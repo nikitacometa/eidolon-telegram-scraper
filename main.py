@@ -14,6 +14,10 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from config.settings import settings
+from config.watchers import get_chat_watchers, load_watchers
+from pipeline.dispatcher import AlertDispatcher
+from pipeline.filters import RuleFilter
+from pipeline.ingestion import ingest_message
 from storage.db import Database
 
 logging.basicConfig(
@@ -34,15 +38,29 @@ class Eidolon:
             settings.telegram_api_id,
             settings.telegram_api_hash,
         )
+        self.dispatcher = AlertDispatcher()
         self._shutdown_event = asyncio.Event()
+
+        # Load watcher configs
+        self.watchers = load_watchers(settings.watchers_path)
+        self.chat_watchers = get_chat_watchers(self.watchers)
+        self.filters: dict[str, RuleFilter] = {
+            w.name: RuleFilter(w) for w in self.watchers
+        }
 
     async def start(self) -> None:
         """Connect to Telegram and database, register handlers, run until shutdown."""
         await self.db.connect()
+        await self.dispatcher.start()
         await self.client.start()
 
         me = await self.client.get_me()
         logger.info("Connected as %s (ID: %d)", me.first_name, me.id)
+        logger.info(
+            "Monitoring %d chats via %d watchers",
+            len(self.chat_watchers),
+            len(self.watchers),
+        )
 
         self._register_handlers()
         self._setup_signals()
@@ -52,6 +70,7 @@ class Eidolon:
 
         logger.info("Shutting down...")
         await self.client.disconnect()
+        await self.dispatcher.close()
         await self.db.close()
         logger.info("Goodbye.")
 
@@ -60,14 +79,64 @@ class Eidolon:
 
         @self.client.on(events.NewMessage)
         async def on_new_message(event: events.NewMessage.Event) -> None:
-            # Will be wired to the full pipeline in Milestone 3
-            # For now: log incoming messages
-            chat = await event.get_chat()
-            chat_title = getattr(chat, "title", "DM")
-            sender = await event.get_sender()
-            sender_name = getattr(sender, "first_name", "Unknown") if sender else "Unknown"
-            text_preview = (event.text or "")[:80]
-            logger.debug("[%s] %s: %s", chat_title, sender_name, text_preview)
+            await self._process_message(event)
+
+    async def _process_message(self, event: events.NewMessage.Event) -> None:
+        """Full pipeline: ingest → filter → dispatch."""
+        chat_id = event.chat_id
+
+        # Check if any watcher monitors this chat
+        watchers = self.chat_watchers.get(chat_id, [])
+        if not watchers:
+            return
+
+        # Ingest message into DB
+        msg_id = await ingest_message(event, self.db)
+        if msg_id is None:
+            return  # duplicate
+
+        # Run through each watcher's filter
+        chat = await event.get_chat()
+        chat_title = getattr(chat, "title", "DM")
+        sender = await event.get_sender()
+        sender_name = getattr(sender, "first_name", "Unknown") if sender else "Unknown"
+
+        for watcher in watchers:
+            rule_filter = self.filters[watcher.name]
+            result = rule_filter.check(event.text)
+
+            # Update filter stats
+            await self.db.update_filter_stats(
+                watcher_name=watcher.name,
+                level_passed=1 if result.passed else None,
+            )
+
+            if not result:
+                continue
+
+            # Store alert in DB
+            alert_id = await self.db.store_alert(
+                watcher_name=watcher.name,
+                message_id=msg_id,
+                filter_level=1,
+            )
+
+            # Dispatch alert
+            if watcher.alert == "immediate":
+                sent = await self.dispatcher.send_alert(
+                    watcher_name=watcher.name,
+                    chat_title=chat_title,
+                    sender_name=sender_name,
+                    text=event.text or "",
+                    matched_keyword=result.matched_keyword,
+                    filter_level=1,
+                )
+                if sent:
+                    await self.db.mark_alert_sent(alert_id)
+                    await self.db.update_filter_stats(
+                        watcher_name=watcher.name,
+                        alert_sent=True,
+                    )
 
     def _setup_signals(self) -> None:
         """Handle SIGINT/SIGTERM for graceful shutdown."""
