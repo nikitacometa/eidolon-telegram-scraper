@@ -1,0 +1,9 @@
+telethon==1.42.0
+aiosqlite>=0.19
+anthropic>=0.40
+openai>=1.50
+chromadb>=0.5
+python-dotenv>=1.0
+pyyaml>=6.0
+pydantic>=2.0
+pydantic-settings>=2.0

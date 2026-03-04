@@ -1,0 +1,50 @@
+# Eidolon — Chat Watcher Configuration
+# Each watcher defines: which chats to monitor, what to look for, how to alert
+
+watchers:
+  - name: phangan-housing
+    description: "Find rental houses/villas on Phangan island"
+    chats: []  # Add Telegram chat IDs after joining
+    rules:
+      keywords:
+        - house
+        - villa
+        - rent
+        - rental
+        - bungalow
+        - apartment
+        - studio
+        - сдаю
+        - сдаётся
+        - дом
+        - аренда
+        - вилла
+        - бунгало
+        - квартира
+      keywords_negative:
+        - looking for
+        - ищу
+        - need
+        - нужен
+      min_length: 20
+      languages: [en, ru]
+    alert: immediate
+    llm_level: 3
+    prompt: |
+      Analyze this message from a Phangan expat chat.
+      Is someone offering a house/villa/apartment for rent?
+      If yes, extract: type, location, price, duration, contact info.
+      If no, reply NO.
+
+# Template for adding new watchers:
+#  - name: watcher-id
+#    description: "What this watcher looks for"
+#    chats: [-100XXXXXXXXXX]
+#    rules:
+#      keywords: [word1, word2]
+#      keywords_negative: [exclude1]
+#      min_length: 10
+#      languages: [en]
+#    alert: immediate | digest
+#    llm_level: 1 | 2 | 3
+#    prompt: "Custom LLM prompt for analysis"
