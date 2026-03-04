@@ -8,7 +8,7 @@ Named after εἴδωλον — the phantom double of a living person in Greek m
 
 - **Runtime**: Python 3.12+
 - **Telegram**: Telethon v1.42 (MTProto userbot, from Codeberg)
-- **LLM**: Anthropic Claude (Haiku for filtering, Sonnet for analysis, Batch API for cost optimization)
+- **LLM**: OpenAI (GPT-4.1-mini for filtering, GPT-4.1 for analysis)
 - **Embeddings**: OpenAI text-embedding-3-small (pre-filtering)
 - **Storage**: SQLite + aiosqlite (messages, alerts, chat metadata)
 - **Vector store**: ChromaDB embedded (semantic filtering)
@@ -21,13 +21,13 @@ Named after εἴδωλον — the phantom double of a living person in Greek m
 python3 main.py
 
 # Generate session string (first time only)
-python3 -m eidolon.auth
+python3 auth.py
 
 # Run tests
 python3 -m pytest tests/
 
-# Check status
-python3 -m eidolon.status
+# Lint & format
+ruff check . && ruff format --check .
 ```
 
 ## Architecture
@@ -44,8 +44,8 @@ Level 2: Embedding similarity (cheap)
     │  Drops ~50-70% of remaining
     ↓
 Level 3: LLM analysis (expensive, rare)
-    │  Claude Haiku: relevance classification
-    │  Claude Sonnet: summaries, deep analysis (Batch API — 50% off)
+    │  GPT-4.1-mini: relevance classification
+    │  GPT-4.1: summaries, deep analysis
     ↓
 Alert Dispatcher
     │  → Telegram (via @ClaudePantheon_Bot)
@@ -62,8 +62,7 @@ TELEGRAM_API_ID=...
 TELEGRAM_API_HASH=...
 TELEGRAM_SESSION_STRING=...
 TELEGRAM_PHONE=...
-ANTHROPIC_API_KEY=...
-OPENAI_API_KEY=...          # for embeddings only
+OPENAI_API_KEY=...          # LLM + embeddings
 PANTHEON_BOT_TOKEN=...      # alert delivery via existing bot
 PANTHEON_CHAT_ID=...        # Nikita's chat ID
 ```
@@ -90,10 +89,9 @@ watchers:
 ## Project Structure
 
 ```
-eidolon/
-├── CLAUDE.md               # This file
-├── BOARD.md                # Task board (E-NNN)
+eidolon-telegram/
 ├── main.py                 # Entry point: Telethon client + event loop
+├── auth.py                 # Session string generator (run once)
 ├── pipeline/
 │   ├── __init__.py
 │   ├── ingestion.py        # Telethon event handlers, message extraction
@@ -115,12 +113,14 @@ eidolon/
 │   └── test_storage.py
 ├── docs/
 │   └── research.md         # Tech research findings
-├── .claude/
-│   └── agents/             # Claude Code agents for this project
 ├── .env.example            # Template for secrets
 ├── .gitignore
 ├── requirements.txt
+├── requirements-dev.txt    # Dev dependencies (pytest, ruff, mypy)
 ├── pyproject.toml
+├── CLAUDE.md               # AI agent instructions
+├── BOARD.md                # Task board (E-NNN)
+├── README.md
 └── tmp/                    # Working files (gitignored)
 ```
 
@@ -129,7 +129,7 @@ eidolon/
 - **Never commit `.env` or session strings.** All secrets live in `.env` (gitignored).
 - **Telethon session is sacred.** Never create multiple concurrent clients with the same session. One process, one session.
 - **Read-only first.** MVP monitors only. Sending messages is a future phase with explicit user approval per chat.
-- **Cost-conscious LLM usage.** Always run rule-based + embedding filters before LLM. Use Batch API for non-urgent analysis.
+- **Cost-conscious LLM usage.** Always run rule-based + embedding filters before LLM. Use GPT-4.1-mini for classification, GPT-4.1 only for deep analysis.
 - **Respect Telegram rate limits.** No mass joins, no spam, human-like pauses for any writes.
 - **Separate account.** Never connect to the user's primary Telegram account. Dedicated number only.
 - **Test filters independently.** Each filter level must have unit tests with real message samples.

@@ -21,6 +21,7 @@ env/
 *.db
 *.db-journal
 *.db-wal
+data/
 
 # ChromaDB
 chroma_data/

@@ -10,8 +10,7 @@ class Settings(BaseSettings):
     telegram_session_string: str = ""
     telegram_phone: str = ""
 
-    # LLM APIs
-    anthropic_api_key: str = ""
+    # OpenAI (LLM + embeddings)
     openai_api_key: str = ""
 
     # Alert delivery (Pantheon bot)

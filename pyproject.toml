@@ -3,10 +3,11 @@ name = "eidolon"
 version = "0.1.0"
 description = "AI-powered digital presence for Telegram"
 requires-python = ">=3.12"
-readme = "README.md"
+license = "MIT"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
 asyncio_mode = "auto"
 
 [tool.ruff]
@@ -14,4 +15,19 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ASYNC"]
+ignore = ["E501"]
+fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ARG001"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = ["B101"]
