@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/eidolon.db")
     watchers_path: Path = Path("config/watchers.yml")
 
+    # Debug
+    debug_echo: bool = False  # Forward ALL messages from monitored chats
+
     # Processing
     batch_size: int = 50
     batch_interval_seconds: int = 300  # 5 min

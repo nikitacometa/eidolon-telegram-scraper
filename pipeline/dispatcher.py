@@ -84,6 +84,37 @@ class AlertDispatcher:
             logger.error("Failed to send alert: %s", e)
             return False
 
+    async def send_echo(
+        self,
+        *,
+        chat_title: str,
+        sender_name: str,
+        text: str,
+    ) -> None:
+        """Forward a message as-is for debug purposes (echo mode)."""
+        if not self._session or not settings.pantheon_bot_token:
+            return
+
+        display_text = text[:300] + "..." if len(text) > 300 else text
+        message = f"🔊 <b>{chat_title}</b> → {sender_name}\n\n{display_text}"
+
+        try:
+            async with self._session.post(
+                self._url,
+                json={
+                    "chat_id": self._chat_id,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Echo send failed %d: %s", resp.status, body)
+        except aiohttp.ClientError as e:
+            logger.warning("Echo send error: %s", e)
+
 
 def _format_alert(
     *,

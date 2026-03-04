@@ -65,6 +65,9 @@ class Eidolon:
         self._register_handlers()
         self._setup_signals()
 
+        if settings.debug_echo:
+            logger.info("DEBUG ECHO MODE — forwarding ALL messages from monitored chats")
+
         logger.info("Eidolon is listening...")
         await self._shutdown_event.wait()
 
@@ -90,17 +93,26 @@ class Eidolon:
         if not watchers:
             return
 
+        # Extract common info
+        chat = await event.get_chat()
+        chat_title = getattr(chat, "title", "DM")
+        sender = await event.get_sender()
+        sender_name = getattr(sender, "first_name", "Unknown") if sender else "Unknown"
+
+        # Debug echo: forward ALL messages from monitored chats
+        if settings.debug_echo and event.text:
+            await self.dispatcher.send_echo(
+                chat_title=chat_title,
+                sender_name=sender_name,
+                text=event.text,
+            )
+
         # Ingest message into DB
         msg_id = await ingest_message(event, self.db)
         if msg_id is None:
             return  # duplicate
 
         # Run through each watcher's filter
-        chat = await event.get_chat()
-        chat_title = getattr(chat, "title", "DM")
-        sender = await event.get_sender()
-        sender_name = getattr(sender, "first_name", "Unknown") if sender else "Unknown"
-
         for watcher in watchers:
             rule_filter = self.filters[watcher.name]
             result = rule_filter.check(event.text)
