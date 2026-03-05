@@ -15,9 +15,7 @@
 
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
-| E-016 | Deploy Eidolon to Hostinger VPS | in_progress | high | systemd user service, `deploy/install.sh` |
-| E-017 | Create Eidolon bot via @BotFather | done | high | @EidolonSpyBot, token in .env |
-| E-018 | Live test: LLM filter + summary on VPS | todo | high | Send test messages, verify filtering and digest |
+| E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
 
 ## Backlog
 
@@ -43,3 +41,5 @@
 | E-011 | LLM: daily digest summarization | done | medium | `pipeline/summarizer.py` — evening digest at 20:00 ICT |
 | E-012 | Digest mode: periodic chat summaries | done | low | Scheduler in main.py, summary via dispatcher |
 | E-015 | Deploy: systemd unit for Linux server | done | low | `deploy/` — install.sh, deploy.sh, eidolon.service |
+| E-016 | Deploy Eidolon to Hostinger VPS | done | high | Live on srv1327676, systemd user service |
+| E-017 | Create Eidolon bot via @BotFather | done | high | @EidolonSpyBot |
