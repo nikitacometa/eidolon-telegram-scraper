@@ -1,13 +1,13 @@
 # Eidolon — Task Board
 
-> Last updated: 2026-03-04
+> Last updated: 2026-03-05
 
 ## Conventions
 
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-016**
+- Next available ID: **E-019**
 
 ---
 
@@ -15,19 +15,17 @@
 
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
-| E-008 | First watcher: Phangan housing monitor | todo | high | Need real chat IDs, test with live messages |
+| E-016 | Deploy Eidolon to Hostinger VPS | in_progress | high | systemd user service, `deploy/install.sh` |
+| E-017 | Create Eidolon bot via @BotFather | done | high | @EidolonSpyBot, token in .env |
+| E-018 | Live test: LLM filter + summary on VPS | todo | high | Send test messages, verify filtering and digest |
 
 ## Backlog
 
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
 | E-009 | Pipeline: embedding similarity filter (Level 2) | todo | medium | `pipeline/embeddings.py` — ChromaDB + text-embedding-3-small |
-| E-010 | Pipeline: LLM classification filter (Level 3) | todo | medium | `pipeline/llm.py` — GPT-4.1-mini relevance check |
-| E-011 | LLM: structured extraction + summarization | todo | medium | GPT-4.1 for deep analysis |
-| E-012 | Digest mode: periodic chat summaries | todo | low | Cron-like scheduler, batch alerts every N hours |
 | E-013 | Monitoring: filter stats dashboard | todo | low | Track pass/drop rates per watcher per level |
 | E-014 | Deploy: launchd plist for macOS daemon | todo | low | Auto-start, restart on crash, log rotation |
-| E-015 | Deploy: systemd unit for Linux server | todo | low | Alternative deployment on Hostinger VPS |
 
 ## Done
 
@@ -40,3 +38,8 @@
 | E-005 | Pipeline: rule-based keyword filter (Level 1) | done | high | `pipeline/filters.py` — 16 tests |
 | E-006 | Pipeline: alert dispatcher via Pantheon bot | done | high | `pipeline/dispatcher.py` — 6 tests |
 | E-007 | Integration: wire pipeline into main event loop | done | high | Full pipeline in main.py — 4 integration tests |
+| E-008 | First watcher: Phangan housing monitor | done | high | Live with real chat IDs |
+| E-010 | Pipeline: LLM classification filter (Level 2+) | done | medium | `pipeline/llm.py` — GPT-4.1-mini, fail-open |
+| E-011 | LLM: daily digest summarization | done | medium | `pipeline/summarizer.py` — evening digest at 20:00 ICT |
+| E-012 | Digest mode: periodic chat summaries | done | low | Scheduler in main.py, summary via dispatcher |
+| E-015 | Deploy: systemd unit for Linux server | done | low | `deploy/` — install.sh, deploy.sh, eidolon.service |

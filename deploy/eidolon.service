@@ -1,0 +1,17 @@
+[Unit]
+Description=Eidolon Telegram Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/eidolon-telegram
+ExecStart=%h/eidolon-telegram/.venv/bin/python3 main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

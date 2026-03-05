@@ -38,6 +38,7 @@ Thumbs.db
 
 # Project temp
 tmp/
+logs/
 
 # Test artifacts
 .pytest_cache/
