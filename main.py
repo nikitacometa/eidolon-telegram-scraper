@@ -9,6 +9,7 @@ import asyncio
 import logging
 import signal
 import sys
+from datetime import date, datetime, timedelta, timezone
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -19,6 +20,7 @@ from pipeline.dispatcher import AlertDispatcher
 from pipeline.filters import RuleFilter
 from pipeline.ingestion import ingest_message
 from pipeline.llm import LLMClassifier, Verdict
+from pipeline.summarizer import DailySummarizer
 from storage.db import Database
 
 logging.basicConfig(
@@ -41,6 +43,7 @@ class Eidolon:
         )
         self.dispatcher = AlertDispatcher()
         self.llm_classifier = LLMClassifier()
+        self.summarizer = DailySummarizer()
         self._shutdown_event = asyncio.Event()
 
         # Load watcher configs
@@ -55,6 +58,7 @@ class Eidolon:
         await self.db.connect()
         await self.dispatcher.start()
         await self.llm_classifier.start()
+        await self.summarizer.start()
         await self.client.start()
 
         me = await self.client.get_me()
@@ -71,11 +75,19 @@ class Eidolon:
         if settings.debug_echo:
             logger.info("DEBUG ECHO MODE — forwarding ALL messages from monitored chats")
 
+        # Start daily summary scheduler
+        if settings.summary_enabled:
+            self._summary_task = asyncio.create_task(self._run_summary_scheduler())
+            logger.info("Summary scheduler enabled (daily at %02d:00 UTC)", settings.summary_hour_utc)
+
         logger.info("Eidolon is listening...")
         await self._shutdown_event.wait()
 
         logger.info("Shutting down...")
+        if hasattr(self, "_summary_task"):
+            self._summary_task.cancel()
         await self.client.disconnect()
+        await self.summarizer.close()
         await self.llm_classifier.close()
         await self.dispatcher.close()
         await self.db.close()
@@ -175,6 +187,52 @@ class Eidolon:
                         watcher_name=watcher.name,
                         alert_sent=True,
                     )
+
+    async def _run_summary_scheduler(self) -> None:
+        """Sleep until summary_hour_utc each day, then generate and send digests."""
+        while not self._shutdown_event.is_set():
+            now = datetime.now(timezone.utc)
+            target = now.replace(
+                hour=settings.summary_hour_utc, minute=0, second=0, microsecond=0,
+            )
+            if target <= now:
+                target += timedelta(days=1)
+            sleep_seconds = (target - now).total_seconds()
+            logger.info("Next summary in %.0f seconds (at %s UTC)", sleep_seconds, target.strftime("%H:%M"))
+
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=sleep_seconds,
+                )
+                return  # shutdown requested
+            except TimeoutError:
+                pass  # time to generate summary
+
+            await self._generate_summaries()
+
+    async def _generate_summaries(self) -> None:
+        """Generate and send summaries for all watchers."""
+        today = date.today()
+        date_str = today.isoformat()
+
+        for watcher in self.watchers:
+            messages = await self.db.get_daily_messages(watcher.chats, date_str)
+            if not messages:
+                logger.info("No messages for [%s] on %s, skipping summary", watcher.name, date_str)
+                continue
+
+            summary = await self.summarizer.summarize(
+                messages=messages,
+                watcher_name=watcher.name,
+                target_date=today,
+            )
+            if summary:
+                await self.dispatcher.send_summary(
+                    watcher_name=watcher.name,
+                    summary=summary,
+                    date_str=date_str,
+                    message_count=len(messages),
+                )
 
     def _setup_signals(self) -> None:
         """Handle SIGINT/SIGTERM for graceful shutdown."""

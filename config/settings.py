@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4.1-mini"
     llm_timeout_seconds: int = 15
 
+    # Daily summary
+    summary_enabled: bool = True
+    summary_hour_utc: int = 13  # 20:00 ICT (UTC+7)
+    summary_model: str = "gpt-4.1-mini"
+
     # Debug
     debug_echo: bool = False  # Forward ALL messages from monitored chats
 

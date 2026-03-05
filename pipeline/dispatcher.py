@@ -117,6 +117,69 @@ class AlertDispatcher:
             logger.warning("Echo send error: %s", e)
 
 
+    async def send_summary(
+        self,
+        *,
+        watcher_name: str,
+        summary: str,
+        date_str: str,
+        message_count: int,
+    ) -> bool:
+        """Send a daily summary, splitting into chunks if needed (Telegram 4096 char limit)."""
+        if not self._session or not (settings.eidolon_bot_token or settings.pantheon_bot_token):
+            return False
+
+        header = (
+            f"📋 <b>Daily Digest</b> — <code>{watcher_name}</code>\n"
+            f"📅 {date_str} | {message_count} messages\n\n"
+        )
+        full_text = header + summary
+
+        chunks = _split_message(full_text, max_len=4096)
+        all_sent = True
+        for chunk in chunks:
+            try:
+                async with self._session.post(
+                    self._url,
+                    json={
+                        "chat_id": self._chat_id,
+                        "text": chunk,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("Summary send failed %d: %s", resp.status, body)
+                        all_sent = False
+            except aiohttp.ClientError as e:
+                logger.error("Summary send error: %s", e)
+                all_sent = False
+
+        if all_sent:
+            logger.info("Summary sent: [%s] %s", watcher_name, date_str)
+        return all_sent
+
+
+def _split_message(text: str, max_len: int = 4096) -> list[str]:
+    """Split a long message into chunks that fit Telegram's limit."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Find last newline before limit
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
 def _format_alert(
     *,
     watcher_name: str,
