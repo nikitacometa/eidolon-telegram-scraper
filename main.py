@@ -18,6 +18,7 @@ from config.watchers import get_chat_watchers, load_watchers
 from pipeline.dispatcher import AlertDispatcher
 from pipeline.filters import RuleFilter
 from pipeline.ingestion import ingest_message
+from pipeline.llm import LLMClassifier, Verdict
 from storage.db import Database
 
 logging.basicConfig(
@@ -39,6 +40,7 @@ class Eidolon:
             settings.telegram_api_hash,
         )
         self.dispatcher = AlertDispatcher()
+        self.llm_classifier = LLMClassifier()
         self._shutdown_event = asyncio.Event()
 
         # Load watcher configs
@@ -52,6 +54,7 @@ class Eidolon:
         """Connect to Telegram and database, register handlers, run until shutdown."""
         await self.db.connect()
         await self.dispatcher.start()
+        await self.llm_classifier.start()
         await self.client.start()
 
         me = await self.client.get_me()
@@ -73,6 +76,7 @@ class Eidolon:
 
         logger.info("Shutting down...")
         await self.client.disconnect()
+        await self.llm_classifier.close()
         await self.dispatcher.close()
         await self.db.close()
         logger.info("Goodbye.")
@@ -126,11 +130,33 @@ class Eidolon:
             if not result:
                 continue
 
+            # Level 2+: LLM classification (if configured)
+            filter_level = 1
+            llm_response = None
+            if watcher.llm_level >= 2 and event.text:
+                verdict = await self.llm_classifier.classify(
+                    text=event.text,
+                    watcher_prompt=watcher.prompt,
+                )
+                llm_response = verdict.value
+                filter_level = 2
+                await self.db.update_filter_stats(
+                    watcher_name=watcher.name,
+                    level_passed=2 if verdict == Verdict.OFFER else None,
+                )
+                if verdict != Verdict.OFFER:
+                    logger.info(
+                        "LLM filtered out [%s]: %s → %s",
+                        watcher.name, (event.text or "")[:50], verdict.value,
+                    )
+                    continue
+
             # Store alert in DB
             alert_id = await self.db.store_alert(
                 watcher_name=watcher.name,
                 message_id=msg_id,
-                filter_level=1,
+                filter_level=filter_level,
+                llm_response=llm_response,
             )
 
             # Dispatch alert
@@ -141,7 +167,7 @@ class Eidolon:
                     sender_name=sender_name,
                     text=event.text or "",
                     matched_keyword=result.matched_keyword,
-                    filter_level=1,
+                    filter_level=filter_level,
                 )
                 if sent:
                     await self.db.mark_alert_sent(alert_id)

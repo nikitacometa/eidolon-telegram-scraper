@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/eidolon.db")
     watchers_path: Path = Path("config/watchers.yml")
 
+    # LLM filtering
+    llm_model: str = "gpt-4.1-mini"
+    llm_timeout_seconds: int = 15
+
     # Debug
     debug_echo: bool = False  # Forward ALL messages from monitored chats
 
