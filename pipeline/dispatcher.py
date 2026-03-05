@@ -18,7 +18,8 @@ class AlertDispatcher:
     """Sends alerts through @ClaudePantheon_Bot to the configured chat."""
 
     def __init__(self) -> None:
-        self._url = BOT_API_URL.format(token=settings.pantheon_bot_token)
+        token = settings.eidolon_bot_token or settings.pantheon_bot_token
+        self._url = BOT_API_URL.format(token=token)
         self._chat_id = settings.pantheon_chat_id
         self._session: aiohttp.ClientSession | None = None
 
@@ -50,8 +51,8 @@ class AlertDispatcher:
             logger.error("Dispatcher not started. Call start() first.")
             return False
 
-        if not settings.pantheon_bot_token:
-            logger.warning("PANTHEON_BOT_TOKEN not set, skipping alert")
+        if not settings.eidolon_bot_token and not settings.pantheon_bot_token:
+            logger.warning("No bot token configured, skipping alert")
             return False
 
         message = _format_alert(
@@ -92,7 +93,7 @@ class AlertDispatcher:
         text: str,
     ) -> None:
         """Forward a message as-is for debug purposes (echo mode)."""
-        if not self._session or not settings.pantheon_bot_token:
+        if not self._session or not (settings.eidolon_bot_token or settings.pantheon_bot_token):
             return
 
         display_text = text[:300] + "..." if len(text) > 300 else text

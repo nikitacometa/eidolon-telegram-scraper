@@ -13,9 +13,10 @@ class Settings(BaseSettings):
     # OpenAI (LLM + embeddings)
     openai_api_key: str = ""
 
-    # Alert delivery (Pantheon bot)
+    # Alert delivery
     pantheon_bot_token: str = ""
     pantheon_chat_id: int = 60972166
+    eidolon_bot_token: str = ""  # Dedicated Eidolon bot (falls back to Pantheon)
 
     # Paths
     db_path: Path = Path("data/eidolon.db")

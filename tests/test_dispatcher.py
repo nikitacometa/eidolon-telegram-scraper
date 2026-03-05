@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from pipeline.dispatcher import AlertDispatcher, _format_alert
+from pipeline.dispatcher import AlertDispatcher, BOT_API_URL, _format_alert
 
 
 class TestFormatAlert:
@@ -106,3 +106,21 @@ class TestAlertDispatcher:
             text="Hello",
         )
         assert result is False
+
+    async def test_eidolon_bot_token_preferred(self) -> None:
+        """Should use eidolon_bot_token when available, falling back to pantheon."""
+        with patch("pipeline.dispatcher.settings") as mock_settings:
+            mock_settings.eidolon_bot_token = "eidolon-token-123"
+            mock_settings.pantheon_bot_token = "pantheon-token-456"
+            mock_settings.pantheon_chat_id = 12345
+            dispatcher = AlertDispatcher()
+            assert "eidolon-token-123" in dispatcher._url
+
+    async def test_fallback_to_pantheon_token(self) -> None:
+        """Should fall back to pantheon_bot_token when eidolon_bot_token is empty."""
+        with patch("pipeline.dispatcher.settings") as mock_settings:
+            mock_settings.eidolon_bot_token = ""
+            mock_settings.pantheon_bot_token = "pantheon-token-456"
+            mock_settings.pantheon_chat_id = 12345
+            dispatcher = AlertDispatcher()
+            assert "pantheon-token-456" in dispatcher._url
