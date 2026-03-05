@@ -7,6 +7,7 @@ watchers:
     chats:
       - -1001914345108
       - -1001809850447
+      - -1003542321165  # TRAVEL DATA (test chat)
     rules:
       keywords:
         - house
