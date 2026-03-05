@@ -23,7 +23,6 @@
 |----|------|--------|----------|-------|
 | E-009 | Pipeline: embedding similarity filter (Level 2) | todo | medium | `pipeline/embeddings.py` — ChromaDB + text-embedding-3-small |
 | E-013 | Monitoring: filter stats dashboard | todo | low | Track pass/drop rates per watcher per level |
-| E-014 | Deploy: launchd plist for macOS daemon | todo | low | Auto-start, restart on crash, log rotation |
 
 ## Done
 

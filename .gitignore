@@ -25,6 +25,7 @@ data/
 
 # ChromaDB
 chroma_data/
+data/chroma/
 
 # IDE
 .idea/

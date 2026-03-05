@@ -22,7 +22,11 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/eidolon.db")
     watchers_path: Path = Path("config/watchers.yml")
 
-    # LLM filtering
+    # Embedding filter (Level 2)
+    embedding_model: str = "text-embedding-3-small"
+    chroma_path: Path = Path("data/chroma")
+
+    # LLM filtering (Level 3)
     llm_model: str = "gpt-4.1-mini"
     llm_timeout_seconds: int = 15
 

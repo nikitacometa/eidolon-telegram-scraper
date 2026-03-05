@@ -17,6 +17,7 @@ from telethon.sessions import StringSession
 from config.settings import settings
 from config.watchers import get_chat_watchers, load_watchers
 from pipeline.dispatcher import AlertDispatcher
+from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.ingestion import ingest_message
 from pipeline.llm import LLMClassifier, Verdict
@@ -42,6 +43,7 @@ class Eidolon:
             settings.telegram_api_hash,
         )
         self.dispatcher = AlertDispatcher()
+        self.embedding_filter = EmbeddingFilter()
         self.llm_classifier = LLMClassifier()
         self.summarizer = DailySummarizer()
         self._shutdown_event = asyncio.Event()
@@ -57,6 +59,7 @@ class Eidolon:
         """Connect to Telegram and database, register handlers, run until shutdown."""
         await self.db.connect()
         await self.dispatcher.start()
+        await self.embedding_filter.start(self.watchers)
         await self.llm_classifier.start()
         await self.summarizer.start()
         await self.client.start()
@@ -89,6 +92,7 @@ class Eidolon:
         await self.client.disconnect()
         await self.summarizer.close()
         await self.llm_classifier.close()
+        await self.embedding_filter.close()
         await self.dispatcher.close()
         await self.db.close()
         logger.info("Goodbye.")
@@ -142,19 +146,34 @@ class Eidolon:
             if not result:
                 continue
 
-            # Level 2+: LLM classification (if configured)
+            # Level 2: Embedding similarity (if configured)
             filter_level = 1
             llm_response = None
             if watcher.llm_level >= 2 and event.text:
+                emb_passed = await self.embedding_filter.check(event.text, watcher.name)
+                await self.db.update_filter_stats(
+                    watcher_name=watcher.name,
+                    level_passed=2 if emb_passed else None,
+                )
+                if not emb_passed:
+                    logger.info(
+                        "Embedding filtered out [%s]: %s",
+                        watcher.name, (event.text or "")[:50],
+                    )
+                    continue
+                filter_level = 2
+
+            # Level 3: LLM classification (if configured)
+            if watcher.llm_level >= 3 and event.text:
                 verdict = await self.llm_classifier.classify(
                     text=event.text,
                     watcher_prompt=watcher.prompt,
                 )
                 llm_response = verdict.value
-                filter_level = 2
+                filter_level = 3
                 await self.db.update_filter_stats(
                     watcher_name=watcher.name,
-                    level_passed=2 if verdict == Verdict.OFFER else None,
+                    level_passed=3 if verdict == Verdict.OFFER else None,
                 )
                 if verdict != Verdict.OFFER:
                     logger.info(
