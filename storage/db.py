@@ -28,10 +28,21 @@ class Database:
         logger.info("Database connected: %s", self.db_path)
 
     async def _migrate(self) -> None:
-        """Run schema.sql to create tables if they don't exist."""
+        """Run schema.sql to create tables if they don't exist, then apply incremental migrations."""
         schema = SCHEMA_PATH.read_text()
         await self._conn.executescript(schema)
         await self._conn.commit()
+        await self._apply_migrations()
+
+    async def _apply_migrations(self) -> None:
+        """Apply incremental schema changes for existing databases."""
+        # Add chat_title column to messages if missing
+        cursor = await self._conn.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "chat_title" not in columns:
+            await self._conn.execute("ALTER TABLE messages ADD COLUMN chat_title TEXT")
+            await self._conn.commit()
+            logger.info("Migration: added chat_title column to messages")
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -51,6 +62,7 @@ class Database:
         *,
         telegram_msg_id: int,
         chat_id: int,
+        chat_title: str | None = None,
         sender_id: int | None,
         sender_name: str | None,
         text: str | None,
@@ -61,15 +73,15 @@ class Database:
         try:
             cursor = await self.conn.execute(
                 """
-                INSERT INTO messages (telegram_msg_id, chat_id, sender_id, sender_name, text, date, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO messages
+                    (telegram_msg_id, chat_id, chat_title, sender_id, sender_name, text, date, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (telegram_msg_id, chat_id, sender_id, sender_name, text, date, raw_json),
+                (telegram_msg_id, chat_id, chat_title, sender_id, sender_name, text, date, raw_json),
             )
             await self.conn.commit()
             return cursor.lastrowid
         except aiosqlite.IntegrityError:
-            # Duplicate message (chat_id + telegram_msg_id unique constraint)
             logger.debug("Duplicate message %d in chat %d", telegram_msg_id, chat_id)
             return None
 
@@ -154,3 +166,33 @@ class Database:
                 (watcher_name,),
             )
         await self.conn.commit()
+
+    async def get_daily_messages(
+        self,
+        chat_ids: list[int],
+        date: str,
+    ) -> list[dict]:
+        """Fetch all messages for given chats on a specific date (YYYY-MM-DD).
+
+        Returns list of dicts with chat_title, sender_name, text, date.
+        """
+        if not chat_ids:
+            return []
+        placeholders = ",".join("?" * len(chat_ids))
+        cursor = await self.conn.execute(
+            f"SELECT chat_id, chat_title, sender_name, text, date FROM messages "  # noqa: S608
+            f"WHERE chat_id IN ({placeholders}) AND DATE(date) = ? AND text IS NOT NULL "
+            f"ORDER BY date ASC",
+            (*chat_ids, date),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "chat_id": row[0],
+                "chat_title": row[1] or "Unknown",
+                "sender_name": row[2] or "Unknown",
+                "text": row[3],
+                "date": row[4],
+            }
+            for row in rows
+        ]

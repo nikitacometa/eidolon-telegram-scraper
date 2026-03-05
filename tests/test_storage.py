@@ -137,6 +137,65 @@ async def test_update_filter_stats(db: Database) -> None:
     assert row[2] == 1  # 1 alert sent
 
 
+async def test_store_message_with_chat_title(db: Database) -> None:
+    """store_message should store chat_title alongside other fields."""
+    row_id = await db.store_message(
+        telegram_msg_id=50,
+        chat_id=-100500,
+        chat_title="Phangan Expats",
+        sender_id=1,
+        sender_name="Alice",
+        text="Hello group",
+        date="2026-03-05 10:00:00",
+    )
+    cursor = await db.conn.execute("SELECT chat_title FROM messages WHERE id = ?", (row_id,))
+    row = await cursor.fetchone()
+    assert row[0] == "Phangan Expats"
+
+
+async def test_get_daily_messages(db: Database) -> None:
+    """get_daily_messages should return messages for given chats on a specific date."""
+    chat_id = -100600
+    # Insert messages on target date
+    await db.store_message(
+        telegram_msg_id=1, chat_id=chat_id, chat_title="Test Chat",
+        sender_id=1, sender_name="Alice", text="Morning msg",
+        date="2026-03-05 08:00:00",
+    )
+    await db.store_message(
+        telegram_msg_id=2, chat_id=chat_id, chat_title="Test Chat",
+        sender_id=2, sender_name="Bob", text="Afternoon msg",
+        date="2026-03-05 14:00:00",
+    )
+    # Insert message on different date (should be excluded)
+    await db.store_message(
+        telegram_msg_id=3, chat_id=chat_id, chat_title="Test Chat",
+        sender_id=1, sender_name="Alice", text="Yesterday msg",
+        date="2026-03-04 12:00:00",
+    )
+    # Insert message in different chat (should be excluded)
+    await db.store_message(
+        telegram_msg_id=4, chat_id=-100999, chat_title="Other Chat",
+        sender_id=3, sender_name="Eve", text="Other chat msg",
+        date="2026-03-05 09:00:00",
+    )
+
+    messages = await db.get_daily_messages([chat_id], "2026-03-05")
+    assert len(messages) == 2
+    assert messages[0]["text"] == "Morning msg"
+    assert messages[1]["text"] == "Afternoon msg"
+    assert messages[0]["chat_title"] == "Test Chat"
+
+
+async def test_get_daily_messages_empty(db: Database) -> None:
+    """get_daily_messages with no matching data should return empty list."""
+    messages = await db.get_daily_messages([-100999], "2026-01-01")
+    assert messages == []
+
+    messages = await db.get_daily_messages([], "2026-03-05")
+    assert messages == []
+
+
 async def test_conn_raises_when_not_connected() -> None:
     """Accessing conn before connect() should raise RuntimeError."""
     db = Database(Path("/tmp/nonexistent.db"))

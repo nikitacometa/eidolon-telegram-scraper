@@ -39,6 +39,7 @@ async def ingest_message(event, db: Database) -> int | None:
     row_id = await db.store_message(
         telegram_msg_id=msg.id,
         chat_id=chat_id,
+        chat_title=chat_title,
         sender_id=sender_id,
         sender_name=sender_name,
         text=msg.text,

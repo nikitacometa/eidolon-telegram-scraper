@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_msg_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
+    chat_title TEXT,
     sender_id INTEGER,
     sender_name TEXT,
     text TEXT,
