@@ -148,6 +148,14 @@ eidolon-telegram/
 
 Tasks in `BOARD.md`. Format: Pantheon table (E-NNN IDs).
 
+## Commit Discipline
+
+- Always commit after completing a task or logical unit of work — never leave finished work uncommitted
+- Use lowercase verb, concise English: `add`, `fix`, `update`, `remove`, `refactor`
+- Push after committing unless explicitly told not to
+- If changes need review, commit anyway — better to fix in a follow-up than leave uncommitted
+- Update task board status before committing the related work
+
 ## Pantheon Integration
 
 - **Registered in:** `~/dev/pantheon-command/projects.yml`
