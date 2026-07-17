@@ -1,13 +1,13 @@
 # Eidolon — Task Board
 
-> Last updated: 2026-03-05
+> Last updated: 2026-07-17
 
 ## Conventions
 
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-026**
+- Next available ID: **E-032**
 
 ---
 
@@ -16,6 +16,12 @@
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
+| E-026 | Harden correctness, security, and public configuration | in_progress | critical | Audit milestone 1 |
+| E-027 | Add typed AI decisions and provider boundaries | todo | high | Structured outputs and provenance |
+| E-028 | Build Evaluation Lab and regression dataset | todo | high | Precision/recall/F1, latency, cost |
+| E-029 | Add durable processing, outbox, and bounded workers | todo | high | Idempotency and crash recovery |
+| E-030 | Add FastAPI control plane, Docker, lockfile, and CI | todo | high | Reproducible production signal |
+| E-031 | Rebrand repository and publish portfolio-grade README | todo | high | `eidolon-telegram-scraper` |
 
 ## Backlog — Phase 3: Autonomous Agent
 
