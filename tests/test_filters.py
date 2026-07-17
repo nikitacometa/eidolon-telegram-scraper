@@ -109,9 +109,7 @@ class TestRuleFilter:
             ("Just photos from yesterday's sunset", False),
         ],
     )
-    def test_various_messages(
-        self, housing_watcher: Watcher, text: str, should_pass: bool
-    ) -> None:
+    def test_various_messages(self, housing_watcher: Watcher, text: str, should_pass: bool) -> None:
         """Parametrized test with various real-world-like messages."""
         f = RuleFilter(housing_watcher)
         result = f.check(text)

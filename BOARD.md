@@ -16,11 +16,7 @@
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
-| E-026 | Harden correctness, security, and public configuration | in_progress | critical | Audit milestone 1 |
-| E-027 | Add typed AI decisions and provider boundaries | todo | high | Structured outputs and provenance |
-| E-028 | Build Evaluation Lab and regression dataset | todo | high | Precision/recall/F1, latency, cost |
-| E-029 | Add durable processing, outbox, and bounded workers | todo | high | Idempotency and crash recovery |
-| E-030 | Add FastAPI control plane, Docker, lockfile, and CI | todo | high | Reproducible production signal |
+| E-029 | Add durable processing, outbox, and bounded workers | in_progress | high | Idempotency and crash recovery |
 | E-031 | Rebrand repository and publish portfolio-grade README | todo | high | `eidolon-telegram-scraper` |
 
 ## Backlog — Phase 3: Autonomous Agent
@@ -58,5 +54,9 @@
 | E-011 | LLM: daily digest summarization | done | medium | `pipeline/summarizer.py` — evening digest at 20:00 ICT |
 | E-012 | Digest mode: periodic chat summaries | done | low | Scheduler in main.py, summary via dispatcher |
 | E-015 | Deploy: systemd unit for Linux server | done | low | `deploy/` — install.sh, deploy.sh, eidolon.service |
-| E-016 | Deploy Eidolon to Hostinger VPS | done | high | Live on srv1327676, systemd user service |
+| E-016 | Deploy Eidolon to Linux VPS | done | high | Live via systemd user service |
 | E-017 | Create Eidolon bot via @BotFather | done | high | @EidolonSpyBot |
+| E-026 | Harden correctness, security, and public configuration | done | critical | Regression-covered audit milestone 1 |
+| E-027 | Add typed AI decisions and provider boundaries | done | high | Structured outputs and provenance |
+| E-028 | Build Evaluation Lab and regression dataset | done | high | Versioned 20-case baseline, F1 0.9412 |
+| E-030 | Add FastAPI control plane, Docker, lockfile, and CI | done | high | Reproducible production signal |

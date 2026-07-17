@@ -1,0 +1,35 @@
+# Copy this file to config/watchers.yml and replace the synthetic chat ID.
+watchers:
+  - name: phangan-housing
+    description: Find rental houses and apartments offered on Phangan
+    chats:
+      - -1001234567890
+    rules:
+      keywords:
+        - house
+        - villa
+        - rent
+        - bungalow
+        - apartment
+        - сдаю
+        - аренда
+        - вилла
+      keywords_negative:
+        - looking for
+        - ищу
+        - need
+      min_length: 20
+      languages: [en, ru]
+    examples:
+      positive:
+        - "Villa for rent near Srithanu, 2 bedrooms, 25000 THB per month"
+        - "Сдаю дом на Пангане, две спальни, свободен с августа"
+      negative:
+        - "Looking for a villa to rent next month"
+        - "Scooter for rent, weekly and monthly rates"
+    alert: immediate
+    llm_level: 3
+    embedding_threshold: 0.70
+    prompt: |
+      Decide whether this message offers residential property for rent on Phangan.
+      Ignore requests from people looking for property and unrelated rentals.

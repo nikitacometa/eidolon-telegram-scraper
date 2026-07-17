@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from datetime import date
 
 from openai import AsyncOpenAI
@@ -41,7 +42,7 @@ class DailySummarizer:
 
     async def summarize(
         self,
-        messages: list[dict],
+        messages: Sequence[Mapping[str, object]],
         watcher_name: str,
         target_date: date | None = None,
     ) -> str | None:
@@ -81,19 +82,23 @@ class DailySummarizer:
                 temperature=0.3,
                 timeout=30,
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            return content.strip() if content else None
 
-        except Exception as e:
-            logger.error("Summary generation failed: %s", e)
+        except Exception as error:
+            logger.error("Summary generation failed: %s", type(error).__name__)
             return None
 
 
-def _build_transcript(messages: list[dict]) -> str:
+def _build_transcript(messages: Sequence[Mapping[str, object]]) -> str:
     """Build a text transcript from message dicts, truncated to MAX_CONTEXT_CHARS."""
-    lines = []
+    lines: list[str] = []
     total = 0
     for msg in messages:
-        line = f"[{msg['chat_title']}] {msg['sender_name']}: {msg['text']}"
+        chat_title = str(msg.get("chat_title") or "Unknown")
+        sender_name = str(msg.get("sender_name") or "Unknown")
+        text = str(msg.get("text") or "")
+        line = f"[{chat_title}] {sender_name}: {text}"
         if total + len(line) > MAX_CONTEXT_CHARS:
             lines.append(f"... ({len(messages) - len(lines)} more messages truncated)")
             break

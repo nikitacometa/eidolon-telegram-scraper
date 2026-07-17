@@ -1,13 +1,14 @@
-"""Integration tests for the full pipeline: ingest → filter → dispatch."""
+"""Offline integration tests for watcher config, rules, and persistence."""
 
+from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
-from config.watchers import WatcherRules, get_chat_watchers, load_watchers
+from config.watchers import get_chat_watchers, load_watchers
 from pipeline.filters import RuleFilter
+from pipeline.models import PipelineOutcome
 from storage.db import Database
 
 
@@ -35,7 +36,7 @@ def watchers_config(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-async def db(tmp_path: Path) -> Database:
+async def db(tmp_path: Path) -> AsyncIterator[Database]:
     """Test database."""
     database = Database(tmp_path / "test.db")
     await database.connect()
@@ -43,10 +44,10 @@ async def db(tmp_path: Path) -> Database:
     await database.close()
 
 
-async def test_full_pipeline_match(
+async def test_rule_match_persists_alert_and_pipeline_outcome(
     db: Database, watchers_config: Path
 ) -> None:
-    """Message matching watcher keywords should be stored and flagged."""
+    """A deterministic match should produce one alert and one aggregate outcome."""
     watchers = load_watchers(watchers_config)
     chat_map = get_chat_watchers(watchers)
     filters = {w.name: RuleFilter(w) for w in watchers}
@@ -84,24 +85,34 @@ async def test_full_pipeline_match(
     )
     assert alert_id > 0
 
-    # Update stats
-    await db.update_filter_stats(watcher_name=watcher.name, level_passed=1, alert_sent=True)
+    inserted = await db.record_pipeline_outcome(
+        PipelineOutcome(
+            message_id=msg_id,
+            watcher_name=watcher.name,
+            rule_passed=True,
+            alert_created=True,
+        )
+    )
+    assert inserted is True
 
     # Verify stats
     cursor = await db.conn.execute(
-        "SELECT messages_total, passed_level1, alerts_sent FROM filter_stats WHERE watcher_name = ?",
+        """
+        SELECT messages_total, passed_level1, passed_level2, passed_level3, alerts_sent
+        FROM filter_stats
+        WHERE watcher_name = ?
+        """,
         (watcher.name,),
     )
     row = await cursor.fetchone()
-    assert row[0] == 1
-    assert row[1] == 1
-    assert row[2] == 1
+    assert row is not None
+    assert tuple(row) == (1, 1, 0, 0, 0)
 
 
-async def test_full_pipeline_no_match(
+async def test_rule_rejection_persists_outcome_without_alert(
     db: Database, watchers_config: Path
 ) -> None:
-    """Message not matching keywords should be stored but no alert created."""
+    """A rejected message should still count once without creating an alert."""
     watchers = load_watchers(watchers_config)
     filters = {w.name: RuleFilter(w) for w in watchers}
 
@@ -120,10 +131,31 @@ async def test_full_pipeline_no_match(
     )
     assert msg_id is not None
 
+    assert await db.record_pipeline_outcome(
+        PipelineOutcome(
+            message_id=msg_id,
+            watcher_name="test-housing",
+            rule_passed=False,
+        )
+    )
+
     # No alert
     cursor = await db.conn.execute("SELECT COUNT(*) FROM alerts")
-    count = (await cursor.fetchone())[0]
-    assert count == 0
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] == 0
+
+    cursor = await db.conn.execute(
+        """
+        SELECT messages_total, passed_level1, passed_level2, passed_level3, alerts_sent
+        FROM filter_stats
+        WHERE watcher_name = ?
+        """,
+        ("test-housing",),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == (1, 0, 0, 0, 0)
 
 
 async def test_unmonitored_chat_ignored(watchers_config: Path) -> None:
@@ -135,9 +167,7 @@ async def test_unmonitored_chat_ignored(watchers_config: Path) -> None:
     assert -100999 not in chat_map
 
 
-async def test_negative_keyword_blocks_pipeline(
-    db: Database, watchers_config: Path
-) -> None:
+async def test_negative_keyword_blocks_pipeline(db: Database, watchers_config: Path) -> None:
     """Negative keywords should prevent alert even with positive match."""
     watchers = load_watchers(watchers_config)
     filters = {w.name: RuleFilter(w) for w in watchers}

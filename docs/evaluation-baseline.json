@@ -1,0 +1,179 @@
+{
+  "metrics": {
+    "dataset": "evals/data/relevance-v1.jsonl",
+    "level": 1,
+    "total": 20,
+    "true_positive": 8,
+    "false_positive": 1,
+    "true_negative": 11,
+    "false_negative": 0,
+    "precision": 0.8889,
+    "recall": 1.0,
+    "f1": 0.9412,
+    "accuracy": 0.95,
+    "mean_latency_ms": 0.008,
+    "passed_gates": true
+  },
+  "predictions": [
+    {
+      "case_id": "en-offer-villa",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.01,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "en-offer-house",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.007,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "en-offer-apartment",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.006,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "en-offer-bungalow",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.006,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "ru-offer-house",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.014,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "ru-offer-villa",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.011,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "ru-offer-apartment",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.008,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "en-offer-long",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.006,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "en-seek-villa",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.001,
+      "score": null,
+      "reason": "negative_keyword"
+    },
+    {
+      "case_id": "en-seek-house",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.003,
+      "score": null,
+      "reason": "negative_keyword"
+    },
+    {
+      "case_id": "ru-seek-house",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.002,
+      "score": null,
+      "reason": "negative_keyword"
+    },
+    {
+      "case_id": "en-scooter-rent",
+      "predicted_alert": true,
+      "stopped_at": "accepted",
+      "latency_ms": 0.006,
+      "score": null,
+      "reason": "all configured stages passed"
+    },
+    {
+      "case_id": "en-current-events",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.011,
+      "score": null,
+      "reason": "no_keyword_match"
+    },
+    {
+      "case_id": "en-warehouse",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.012,
+      "score": null,
+      "reason": "no_keyword_match"
+    },
+    {
+      "case_id": "en-restaurant",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.011,
+      "score": null,
+      "reason": "no_keyword_match"
+    },
+    {
+      "case_id": "en-event",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.012,
+      "score": null,
+      "reason": "no_keyword_match"
+    },
+    {
+      "case_id": "en-prompt-injection",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.017,
+      "score": null,
+      "reason": "no_keyword_match"
+    },
+    {
+      "case_id": "ru-unrelated",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.01,
+      "score": null,
+      "reason": "no_keyword_match"
+    },
+    {
+      "case_id": "en-short",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.001,
+      "score": null,
+      "reason": "too_short"
+    },
+    {
+      "case_id": "en-quoted-seek",
+      "predicted_alert": false,
+      "stopped_at": "rules",
+      "latency_ms": 0.001,
+      "score": null,
+      "reason": "negative_keyword"
+    }
+  ]
+}

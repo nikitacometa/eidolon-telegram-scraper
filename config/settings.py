@@ -1,12 +1,15 @@
 from pathlib import Path
 
-from pydantic_settings import BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Runtime configuration loaded from environment variables and `.env`."""
+
     # Telegram MTProto
-    telegram_api_id: int
-    telegram_api_hash: str
+    telegram_api_id: int = 0
+    telegram_api_hash: str = ""
     telegram_session_string: str = ""
     telegram_phone: str = ""
 
@@ -15,7 +18,7 @@ class Settings(BaseSettings):
 
     # Alert delivery
     pantheon_bot_token: str = ""
-    pantheon_chat_id: int = 60972166
+    pantheon_chat_id: int = 0
     eidolon_bot_token: str = ""  # Dedicated Eidolon bot (falls back to Pantheon)
 
     # Paths
@@ -41,9 +44,21 @@ class Settings(BaseSettings):
     # Processing
     batch_size: int = 50
     batch_interval_seconds: int = 300  # 5 min
-    embedding_similarity_threshold: float = 0.70
+    embedding_similarity_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
+    embedding_negative_margin: float = Field(default=0.05, ge=0.0, le=1.0)
+    processing_queue_size: int = Field(default=500, ge=1, le=100_000)
+    processing_workers: int = Field(default=4, ge=1, le=64)
+    shutdown_timeout_seconds: int = Field(default=30, ge=1, le=300)
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # Data minimization
+    store_raw_telegram_json: bool = False
+    retention_days: int = Field(default=30, ge=1, le=3650)
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()

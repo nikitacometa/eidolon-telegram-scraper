@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from config.watchers import Watcher, WatcherRules, get_chat_watchers, load_watchers
+from config.watchers import (
+    Watcher,
+    WatcherConfigError,
+    WatcherRules,
+    get_chat_watchers,
+    load_watchers,
+)
 
 
 @pytest.fixture
@@ -26,6 +32,10 @@ def config_file(tmp_path: Path) -> Path:
                 "alert": "immediate",
                 "llm_level": 2,
                 "prompt": "Test prompt",
+                "examples": {
+                    "positive": ["Villa available near Srithanu"],
+                    "negative": ["Looking for a villa"],
+                },
             },
             {
                 "name": "second-watcher",
@@ -56,16 +66,80 @@ def test_keywords_lowercased(config_file: Path) -> None:
 
 
 def test_load_nonexistent_file() -> None:
-    """Missing config file should return empty list, not crash."""
-    watchers = load_watchers(Path("/nonexistent/watchers.yml"))
-    assert watchers == []
+    """Missing monitoring policy should fail startup instead of silently doing nothing."""
+    with pytest.raises(WatcherConfigError, match="watchers config not found"):
+        load_watchers(Path("/nonexistent/watchers.yml"))
 
 
 def test_load_empty_file(tmp_path: Path) -> None:
-    """Empty YAML file should return empty list."""
+    """An empty YAML document should fail validation."""
     path = tmp_path / "empty.yml"
     path.write_text("")
-    assert load_watchers(path) == []
+    with pytest.raises(WatcherConfigError, match="invalid watchers config"):
+        load_watchers(path)
+
+
+@pytest.mark.parametrize(
+    "watchers",
+    [
+        [],
+        [
+            {
+                "name": "invalid-alert",
+                "chats": [-100111],
+                "rules": {},
+                "alert": "eventually",
+            }
+        ],
+        [
+            {
+                "name": "invalid-chat",
+                "chats": [100111],
+                "rules": {},
+            }
+        ],
+        [
+            {
+                "name": "invalid-level",
+                "chats": [-100111],
+                "rules": {},
+                "llm_level": 4,
+            }
+        ],
+    ],
+)
+def test_invalid_watcher_config_fails_fast(
+    tmp_path: Path,
+    watchers: list[dict[str, object]],
+) -> None:
+    """Invalid policy values must not produce a partially configured daemon."""
+    path = tmp_path / "invalid.yml"
+    path.write_text(yaml.safe_dump({"watchers": watchers}))
+
+    with pytest.raises(WatcherConfigError, match="invalid watchers config"):
+        load_watchers(path)
+
+
+def test_duplicate_watcher_names_fail_fast(tmp_path: Path) -> None:
+    """Watcher names are stable persistence keys and therefore must be unique."""
+    watcher = {
+        "name": "duplicate-watcher",
+        "chats": [-100111],
+        "rules": {"keywords": ["villa"]},
+    }
+    path = tmp_path / "duplicates.yml"
+    path.write_text(yaml.safe_dump({"watchers": [watcher, watcher]}))
+
+    with pytest.raises(WatcherConfigError, match="watcher names must be unique"):
+        load_watchers(path)
+
+
+def test_positive_and_negative_examples_are_parsed(config_file: Path) -> None:
+    """Semantic examples should remain separated for contrastive retrieval."""
+    watcher = load_watchers(config_file)[0]
+
+    assert watcher.examples.positive == ["Villa available near Srithanu"]
+    assert watcher.examples.negative == ["Looking for a villa"]
 
 
 def test_get_chat_watchers(config_file: Path) -> None:
@@ -88,9 +162,11 @@ def test_get_chat_watchers(config_file: Path) -> None:
 
 def test_watcher_defaults() -> None:
     """Watcher with minimal config should have sensible defaults."""
-    w = Watcher(name="minimal", chats=[], rules=WatcherRules())
+    w = Watcher(name="minimal", chats=[-100111], rules=WatcherRules())
     assert w.alert == "immediate"
     assert w.llm_level == 1
     assert w.prompt == ""
     assert w.rules.min_length == 0
     assert w.rules.keywords == []
+    assert w.examples.positive == []
+    assert w.examples.negative == []

@@ -63,8 +63,7 @@ class TestBuildTranscript:
 
     def test_truncation(self) -> None:
         messages = [
-            {"chat_title": "Chat", "sender_name": "X", "text": "a" * 5000}
-            for _ in range(10)
+            {"chat_title": "Chat", "sender_name": "X", "text": "a" * 5000} for _ in range(10)
         ]
         transcript = _build_transcript(messages)
         assert "truncated" in transcript
@@ -114,14 +113,17 @@ class TestDailySummarizer:
 
     async def test_summarize_empty_messages(self, summarizer: DailySummarizer) -> None:
         result = await summarizer.summarize(
-            messages=[], watcher_name="test", target_date=date(2026, 3, 5),
+            messages=[],
+            watcher_name="test",
+            target_date=date(2026, 3, 5),
         )
         assert result is None
 
     async def test_summarize_no_client(self, sample_messages: list[dict]) -> None:
         summarizer = DailySummarizer()
         result = await summarizer.summarize(
-            messages=sample_messages, watcher_name="test",
+            messages=sample_messages,
+            watcher_name="test",
         )
         assert result is None
 
@@ -130,11 +132,10 @@ class TestDailySummarizer:
         summarizer: DailySummarizer,
         sample_messages: list[dict],
     ) -> None:
-        summarizer._client.chat.completions.create = AsyncMock(
-            side_effect=RuntimeError("API down")
-        )
+        summarizer._client.chat.completions.create = AsyncMock(side_effect=RuntimeError("API down"))
         result = await summarizer.summarize(
-            messages=sample_messages, watcher_name="test",
+            messages=sample_messages,
+            watcher_name="test",
         )
         assert result is None
 

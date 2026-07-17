@@ -1,0 +1,48 @@
+name: eidolon-telegram-scraper
+
+x-service-base: &service-base
+  image: eidolon-telegram-scraper:local
+  build:
+    context: .
+    target: runtime
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 40s
+
+services:
+  worker:
+    <<: *service-base
+    command:
+      - eidolon-scraper
+    env_file:
+      - .env
+    environment:
+      CHROMA_PATH: /app/data/chroma
+      DB_PATH: /app/data/eidolon.db
+      WATCHERS_PATH: /app/config/watchers.yml
+    volumes:
+      - eidolon-data:/app/data
+      - ./config/watchers.yml:/app/config/watchers.yml:ro
+    healthcheck:
+      disable: true
+
+  control-plane:
+    <<: *service-base
+    environment:
+      DB_PATH: /app/data/eidolon.db
+      WATCHERS_PATH: /app/config/watchers.yml
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - eidolon-data:/app/data:ro
+      - ./config/watchers.yml:/app/config/watchers.yml:ro
+
+volumes:
+  eidolon-data:

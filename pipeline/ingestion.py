@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime
+from typing import Protocol
 
 from telethon.tl.types import (
     Channel,
@@ -17,7 +19,35 @@ from storage.db import Database
 logger = logging.getLogger(__name__)
 
 
-async def ingest_message(event, db: Database) -> int | None:
+class TelegramMessage(Protocol):
+    """Fields consumed from a Telethon message without leaking untyped APIs."""
+
+    id: int
+    chat_id: int | None
+    text: str | None
+    date: object
+
+    def to_dict(self) -> dict[str, object]: ...
+
+
+class NewMessageEvent(Protocol):
+    """Minimal async event contract used by ingestion and the worker queue."""
+
+    message: TelegramMessage
+    chat_id: int | None
+    text: str | None
+
+    async def get_sender(self) -> object | None: ...
+
+    async def get_chat(self) -> object | None: ...
+
+
+async def ingest_message(
+    event: NewMessageEvent,
+    db: Database,
+    *,
+    store_raw_json: bool = False,
+) -> int | None:
     """Extract message data from a Telethon NewMessage event and store it.
 
     Returns the database row ID, or None if the message is a duplicate.
@@ -31,7 +61,9 @@ async def ingest_message(event, db: Database) -> int | None:
 
     # Extract chat info
     chat = await event.get_chat()
-    chat_id = msg.chat_id or event.chat_id
+    chat_id = msg.chat_id if msg.chat_id is not None else event.chat_id
+    if chat_id is None:
+        raise ValueError("Telegram update has no chat ID")
     chat_title = _get_chat_title(chat)
     chat_type = _get_chat_type(chat)
 
@@ -44,25 +76,22 @@ async def ingest_message(event, db: Database) -> int | None:
         sender_name=sender_name,
         text=msg.text,
         date=msg.date.isoformat() if isinstance(msg.date, datetime) else str(msg.date),
-        raw_json=_safe_to_json(msg.to_dict()) if msg.text else None,
+        raw_json=_safe_to_json(msg.to_dict()) if store_raw_json and msg.text else None,
     )
 
-    # Update chat metadata
-    await db.update_chat(chat_id=chat_id, title=chat_title, chat_type=chat_type)
-
     if row_id:
+        # Duplicate Telegram updates must not inflate denormalized chat counts.
+        await db.update_chat(chat_id=chat_id, title=chat_title, chat_type=chat_type)
         logger.debug(
-            "Ingested msg %d from [%s] %s: %s",
+            "Ingested Telegram message %d in chat %d",
             msg.id,
-            chat_title,
-            sender_name,
-            (msg.text or "")[:60],
+            chat_id,
         )
 
     return row_id
 
 
-def _get_sender_name(sender) -> str:
+def _get_sender_name(sender: object | None) -> str:
     """Extract a display name from a Telethon sender entity."""
     if sender is None:
         return "Unknown"
@@ -72,14 +101,14 @@ def _get_sender_name(sender) -> str:
     return getattr(sender, "title", None) or getattr(sender, "username", None) or "Unknown"
 
 
-def _get_chat_title(chat) -> str:
+def _get_chat_title(chat: object | None) -> str:
     """Extract chat title from a Telethon chat entity."""
     if chat is None:
         return "Unknown"
     return getattr(chat, "title", None) or "DM"
 
 
-def _get_chat_type(chat) -> str:
+def _get_chat_type(chat: object | None) -> str:
     """Determine chat type string."""
     if isinstance(chat, Channel):
         return "channel" if chat.broadcast else "supergroup"
@@ -88,7 +117,7 @@ def _get_chat_type(chat) -> str:
     return "private"
 
 
-def _safe_to_json(obj: dict) -> str | None:
+def _safe_to_json(obj: Mapping[str, object]) -> str | None:
     """Serialize a dict to JSON, handling non-serializable values."""
     try:
         return json.dumps(obj, default=str, ensure_ascii=False)

@@ -1,17 +1,25 @@
 [Unit]
-Description=Eidolon Telegram Monitor
+Description=Eidolon Telegram Scraper
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/eidolon-telegram
-ExecStart=%h/eidolon-telegram/.venv/bin/python3 main.py
+WorkingDirectory=%h/eidolon-telegram-scraper
+ExecStart=%h/eidolon-telegram-scraper/.venv/bin/eidolon-scraper
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=45
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/eidolon-telegram-scraper/data
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=default.target

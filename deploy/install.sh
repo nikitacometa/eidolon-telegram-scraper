@@ -1,38 +1,44 @@
 #!/usr/bin/env bash
 # First-time setup on a fresh VPS.
 # Usage: bash deploy/install.sh
-set -euo pipefail
+set -Eeuo pipefail
 
-REPO_DIR="$HOME/eidolon-telegram"
+umask 077
 
-echo "=== Eidolon Install ==="
+readonly REPO_DIR="${REPO_DIR:-$HOME/eidolon-telegram-scraper}"
 
-# Ensure Python 3.12+
-python3 --version
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
 
-# Create venv if missing
-if [ ! -d "$REPO_DIR/.venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv "$REPO_DIR/.venv"
-fi
+for command_name in uv systemctl; do
+    command -v "$command_name" >/dev/null || fail "missing required command: $command_name"
+done
 
-echo "Installing dependencies..."
-"$REPO_DIR/.venv/bin/pip" install --upgrade pip
-"$REPO_DIR/.venv/bin/pip" install -r "$REPO_DIR/requirements.txt"
+[[ -d "$REPO_DIR/.git" ]] || fail "repository not found at $REPO_DIR"
+[[ -f "$REPO_DIR/.env" ]] || fail "create $REPO_DIR/.env before installing the service"
+[[ -f "$REPO_DIR/config/watchers.yml" ]] || {
+    fail "copy config/watchers.example.yml to config/watchers.yml and configure it first"
+}
 
-# Ensure data directory exists
+printf 'Installing locked production dependencies...\n'
+(
+    cd "$REPO_DIR"
+    uv sync --frozen --no-dev
+)
+
 mkdir -p "$REPO_DIR/data"
+chmod 700 "$REPO_DIR/data"
+chmod 600 "$REPO_DIR/.env"
 
-# Install systemd user service
 mkdir -p "$HOME/.config/systemd/user"
 cp "$REPO_DIR/deploy/eidolon.service" "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user enable eidolon.service
 
-echo ""
-echo "=== Done ==="
-echo "Next steps:"
-echo "  1. Create $REPO_DIR/.env with your secrets"
-echo "  2. Run: systemctl --user start eidolon"
-echo "  3. Check: systemctl --user status eidolon"
-echo "  4. Logs: journalctl --user -u eidolon -f"
+printf '%s\n' \
+    "Install complete." \
+    "Start:  systemctl --user start eidolon" \
+    "Status: systemctl --user status eidolon" \
+    "Logs:   journalctl --user -u eidolon -f"

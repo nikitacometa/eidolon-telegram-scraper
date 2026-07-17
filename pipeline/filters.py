@@ -17,12 +17,12 @@ class RuleFilter:
         self.watcher = watcher
         self.rules = watcher.rules
 
-        # Pre-compile keyword patterns for performance
+        # Match complete words/phrases so `rent` does not match `current`.
         self._positive_patterns = [
-            re.compile(re.escape(kw), re.IGNORECASE) for kw in self.rules.keywords
+            (keyword, _keyword_pattern(keyword)) for keyword in self.rules.keywords
         ]
         self._negative_patterns = [
-            re.compile(re.escape(kw), re.IGNORECASE) for kw in self.rules.keywords_negative
+            (keyword, _keyword_pattern(keyword)) for keyword in self.rules.keywords_negative
         ]
 
     def check(self, text: str | None) -> FilterResult:
@@ -38,27 +38,36 @@ class RuleFilter:
             return FilterResult(passed=False, reason="too_short")
 
         # Negative keyword check (reject if found)
-        for pattern in self._negative_patterns:
+        for keyword, pattern in self._negative_patterns:
             if pattern.search(text):
                 return FilterResult(
                     passed=False,
                     reason="negative_keyword",
-                    matched_keyword=pattern.pattern,
+                    matched_keyword=keyword,
                 )
 
         # Positive keyword check (accept if any found)
         if self._positive_patterns:
-            for pattern in self._positive_patterns:
+            for keyword, pattern in self._positive_patterns:
                 if pattern.search(text):
                     return FilterResult(
                         passed=True,
                         reason="keyword_match",
-                        matched_keyword=pattern.pattern,
+                        matched_keyword=keyword,
                     )
             return FilterResult(passed=False, reason="no_keyword_match")
 
         # No keywords configured — pass everything
         return FilterResult(passed=True, reason="no_rules")
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    escaped = re.escape(keyword)
+    if keyword[0].isalnum():
+        escaped = rf"(?<!\w){escaped}"
+    if keyword[-1].isalnum():
+        escaped = rf"{escaped}(?!\w)"
+    return re.compile(escaped, re.IGNORECASE)
 
 
 class FilterResult:
