@@ -16,7 +16,6 @@
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
-| E-031 | Rebrand repository and publish portfolio-grade README | in_progress | high | `eidolon-telegram-scraper` |
 
 ## Backlog — Phase 3: Autonomous Agent
 
@@ -62,4 +61,5 @@
 | E-028 | Build Evaluation Lab and regression dataset | done | high | Versioned 20-case baseline, F1 0.9412 |
 | E-029 | Add durable processing, outbox, and bounded workers | done | high | Atomic ingress/outcome/delivery and crash recovery |
 | E-030 | Add FastAPI control plane, Docker, lockfile, and CI | done | high | Reproducible production signal |
+| E-031 | Rebrand repository and publish portfolio-grade README | done | high | `eidolon-telegram-scraper`; GitHub CI passed |
 | E-034 | Harden degraded AI policy, digest grounding, and lease fencing | done | critical | Safe defaults, validated citations, stale-worker protection |
