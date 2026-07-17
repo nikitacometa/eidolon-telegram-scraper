@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-032**
+- Next available ID: **E-035**
 
 ---
 
@@ -16,8 +16,7 @@
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
-| E-029 | Add durable processing, outbox, and bounded workers | in_progress | high | Idempotency and crash recovery |
-| E-031 | Rebrand repository and publish portfolio-grade README | todo | high | `eidolon-telegram-scraper` |
+| E-031 | Rebrand repository and publish portfolio-grade README | in_progress | high | `eidolon-telegram-scraper` |
 
 ## Backlog — Phase 3: Autonomous Agent
 
@@ -36,6 +35,8 @@
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
 | E-013 | Monitoring: filter stats dashboard | todo | low | Track pass/drop rates per watcher per level |
+| E-032 | Improve blind-set recall with uncertainty routing | todo | high | Promote v3 misses to dev; evaluate on a new blind corpus |
+| E-033 | Add durable digest chunk delivery | todo | medium | Resume partial summaries through the outbox |
 
 ## Done
 
@@ -50,13 +51,15 @@
 | E-007 | Integration: wire pipeline into main event loop | done | high | Full pipeline in main.py — 4 integration tests |
 | E-008 | First watcher: Phangan housing monitor | done | high | Live with real chat IDs |
 | E-009 | Pipeline: embedding similarity filter (Level 2) | done | medium | `pipeline/embeddings.py` — ChromaDB + text-embedding-3-small |
-| E-010 | Pipeline: LLM classification filter (Level 3) | done | medium | `pipeline/llm.py` — GPT-4.1-mini, fail-open |
+| E-010 | Pipeline: LLM classification filter (Level 3) | done | medium | `pipeline/llm.py` — typed GPT-4.1-mini decision, safe degraded default |
 | E-011 | LLM: daily digest summarization | done | medium | `pipeline/summarizer.py` — evening digest at 20:00 ICT |
 | E-012 | Digest mode: periodic chat summaries | done | low | Scheduler in main.py, summary via dispatcher |
 | E-015 | Deploy: systemd unit for Linux server | done | low | `deploy/` — install.sh, deploy.sh, eidolon.service |
 | E-016 | Deploy Eidolon to Linux VPS | done | high | Live via systemd user service |
-| E-017 | Create Eidolon bot via @BotFather | done | high | @EidolonSpyBot |
+| E-017 | Create Eidolon bot via @BotFather | done | high | Dedicated alert bot configured |
 | E-026 | Harden correctness, security, and public configuration | done | critical | Regression-covered audit milestone 1 |
 | E-027 | Add typed AI decisions and provider boundaries | done | high | Structured outputs and provenance |
 | E-028 | Build Evaluation Lab and regression dataset | done | high | Versioned 20-case baseline, F1 0.9412 |
+| E-029 | Add durable processing, outbox, and bounded workers | done | high | Atomic ingress/outcome/delivery and crash recovery |
 | E-030 | Add FastAPI control plane, Docker, lockfile, and CI | done | high | Reproducible production signal |
+| E-034 | Harden degraded AI policy, digest grounding, and lease fencing | done | critical | Safe defaults, validated citations, stale-worker protection |

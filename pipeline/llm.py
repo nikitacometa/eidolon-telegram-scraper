@@ -115,7 +115,9 @@ class LLMClassifier:
             )
             parsed = response.choices[0].message.parsed
             if parsed is None:
-                logger.warning("LLM returned no parsed classification; applying fail-open policy")
+                logger.warning(
+                    "LLM returned no parsed classification; watcher degradation policy decides"
+                )
                 return _degraded_decision(
                     model=settings.llm_model,
                     started=started,
@@ -124,7 +126,8 @@ class LLMClassifier:
             normalized_evidence = _source_excerpt(parsed.evidence, text)
             if normalized_evidence is None:
                 logger.warning(
-                    "LLM evidence was not an exact message excerpt; applying fail-open policy"
+                    "LLM evidence was not an exact message excerpt; "
+                    "watcher degradation policy decides"
                 )
                 return _degraded_decision(
                     model=settings.llm_model,

@@ -84,7 +84,7 @@ class EmbeddingFilter:
     async def check(self, text: str, watcher_name: str) -> EmbeddingDecision:
         """Return an explainable semantic-stage decision.
 
-        Provider failures remain fail-open but are explicitly marked `DEGRADED`.
+        Provider failures return a degraded neutral decision; watcher policy decides.
         """
         started = time.perf_counter()
         collection = self._collections.get(watcher_name)
@@ -195,7 +195,7 @@ class EmbeddingFilter:
             return EmbeddingDecision(
                 passed=True,
                 status=StageStatus.DEGRADED,
-                reason="embedding stage failed; accepted by fail-open policy",
+                reason="embedding stage failed; watcher degradation policy decides",
                 model=settings.embedding_model,
                 latency_ms=_elapsed_ms(started),
                 error_code=type(error).__name__,

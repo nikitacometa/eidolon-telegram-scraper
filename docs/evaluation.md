@@ -13,10 +13,12 @@ intent-policy, and structured-LLM components used by the worker.
 | `relevance-holdout-v2.jsonl` | Adversarial development set | 32 | Balanced set that exposed deterministic-gate recall loss |
 | `relevance-holdout-v3.jsonl` | Final blind holdout | 40 | Independently authored, balanced by label and language; not used for tuning |
 
-Current artifacts include SHA-256 hashes for the dataset and watcher config, the prompt
-version, models, intent and degradation policy, threshold, margin, per-case stopping
-stage, aggregate latency/token usage, and machine-readable stage errors. Historical blind
-artifacts retain the policy and config hash under which they were first observed.
+Current v0.2 artifacts include SHA-256 hashes for the dataset and watcher config, the
+prompt version, models, intent and degradation policy, threshold, margin, per-case
+stopping stage, aggregate latency/token usage, and machine-readable stage errors.
+Historical blind artifacts retain their original config hash; an omitted
+`degraded_policy` denotes the legacy availability-first `accept` behavior and is handled
+explicitly by compatibility code.
 
 ## Reproduce
 

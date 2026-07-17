@@ -2,51 +2,52 @@
 
 ## Project Structure & Module Organization
 
-`main.py` starts the Telethon listener; `auth.py` creates the dedicated account session.
-Message processing lives in `pipeline/`: ingestion, filters, LLM analysis, summaries, and
-alert dispatch. Configuration models and the watcher source of truth are under `config/`,
-especially `config/watchers.yml`. SQLite access and schemas live in `storage/`. Keep tests
-in `tests/`, using names such as `test_filters.py`. Deployment files are in `deploy/`;
-longer technical notes belong in `docs/`.
+`main.py` owns the Telethon session, ingress, workers, recovery, and summaries.
+`pipeline/` contains typed stages: rules, embeddings, LLM
+classification, orchestration, and Telegram delivery. SQLite code and migrations live in
+`storage/`; validated settings and watcher policy live in `config/`. `api.py` is a
+separate read-only FastAPI control plane. Keep tests in `tests/test_<module>.py`,
+evaluation corpora in `evals/data/`, committed results in `docs/`, and deployment
+scripts in `deploy/`.
 
 ## Build, Test, and Development Commands
 
-- `python3 -m venv .venv && source .venv/bin/activate` creates a local environment.
-- `pip install -r requirements.txt -r requirements-dev.txt` installs runtime and tooling
-  dependencies.
-- `python3 auth.py` generates the initial Telegram session; run it only for the dedicated
-  account and never concurrently with the listener.
-- `python3 main.py` runs the monitoring daemon locally.
-- `python3 -m pytest tests/` runs the complete test suite.
-- `ruff check . && ruff format --check .` verifies linting and formatting.
-- `mypy .` runs strict static type checks.
+- `uv sync --locked --dev` installs the locked dependency graph.
+- `uv run eidolon-auth` creates the dedicated account session and saves it to `.env`.
+- `uv run eidolon-scraper` starts the worker; never run two copies for one session.
+- `uv run uvicorn api:app --host 127.0.0.1 --port 8000` starts the control plane.
+- `uv run pytest --cov` runs unit and integration tests with the 80% coverage gate.
+- `uv run ruff format --check . && uv run ruff check .` checks style and lint rules.
+- `uv run mypy` runs strict static type checks.
+- `uv run eidolon-eval --level 1` runs the credential-free relevance baseline.
+- `docker compose -f compose.yml config --quiet` validates container configuration.
 
 ## Coding Style & Naming Conventions
 
-Target Python 3.12 and use four-space indentation. Ruff enforces a 100-character line
-length and checks imports, naming, modernization, bug patterns, and async usage. Use
-`snake_case` for functions and modules, `PascalCase` for classes, and explicit type
-annotations for new code. Keep async I/O non-blocking and preserve the pipeline order:
-rules, embeddings, then LLM.
+Target Python 3.12, four-space indentation, and a 100-character line limit. Use
+`snake_case` for functions/modules, `PascalCase` for classes, frozen or slotted typed
+contracts where practical, and explicit return types. Keep blocking work outside the
+event loop. Preserve the rules → embeddings → LLM order and make degraded provider
+behavior explicit rather than swallowing exceptions.
 
 ## Testing Guidelines
 
-Pytest uses strict markers and automatic asyncio support. Name files `test_<module>.py`
-and functions `test_<behavior>`. Test every filter level, including accepted, rejected,
-malformed, and provider-failure cases. Mock Telegram and OpenAI calls; tests must not
-contact live services or require secrets. Run the full suite before submitting changes.
+Pytest uses strict markers, asyncio support, timeouts, and branch coverage. Cover accepted,
+rejected, duplicate, cancellation, retry, malformed-output, and provider-failure paths.
+Mock Telegram/OpenAI in ordinary tests; only explicit evaluation commands may call live
+providers. Add anonymized EN/RU cases for relevance changes, calibrate on a development
+set, and reserve a new holdout for final measurement.
 
 ## Commit & Pull Request Guidelines
 
-Follow the existing history: lowercase imperative subjects such as `add daily digest`
-or `fix watcher validation`. Update the relevant `E-NNN` entry in `BOARD.md`, then commit
-each logical unit. Pull requests should explain the behavior change, link the task or
-issue, list tests run, and call out configuration or deployment impact. Include logs or
-screenshots only when they clarify user-visible alert behavior.
+History uses lowercase imperative subjects such as `fix retry accounting`. Update the
+related `E-NNN` row in `BOARD.md`, then commit each logical unit. Pull requests must
+describe behavior, tests, configuration/storage/cost impact, and linked tasks. Include
+screenshots only for user-visible alert changes.
 
 ## Security & Operational Safety
 
-Copy `.env.example` to `.env`; never commit credentials, session strings, databases, or
-generated state. Use one process per Telethon session. Keep monitoring read-only unless
-the task explicitly authorizes Telegram writes, and treat `config/watchers.yml` as the
-authoritative monitoring scope.
+Copy `.env.example` and `config/watchers.example.yml`; never commit credentials, session
+strings, real chat IDs, databases, or message data. Keep Telegram behavior read-only
+unless an approved task defines consent and rate limits. Bind the unauthenticated API to
+loopback, and document at-least-once—not exactly-once—delivery semantics.
