@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from config.settings import settings
 from config.watchers import (
     Watcher,
     WatcherConfigError,
@@ -12,6 +13,7 @@ from config.watchers import (
     get_chat_watchers,
     load_watchers,
 )
+from pipeline.policy import effective_policy_fingerprint
 
 
 @pytest.fixture
@@ -65,6 +67,25 @@ def test_keywords_lowercased(config_file: Path) -> None:
     assert "WORLD" not in watchers[0].rules.keywords
 
 
+def test_policy_fingerprint_covers_watcher_and_runtime_defaults(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watcher = load_watchers(config_file)[0]
+    original = effective_policy_fingerprint(watcher)
+
+    assert original == effective_policy_fingerprint(watcher)
+    assert original != effective_policy_fingerprint(
+        watcher.model_copy(update={"prompt": "A different trusted objective"})
+    )
+    monkeypatch.setattr(
+        settings,
+        "embedding_similarity_threshold",
+        settings.embedding_similarity_threshold + 0.01,
+    )
+    assert original != effective_policy_fingerprint(watcher)
+
+
 def test_load_nonexistent_file() -> None:
     """Missing monitoring policy should fail startup instead of silently doing nothing."""
     with pytest.raises(WatcherConfigError, match="watchers config not found"):
@@ -106,6 +127,23 @@ def test_load_empty_file(tmp_path: Path) -> None:
                 "llm_level": 4,
             }
         ],
+        [
+            {
+                "name": "missing-semantic-policy",
+                "chats": [-100111],
+                "rules": {},
+                "llm_level": 2,
+            }
+        ],
+        [
+            {
+                "name": "blank-semantic-policy",
+                "chats": [-100111],
+                "rules": {},
+                "examples": {"positive": ["   "]},
+                "llm_level": 2,
+            }
+        ],
     ],
 )
 def test_invalid_watcher_config_fails_fast(
@@ -130,7 +168,7 @@ def test_duplicate_watcher_names_fail_fast(tmp_path: Path) -> None:
     path = tmp_path / "duplicates.yml"
     path.write_text(yaml.safe_dump({"watchers": [watcher, watcher]}))
 
-    with pytest.raises(WatcherConfigError, match="watcher names must be unique"):
+    with pytest.raises(WatcherConfigError, match="value_error"):
         load_watchers(path)
 
 
@@ -165,8 +203,30 @@ def test_watcher_defaults() -> None:
     w = Watcher(name="minimal", chats=[-100111], rules=WatcherRules())
     assert w.alert == "immediate"
     assert w.llm_level == 1
+    assert w.target_intents == ["offer"]
     assert w.prompt == ""
     assert w.rules.min_length == 0
     assert w.rules.keywords == []
     assert w.examples.positive == []
     assert w.examples.negative == []
+
+
+def test_target_intents_are_validated_and_deduplicated() -> None:
+    watcher = Watcher(
+        name="intent-policy",
+        chats=[-100111],
+        rules=WatcherRules(),
+        target_intents=["seek", "seek"],
+    )
+
+    assert watcher.target_intents == ["seek"]
+
+    with pytest.raises(ValueError, match="target_intents"):
+        Watcher.model_validate(
+            {
+                "name": "bad-intent",
+                "chats": [-100111],
+                "rules": {},
+                "target_intents": ["invented"],
+            }
+        )

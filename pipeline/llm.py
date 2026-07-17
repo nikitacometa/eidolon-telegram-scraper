@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
+from collections.abc import Collection
 from enum import StrEnum
 
 from openai import AsyncOpenAI
@@ -20,6 +22,9 @@ from pipeline.models import (
 logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "relevance-v2"
+MAX_MESSAGE_CHARS = 4000
+MESSAGE_HEAD_CHARS = 3000
+OMISSION_MARKER = "\n[...]\n"
 
 SYSTEM_PROMPT = """\
 You are a high-precision relevance gate for a Telegram monitoring pipeline.
@@ -49,9 +54,8 @@ class Verdict(StrEnum):
 class LLMClassifier:
     """Classify watcher-specific relevance using a strict Pydantic schema.
 
-    Provider failures are explicit `DEGRADED` decisions. The product policy is
-    still fail-open, but fallback traffic is no longer reported as a successful
-    model inference.
+    Provider failures are explicit `DEGRADED` decisions. The watcher applies
+    its own safe-by-default failure policy after classification.
     """
 
     def __init__(self, client: AsyncOpenAI | None = None) -> None:
@@ -94,7 +98,7 @@ class LLMClassifier:
             f"{SYSTEM_PROMPT}\n\nWatcher objective ({PROMPT_VERSION}):\n{trusted_objective}"
         )
         user_content = json.dumps(
-            {"telegram_message": text[:2000]},
+            {"telegram_message": _bounded_message_text(text)},
             ensure_ascii=False,
         )
 
@@ -117,11 +121,29 @@ class LLMClassifier:
                     started=started,
                     error_code="unparsed_response",
                 )
+            normalized_evidence = _source_excerpt(parsed.evidence, text)
+            if normalized_evidence is None:
+                logger.warning(
+                    "LLM evidence was not an exact message excerpt; applying fail-open policy"
+                )
+                return _degraded_decision(
+                    model=settings.llm_model,
+                    started=started,
+                    error_code="invalid_evidence",
+                )
+            if normalized_evidence != parsed.evidence:
+                parsed = parsed.model_copy(update={"evidence": normalized_evidence})
+            usage = getattr(response, "usage", None)
+            raw_input_tokens = getattr(usage, "prompt_tokens", 0)
+            raw_output_tokens = getattr(usage, "completion_tokens", 0)
+            raw_model = getattr(response, "model", None)
             return ClassificationDecision(
                 result=parsed,
                 status=StageStatus.OK,
-                model=settings.llm_model,
+                model=raw_model if isinstance(raw_model, str) else settings.llm_model,
                 latency_ms=_elapsed_ms(started),
+                input_tokens=(raw_input_tokens if isinstance(raw_input_tokens, int) else 0),
+                output_tokens=(raw_output_tokens if isinstance(raw_output_tokens, int) else 0),
             )
         except Exception as error:
             logger.error(
@@ -144,6 +166,29 @@ def decision_verdict(decision: ClassificationDecision) -> Verdict:
     return Verdict.OFFER
 
 
+def classification_passes(
+    decision: ClassificationDecision,
+    target_intents: Collection[str],
+    degraded_policy: str = "reject",
+) -> bool:
+    """Apply watcher intent and explicitly configured degradation policy."""
+    if decision.status is not StageStatus.OK:
+        return degraded_policy == "accept"
+    return decision.result.relevant and decision.result.intent.value in target_intents
+
+
+def build_watcher_objective(
+    *,
+    description: str,
+    prompt: str,
+    target_intents: Collection[str],
+) -> str:
+    """Render one trusted policy string shared by production and evaluations."""
+    base = "\n\n".join(part for part in (description.strip(), prompt.strip()) if part)
+    allowed = ", ".join(sorted(target_intents))
+    return f"{base}\n\nAccepted message intents: {allowed}.".strip()
+
+
 def _degraded_decision(
     *,
     model: str,
@@ -155,7 +200,7 @@ def _degraded_decision(
             relevant=True,
             intent=Intent.OFFER,
             confidence=0.0,
-            reason="Provider unavailable; accepted by explicit fail-open policy.",
+            reason="Provider unavailable; watcher degradation policy decides.",
             evidence="Rules-only fallback.",
         ),
         status=StageStatus.DEGRADED,
@@ -163,6 +208,25 @@ def _degraded_decision(
         latency_ms=_elapsed_ms(started),
         error_code=error_code,
     )
+
+
+def _bounded_message_text(text: str) -> str:
+    """Keep both ends of a long Telegram message within a predictable budget."""
+    if len(text) <= MAX_MESSAGE_CHARS:
+        return text
+    tail_chars = MAX_MESSAGE_CHARS - MESSAGE_HEAD_CHARS - len(OMISSION_MARKER)
+    return f"{text[:MESSAGE_HEAD_CHARS]}{OMISSION_MARKER}{text[-tail_chars:]}"
+
+
+def _source_excerpt(evidence: str, source: str) -> str | None:
+    """Resolve harmless quote/case drift back to the exact source substring."""
+    candidate = evidence.strip().strip("\"'“”‘’")
+    if not candidate:
+        return None
+    match = re.search(re.escape(candidate), source, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(0)
 
 
 def _elapsed_ms(started: float) -> float:

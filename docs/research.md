@@ -36,7 +36,11 @@ system that is measurable, explainable, failure-aware, and reproducible.
 
 The embedded Chroma dependency is held below the affected range in
 [GHSA-f4j7-r4q5-qw2c](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c).
-`uv.lock`, Dependabot, and `pip-audit` make that exception visible and reviewable.
+Chroma 0.6.3 also calls PostHog's pre-6 positional telemetry API, so the direct
+`posthog>=5.4,<6` constraint prevents a resolver-valid but runtime-incompatible pairing;
+anonymous product telemetry is disabled as a separate privacy control. `uv.lock`,
+Dependabot, a Chroma add/query smoke test, and `pip-audit` make these compatibility holds
+visible and reviewable.
 
 ## Deliberate Non-Goals
 

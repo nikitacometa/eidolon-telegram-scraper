@@ -1,8 +1,11 @@
 """Tests for the explainable Level 2 embedding decision contract."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import chromadb
 import pytest
+from chromadb.config import Settings as ChromaSettings
 
 from config.watchers import Watcher, WatcherExamples, WatcherRules
 from pipeline.embeddings import (
@@ -10,6 +13,7 @@ from pipeline.embeddings import (
     ReferenceText,
     _build_reference_records,
     _build_reference_texts,
+    _collection_metadata,
     _collection_name,
     _reference_fingerprint,
 )
@@ -54,15 +58,30 @@ def _filter_with_results(
     *,
     reference_count: int = 2,
     threshold: float = 0.70,
+    negative_margin: float = 0.05,
 ) -> tuple[EmbeddingFilter, MagicMock, MagicMock]:
+    normalized_results = dict(results)
+    documents = normalized_results.pop("documents", [[]])
+    document_rows = documents if isinstance(documents, list) else [[]]
+    first_row = document_rows[0] if document_rows else []
+    reference_ids = [f"reference-{index}" for index, _ in enumerate(first_row)]
+    normalized_results["ids"] = [reference_ids]
+
     client = MagicMock()
     client.embeddings.create = AsyncMock(return_value=_embedding_response([0.1, 0.2, 0.3]))
     collection = MagicMock()
     collection.count.return_value = reference_count
-    collection.query.return_value = results
-    collection.metadata = {"eidolon:threshold": threshold}
+    collection.query.return_value = normalized_results
+    collection.metadata = {
+        "eidolon:threshold": threshold,
+        "eidolon:negative_margin": negative_margin,
+    }
     embedding_filter = EmbeddingFilter(openai_client=client)
     embedding_filter._collections["test-watcher"] = collection
+    embedding_filter._reference_texts["test-watcher"] = {
+        reference_id: str(document)
+        for reference_id, document in zip(reference_ids, first_row, strict=True)
+    }
     return embedding_filter, client, collection
 
 
@@ -162,8 +181,9 @@ class TestEmbeddingDecision:
         assert decision.passed is False
         assert decision.status is StageStatus.OK
         assert decision.score == 0.8
+        assert decision.negative_score == 0.78
         assert decision.matched_reference == "Villa for rent"
-        assert "negative margin" in decision.reason
+        assert "configured margin" in decision.reason
 
     async def test_score_below_threshold_is_rejected(self) -> None:
         embedding_filter, _, _ = _filter_with_results(
@@ -307,7 +327,70 @@ class TestIndexLifecycle:
             reference.text for reference in references
         ]
         add_call = fresh_collection.add.call_args
+        assert "documents" not in add_call.kwargs
         assert add_call.kwargs["metadatas"] == [
             {"label": reference.label} for reference in references
         ]
         assert embedding_filter._collections[housing_watcher.name] is fresh_collection
+
+    async def test_changed_threshold_rebuilds_persisted_decision_policy(
+        self,
+        housing_watcher: Watcher,
+    ) -> None:
+        references = _build_reference_records(housing_watcher)
+        fingerprint = _reference_fingerprint(references)
+        stale_metadata = _collection_metadata(
+            housing_watcher,
+            references,
+            fingerprint,
+        )
+        stale_metadata["eidolon:threshold"] = 0.11
+
+        client = MagicMock()
+        client.embeddings.create = AsyncMock(
+            return_value=_embedding_response(*[[0.1] for _ in references])
+        )
+        stale_collection = MagicMock()
+        stale_collection.metadata = stale_metadata
+        stale_collection.count.return_value = 1
+        fresh_collection = MagicMock()
+        fresh_collection.count.return_value = 0
+        chroma = MagicMock()
+        chroma.get_or_create_collection.return_value = stale_collection
+        chroma.create_collection.return_value = fresh_collection
+
+        await EmbeddingFilter(
+            openai_client=client,
+            chroma_client=chroma,
+        )._seed_collection(housing_watcher)
+
+        chroma.delete_collection.assert_called_once_with(_collection_name(housing_watcher.name))
+        created_metadata = chroma.create_collection.call_args.kwargs["metadata"]
+        assert created_metadata["eidolon:threshold"] == 0.72
+
+
+def test_chroma_telemetry_opt_out_add_query_smoke(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = chromadb.PersistentClient(
+        path=str(tmp_path),
+        settings=ChromaSettings(anonymized_telemetry=False),
+    )
+    collection = client.get_or_create_collection(
+        "telemetry-smoke",
+        metadata={"hnsw:space": "cosine"},
+    )
+    collection.add(
+        ids=["positive"],
+        embeddings=[[1.0, 0.0]],
+    )
+
+    result = collection.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+
+    assert result["ids"] == [["positive"]]
+    assert not [
+        record
+        for record in caplog.records
+        if record.name.startswith("chromadb.telemetry") and record.levelname == "ERROR"
+    ]

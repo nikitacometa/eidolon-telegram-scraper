@@ -7,7 +7,6 @@ Run once interactively. By default the session is written to `.env` with mode
 import argparse
 import asyncio
 import os
-import sys
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -72,6 +71,13 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
+    if not settings.telegram_api_id or not settings.telegram_api_hash:
+        print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env")
+        raise SystemExit(1)
+    if not settings.telegram_phone:
+        print("Error: TELEGRAM_PHONE must be set in .env")
+        raise SystemExit(1)
+
     print("Generating Telegram session string...")
     print("You will be prompted for a verification code sent to your Telegram app.\n")
 
@@ -85,10 +91,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if not settings.telegram_api_id or not settings.telegram_api_hash:
-        print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env")
-        sys.exit(1)
-    if not settings.telegram_phone:
-        print("Error: TELEGRAM_PHONE must be set in .env")
-        sys.exit(1)
     main()

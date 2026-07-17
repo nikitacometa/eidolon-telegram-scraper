@@ -1,6 +1,9 @@
 # Secrets
 .env
-*.session
+.env.*
+!.env.example
+.envrc
+*.session*
 session_string.txt
 config/watchers.yml
 
@@ -22,11 +25,11 @@ env/
 *.db
 *.db-journal
 *.db-wal
-data/
+/data/
 
 # ChromaDB
 chroma_data/
-data/chroma/
+/data/chroma/
 
 # IDE
 .idea/
@@ -46,6 +49,7 @@ logs/
 .pytest_cache/
 .coverage
 coverage.json
+coverage.xml
 htmlcov/
 
 # Evaluation output

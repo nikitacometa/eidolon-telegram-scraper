@@ -38,15 +38,21 @@ configuration and must remain untracked; commit only the redacted example file.
 ## Data Privacy and Retention
 
 SQLite stores message text, sender and chat metadata, pipeline decisions, and alert
-delivery state. L2 embeddings, L3 classification, and enabled daily summaries send
-message content to OpenAI. Embedded Chroma stores watcher reference embeddings.
-`STORE_RAW_TELEGRAM_JSON` is disabled by default, but disabling it does not disable normal
-message-text storage.
+delivery state. L2 sends message text and watcher examples to OpenAI for embeddings. L3
+sends message text plus the watcher description/prompt to OpenAI; enabled summaries send
+selected message fields. Do not put secrets, private identifiers, or unnecessary PII in
+watcher objectives or examples. Embedded Chroma stores reference vectors, opaque IDs, and
+positive/negative labels; reference plaintext remains in local watcher configuration and
+process memory rather than Chroma documents. `STORE_RAW_TELEGRAM_JSON` is disabled by
+default, but disabling it does not disable normal message-text storage.
 
-`RETENTION_DAYS` defaults to 30 days. Purging runs when the worker starts, so a long-lived
-process needs an operational restart or separate maintenance schedule to enforce the
-window continuously. Encrypt and access-control host volumes and backups, and expire
-backups under the same retention policy.
+`RETENTION_DAYS` defaults to 30 days. The worker purges at startup and repeats the sweep
+every `RETENTION_SWEEP_HOURS` (24 by default). Pending pipeline jobs and pending alert
+deliveries are exempt until they become terminal so retention cannot silently destroy
+recoverable work; monitor backlog age because this can extend storage beyond the nominal
+window. Failed jobs remain visible through `/stats` and become retention-eligible.
+Encrypt and access-control host volumes and backups, and expire backups under the same
+retention policy.
 
 ## Control-Plane Exposure
 

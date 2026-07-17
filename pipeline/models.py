@@ -25,6 +25,14 @@ class AlertDeliveryStatus(StrEnum):
     FAILED = "failed"
 
 
+class PipelineRunStatus(StrEnum):
+    """Lifecycle state of durable message/watcher processing."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Intent(StrEnum):
     """Message intent returned by the relevance classifier."""
 
@@ -53,6 +61,8 @@ class ClassificationDecision:
     status: StageStatus
     model: str
     latency_ms: float
+    input_tokens: int = 0
+    output_tokens: int = 0
     error_code: str | None = None
 
 
@@ -63,8 +73,15 @@ class EmbeddingDecision:
     passed: bool
     status: StageStatus
     score: float | None = None
+    negative_score: float | None = None
+    threshold: float | None = None
+    negative_margin: float | None = None
     matched_reference: str | None = None
+    matched_negative_reference: str | None = None
     reason: str = ""
+    model: str = ""
+    latency_ms: float = 0.0
+    input_tokens: int = 0
     error_code: str | None = None
 
 
@@ -110,8 +127,33 @@ class AlertOutboxItem:
     chat_title: str
     sender_name: str
     text: str
+    matched_keyword: str | None
     filter_level: int
     delivery_attempts: int
+    claim_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class AlertDraft:
+    """Immutable alert payload committed with its terminal pipeline outcome."""
+
+    filter_level: int
+    score: float | None = None
+    llm_response: str | None = None
+    matched_keyword: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPipelineJob:
+    """Pending pipeline work reconstructed from durable message state."""
+
+    message_id: int
+    watcher_name: str
+    chat_id: int
+    chat_title: str
+    sender_name: str
+    text: str
+    watcher_config_fingerprint: str
 
 
 @dataclass(slots=True)
@@ -120,24 +162,27 @@ class PipelineOutcome:
 
     message_id: int
     watcher_name: str
+    processing_status: PipelineRunStatus = PipelineRunStatus.COMPLETED
     rule_passed: bool = False
     embedding_status: StageStatus = StageStatus.SKIPPED
     embedding_passed: bool = False
     embedding_score: float | None = None
+    embedding_negative_score: float | None = None
+    embedding_threshold: float | None = None
     embedding_model: str | None = None
     embedding_latency_ms: float | None = None
+    embedding_input_tokens: int = 0
     llm_status: StageStatus = StageStatus.SKIPPED
     llm_relevant: bool = False
+    llm_passed: bool = False
     llm_verdict: str | None = None
     llm_confidence: float | None = None
     llm_model: str | None = None
     llm_prompt_version: str | None = None
     llm_latency_ms: float | None = None
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+    accepted: bool = False
     alert_created: bool = False
     alert_sent: bool = False
     error_code: str | None = None
-
-    @property
-    def accepted(self) -> bool:
-        """Whether this watcher accepted the message for alerting."""
-        return self.alert_created

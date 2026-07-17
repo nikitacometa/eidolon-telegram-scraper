@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Protocol
 
@@ -47,6 +47,8 @@ async def ingest_message(
     db: Database,
     *,
     store_raw_json: bool = False,
+    watcher_names: Sequence[str] = (),
+    watcher_fingerprints: Mapping[str, str] | None = None,
 ) -> int | None:
     """Extract message data from a Telethon NewMessage event and store it.
 
@@ -54,34 +56,49 @@ async def ingest_message(
     """
     msg = event.message
 
-    # Extract sender info
-    sender = await event.get_sender()
+    # Entity lookup is network-backed and optional. Persist the update even
+    # when Telegram cannot enrich sender/chat metadata.
+    try:
+        sender = await event.get_sender()
+    except Exception as error:
+        logger.warning("Sender metadata unavailable: error=%s", type(error).__name__)
+        sender = None
     sender_id = getattr(sender, "id", None)
     sender_name = _get_sender_name(sender)
 
-    # Extract chat info
-    chat = await event.get_chat()
+    try:
+        chat = await event.get_chat()
+    except Exception as error:
+        logger.warning("Chat metadata unavailable: error=%s", type(error).__name__)
+        chat = None
     chat_id = msg.chat_id if msg.chat_id is not None else event.chat_id
     if chat_id is None:
         raise ValueError("Telegram update has no chat ID")
     chat_title = _get_chat_title(chat)
     chat_type = _get_chat_type(chat)
+    raw_json = None
+    if store_raw_json and msg.text:
+        try:
+            raw_json = _safe_to_json(msg.to_dict())
+        except Exception as error:
+            logger.warning("Raw Telegram payload unavailable: error=%s", type(error).__name__)
 
     # Store the message
     row_id = await db.store_message(
         telegram_msg_id=msg.id,
         chat_id=chat_id,
         chat_title=chat_title,
+        chat_type=chat_type,
         sender_id=sender_id,
         sender_name=sender_name,
         text=msg.text,
         date=msg.date.isoformat() if isinstance(msg.date, datetime) else str(msg.date),
-        raw_json=_safe_to_json(msg.to_dict()) if store_raw_json and msg.text else None,
+        raw_json=raw_json,
+        watcher_names=watcher_names,
+        watcher_fingerprints=watcher_fingerprints,
     )
 
     if row_id:
-        # Duplicate Telegram updates must not inflate denormalized chat counts.
-        await db.update_chat(chat_id=chat_id, title=chat_title, chat_type=chat_type)
         logger.debug(
             "Ingested Telegram message %d in chat %d",
             msg.id,

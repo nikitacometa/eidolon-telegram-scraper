@@ -17,10 +17,11 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     watcher_name TEXT NOT NULL,
-    message_id INTEGER REFERENCES messages(id),
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     filter_level INTEGER NOT NULL,  -- 1=rule, 2=embedding, 3=llm
     score REAL,
     llm_response TEXT,
+    matched_keyword TEXT,
     delivery_status TEXT NOT NULL DEFAULT 'pending'
         CHECK(delivery_status IN ('pending', 'sent', 'failed')),
     delivery_attempts INTEGER NOT NULL DEFAULT 0
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_error TEXT,
     claimed_until TIMESTAMP,
+    lease_owner TEXT,
     sent_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(watcher_name, message_id)
@@ -37,23 +39,34 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL REFERENCES messages(id),
     watcher_name TEXT NOT NULL,
+    watcher_config_fingerprint TEXT NOT NULL DEFAULT 'legacy-unknown',
+    processing_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(processing_status IN ('pending', 'completed', 'failed')),
     rule_passed INTEGER NOT NULL DEFAULT 0,
     embedding_status TEXT NOT NULL DEFAULT 'skipped',
     embedding_passed INTEGER NOT NULL DEFAULT 0,
     embedding_score REAL,
+    embedding_negative_score REAL,
+    embedding_threshold REAL,
     embedding_model TEXT,
     embedding_latency_ms REAL,
+    embedding_input_tokens INTEGER NOT NULL DEFAULT 0,
     llm_status TEXT NOT NULL DEFAULT 'skipped',
     llm_relevant INTEGER NOT NULL DEFAULT 0,
+    llm_passed INTEGER NOT NULL DEFAULT 0,
     llm_verdict TEXT,
     llm_confidence REAL,
     llm_model TEXT,
     llm_prompt_version TEXT,
     llm_latency_ms REAL,
+    llm_input_tokens INTEGER NOT NULL DEFAULT 0,
+    llm_output_tokens INTEGER NOT NULL DEFAULT 0,
+    accepted INTEGER NOT NULL DEFAULT 0,
     alert_created INTEGER NOT NULL DEFAULT 0,
     alert_sent INTEGER NOT NULL DEFAULT 0,
     error_code TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
     UNIQUE(message_id, watcher_name)
 );
 
@@ -74,6 +87,7 @@ CREATE TABLE IF NOT EXISTS filter_stats (
     passed_level1 INTEGER DEFAULT 0,
     passed_level2 INTEGER DEFAULT 0,
     passed_level3 INTEGER DEFAULT 0,
+    accepted INTEGER DEFAULT 0,
     alerts_sent INTEGER DEFAULT 0,
     UNIQUE(watcher_name, date)
 );

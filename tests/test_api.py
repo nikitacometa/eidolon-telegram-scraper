@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from api import ReadOnlySQLite, create_app
+from pipeline.models import DeliveryResult, PipelineOutcome, PipelineRunStatus
 from storage.db import Database
 
 
@@ -46,11 +47,12 @@ async def _seed_stats(db_path: Path, selected_date: date) -> None:
                 passed_level1,
                 passed_level2,
                 passed_level3,
+                accepted,
                 alerts_sent
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("housing-watch", selected_date.isoformat(), 20, 12, 8, 5, 4),
+            ("housing-watch", selected_date.isoformat(), 20, 12, 8, 5, 5, 4),
         )
         await database.conn.execute(
             """
@@ -61,11 +63,12 @@ async def _seed_stats(db_path: Path, selected_date: date) -> None:
                 passed_level1,
                 passed_level2,
                 passed_level3,
+                accepted,
                 alerts_sent
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("archived-watch", selected_date.isoformat(), 3, 2, 0, 0, 1),
+            ("archived-watch", selected_date.isoformat(), 3, 2, 0, 0, 2, 1),
         )
         await database.conn.commit()
     finally:
@@ -193,6 +196,7 @@ def test_stats_returns_daily_rows_totals_and_provenance(tmp_path: Path) -> None:
                 "passed_level1": 2,
                 "passed_level2": 0,
                 "passed_level3": 0,
+                "accepted": 2,
                 "alerts_sent": 1,
             },
             {
@@ -201,6 +205,7 @@ def test_stats_returns_daily_rows_totals_and_provenance(tmp_path: Path) -> None:
                 "passed_level1": 12,
                 "passed_level2": 8,
                 "passed_level3": 5,
+                "accepted": 5,
                 "alerts_sent": 4,
             },
         ],
@@ -209,7 +214,14 @@ def test_stats_returns_daily_rows_totals_and_provenance(tmp_path: Path) -> None:
             "passed_level1": 14,
             "passed_level2": 8,
             "passed_level3": 5,
+            "accepted": 7,
             "alerts_sent": 5,
+        },
+        "backlog": {
+            "pending_pipeline_jobs": 0,
+            "failed_pipeline_jobs": 0,
+            "pending_alerts": 0,
+            "failed_alerts": 0,
         },
         "provenance": {
             "source": "sqlite.filter_stats",
@@ -239,9 +251,86 @@ def test_stats_includes_configured_watcher_with_zero_activity(tmp_path: Path) ->
             "passed_level1": 0,
             "passed_level2": 0,
             "passed_level3": 0,
+            "accepted": 0,
             "alerts_sent": 0,
         }
     ]
+
+
+def test_stats_exposes_pipeline_and_delivery_backlog(tmp_path: Path) -> None:
+    watchers_path = tmp_path / "watchers.yml"
+    _write_watchers(watchers_path)
+    db_path = tmp_path / "control.db"
+
+    async def seed_backlog() -> None:
+        database = Database(db_path)
+        await database.connect()
+        try:
+            pending_message = await database.store_message(
+                telegram_msg_id=90,
+                chat_id=-100123,
+                sender_id=1,
+                sender_name="Alice",
+                text="Villa for rent",
+                date="2026-07-17 12:00:00",
+                watcher_names=("housing-watch",),
+                watcher_fingerprints={"housing-watch": "policy-v1"},
+            )
+            failed_message = await database.store_message(
+                telegram_msg_id=91,
+                chat_id=-100123,
+                sender_id=2,
+                sender_name="Bob",
+                text="House for rent",
+                date="2026-07-17 12:01:00",
+            )
+            assert pending_message is not None
+            assert failed_message is not None
+            await database.record_pipeline_outcome(
+                PipelineOutcome(
+                    message_id=failed_message,
+                    watcher_name="archived-watch",
+                    processing_status=PipelineRunStatus.FAILED,
+                    error_code="pipeline_runtime_error",
+                )
+            )
+            await database.store_alert(
+                watcher_name="housing-watch",
+                message_id=pending_message,
+                filter_level=1,
+            )
+            failed_alert = await database.store_alert(
+                watcher_name="archived-watch",
+                message_id=failed_message,
+                filter_level=1,
+            )
+            claimed = await database.claim_due_alerts(limit=10)
+            failed_claim = next(item for item in claimed if item.alert_id == failed_alert)
+            await database.mark_alert_delivery_result(
+                failed_alert,
+                DeliveryResult(
+                    sent=False,
+                    retryable=False,
+                    error_code="telegram_http_403",
+                ),
+                claim_token=failed_claim.claim_token,
+            )
+        finally:
+            await database.close()
+
+    asyncio.run(seed_backlog())
+    app = create_app(db_path=db_path, watchers_path=watchers_path)
+
+    with TestClient(app) as client:
+        response = client.get("/stats", params={"date": "2026-07-17"})
+
+    assert response.status_code == 200
+    assert response.json()["backlog"] == {
+        "pending_pipeline_jobs": 1,
+        "failed_pipeline_jobs": 1,
+        "pending_alerts": 1,
+        "failed_alerts": 1,
+    }
 
 
 def test_stats_rejects_invalid_date(tmp_path: Path) -> None:

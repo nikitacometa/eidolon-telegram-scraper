@@ -10,19 +10,28 @@ import logging
 import signal
 import sys
 from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from config.settings import settings
-from config.watchers import Watcher, get_chat_watchers, load_watchers
+from config.watchers import (
+    Watcher,
+    WatcherConfigError,
+    get_chat_watchers,
+    load_watchers,
+)
 from pipeline.dispatcher import AlertDispatcher
 from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.ingestion import NewMessageEvent, ingest_message
-from pipeline.llm import LLMClassifier, decision_verdict
-from pipeline.models import PipelineOutcome, StageStatus
+from pipeline.llm import LLMClassifier
+from pipeline.models import PipelineOutcome, PipelineRunStatus
+from pipeline.policy import effective_policy_fingerprint
+from pipeline.processor import MessageProcessor
 from pipeline.summarizer import DailySummarizer
 from storage.db import Database
 
@@ -32,6 +41,48 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("eidolon")
+
+
+class RuntimeConfigurationError(ValueError):
+    """Raised when required daemon credentials or destinations are absent."""
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineWorkItem:
+    """Durably ingested message ready for in-memory execution."""
+
+    message_id: int
+    text: str | None
+    watcher_names: tuple[str, ...]
+
+
+def _validate_runtime_configuration(watchers: list[Watcher]) -> None:
+    missing: list[str] = []
+    if not settings.telegram_api_id:
+        missing.append("TELEGRAM_API_ID")
+    if not settings.telegram_api_hash:
+        missing.append("TELEGRAM_API_HASH")
+    if not settings.telegram_session_string:
+        missing.append("TELEGRAM_SESSION_STRING")
+
+    digest_configured = any(watcher.alert == "digest" for watcher in watchers)
+    if digest_configured and not settings.summary_enabled:
+        raise RuntimeConfigurationError("digest watcher configured while SUMMARY_ENABLED=false")
+    ai_required = settings.summary_enabled or any(watcher.llm_level >= 2 for watcher in watchers)
+    if ai_required and not settings.openai_api_key:
+        missing.append("OPENAI_API_KEY")
+
+    delivery_required = settings.summary_enabled or any(
+        watcher.alert == "immediate" for watcher in watchers
+    )
+    if delivery_required and not (settings.eidolon_bot_token or settings.pantheon_bot_token):
+        missing.append("EIDOLON_BOT_TOKEN or PANTHEON_BOT_TOKEN")
+    if delivery_required and not settings.pantheon_chat_id:
+        missing.append("PANTHEON_CHAT_ID")
+    if missing:
+        raise RuntimeConfigurationError(
+            "missing required runtime configuration: " + ", ".join(missing)
+        )
 
 
 class Eidolon:
@@ -50,16 +101,31 @@ class Eidolon:
         self.llm_classifier = LLMClassifier()
         self.summarizer = DailySummarizer()
         self._shutdown_event = asyncio.Event()
-        self._message_queue: asyncio.Queue[NewMessageEvent] = asyncio.Queue(
+        self._message_queue: asyncio.Queue[PipelineWorkItem] = asyncio.Queue(
             maxsize=settings.processing_queue_size
         )
         self._worker_tasks: list[asyncio.Task[None]] = []
         self._summary_task: asyncio.Task[None] | None = None
+        self._outbox_task: asyncio.Task[None] | None = None
+        self._maintenance_task: asyncio.Task[None] | None = None
+        self._outbox_wakeup = asyncio.Event()
+        self._fatal_ingress_error: BaseException | None = None
 
         # Load watcher configs
         self.watchers = load_watchers(settings.watchers_path)
+        _validate_runtime_configuration(self.watchers)
+        self.watchers_by_name = {watcher.name: watcher for watcher in self.watchers}
+        self.watcher_fingerprints = {
+            watcher.name: effective_policy_fingerprint(watcher) for watcher in self.watchers
+        }
         self.chat_watchers = get_chat_watchers(self.watchers)
         self.filters: dict[str, RuleFilter] = {w.name: RuleFilter(w) for w in self.watchers}
+        self.processor = MessageProcessor(
+            store=self.db,
+            rule_filters=self.filters,
+            embedding_filter=self.embedding_filter,
+            llm_classifier=self.llm_classifier,
+        )
 
     async def start(self) -> None:
         """Connect to Telegram and database, register handlers, run until shutdown."""
@@ -82,6 +148,7 @@ class Eidolon:
                 stack.push_async_callback(self.llm_classifier.close)
                 await self.summarizer.start()
                 stack.push_async_callback(self.summarizer.close)
+                await self._recover_pending_pipeline_jobs()
                 await self.client.start()
                 stack.push_async_callback(self.client.disconnect)
 
@@ -104,6 +171,10 @@ class Eidolon:
                         settings.processing_queue_size,
                     )
                     await self._shutdown_event.wait()
+                    if self._fatal_ingress_error is not None:
+                        raise RuntimeError(
+                            "daemon stopped after durable ingress failed"
+                        ) from self._fatal_ingress_error
                     logger.info("Shutdown requested")
                 finally:
                     await self._stop_background_tasks()
@@ -120,6 +191,14 @@ class Eidolon:
             )
             for worker_id in range(settings.processing_workers)
         ]
+        self._outbox_task = asyncio.create_task(
+            self._run_outbox_worker(),
+            name="alert-outbox",
+        )
+        self._maintenance_task = asyncio.create_task(
+            self._run_retention_sweeper(),
+            name="retention-sweeper",
+        )
         if settings.summary_enabled:
             self._summary_task = asyncio.create_task(
                 self._run_summary_scheduler(),
@@ -131,11 +210,24 @@ class Eidolon:
             )
 
     async def _stop_background_tasks(self) -> None:
+        # Stop ingress before draining the bounded queue. A message committed
+        # just before disconnect already has durable pending watcher jobs.
+        if self.client.is_connected():
+            try:
+                await self.client.disconnect()
+            except Exception:
+                logger.exception("Telegram disconnect failed during shutdown")
+
         if self._summary_task is not None:
             self._summary_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._summary_task
             self._summary_task = None
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._maintenance_task
+            self._maintenance_task = None
 
         try:
             await asyncio.wait_for(
@@ -153,19 +245,53 @@ class Eidolon:
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks.clear()
 
+        if self._outbox_task is not None:
+            try:
+                await asyncio.wait_for(
+                    self._outbox_task,
+                    timeout=settings.shutdown_timeout_seconds,
+                )
+            except TimeoutError:
+                self._outbox_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._outbox_task
+            self._outbox_task = None
+
+        # Flush alerts created while the message queue was draining. Future
+        # retries remain durable and will be recovered on the next start.
+        try:
+            async with asyncio.timeout(settings.shutdown_timeout_seconds):
+                await self._deliver_due_alerts()
+        except TimeoutError:
+            logger.warning("Final outbox flush timed out; alerts remain durable")
+        except Exception:
+            logger.exception("Final outbox flush failed; alerts remain durable")
+
     def _register_handlers(self) -> None:
         """Register Telethon event handlers."""
 
         @self.client.on(events.NewMessage)  # type: ignore[untyped-decorator]
         async def on_new_message(event: NewMessageEvent) -> None:
-            await self._message_queue.put(event)
+            try:
+                work_item = await self._ingest_update(event)
+                if work_item is not None:
+                    await self._message_queue.put(work_item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # Continuing after an unpersisted Telegram update would create
+                # a silent monitoring gap. Stop visibly so supervision can
+                # restart the session and operators can investigate.
+                self._fatal_ingress_error = error
+                self._shutdown_event.set()
+                logger.critical("Durable Telegram ingress failed; stopping daemon", exc_info=True)
 
     async def _message_worker(self, worker_id: int) -> None:
         """Process queued Telegram updates with bounded concurrency."""
         while True:
-            event = await self._message_queue.get()
+            work_item = await self._message_queue.get()
             try:
-                await self._process_message(event)
+                await self._process_work_item(work_item)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -173,56 +299,96 @@ class Eidolon:
             finally:
                 self._message_queue.task_done()
 
-    async def _process_message(self, event: NewMessageEvent) -> None:
-        """Full pipeline: ingest → filter → dispatch."""
+    async def _ingest_update(
+        self,
+        event: NewMessageEvent,
+    ) -> PipelineWorkItem | None:
+        """Persist a Telegram update before placing work in volatile memory."""
         chat_id = event.chat_id
         if chat_id is None:
             logger.warning("Ignoring Telegram update without a chat ID")
-            return
+            return None
 
         # Check if any watcher monitors this chat
         watchers = self.chat_watchers.get(chat_id, [])
         if not watchers:
-            return
+            return None
 
-        # Extract common info
-        chat = await event.get_chat()
-        chat_title = getattr(chat, "title", "DM")
-        sender = await event.get_sender()
-        sender_name = getattr(sender, "first_name", "Unknown") if sender else "Unknown"
-
-        # Debug echo: forward ALL messages from monitored chats
-        if settings.debug_echo and event.text:
-            await self.dispatcher.send_echo(
-                chat_title=chat_title,
-                sender_name=sender_name,
-                text=event.text,
-            )
-
-        # Ingest message into DB
-        msg_id = await ingest_message(
-            event,
-            self.db,
-            store_raw_json=settings.store_raw_telegram_json,
-        )
+        msg_id: int | None = None
+        for attempt in range(1, settings.ingress_max_attempts + 1):
+            try:
+                msg_id = await ingest_message(
+                    event,
+                    self.db,
+                    store_raw_json=settings.store_raw_telegram_json,
+                    watcher_names=[watcher.name for watcher in watchers],
+                    watcher_fingerprints={
+                        watcher.name: self.watcher_fingerprints[watcher.name]
+                        for watcher in watchers
+                    },
+                )
+                break
+            except aiosqlite.OperationalError:
+                if attempt == settings.ingress_max_attempts:
+                    raise
+                delay = settings.ingress_retry_base_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "SQLite ingress attempt %d/%d failed; retrying in %.2fs",
+                    attempt,
+                    settings.ingress_max_attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
         if msg_id is None:
-            return  # duplicate
+            return None  # duplicate
 
-        # Run through each watcher's filter
-        for watcher in watchers:
+        # Debug echo is deliberately best-effort and happens after durable
+        # ingestion so an auxiliary delivery cannot lose pipeline work.
+        if settings.debug_echo and event.text:
+            try:
+                chat = await event.get_chat()
+                sender = await event.get_sender()
+                await self.dispatcher.send_echo(
+                    chat_title=str(getattr(chat, "title", "DM")),
+                    sender_name=(
+                        str(getattr(sender, "first_name", "Unknown")) if sender else "Unknown"
+                    ),
+                    text=event.text,
+                )
+            except Exception:
+                logger.exception("Debug echo failed for message_id=%d", msg_id)
+
+        return PipelineWorkItem(
+            message_id=msg_id,
+            text=event.text,
+            watcher_names=tuple(watcher.name for watcher in watchers),
+        )
+
+    async def _process_work_item(self, work_item: PipelineWorkItem) -> None:
+        """Run all policies attached during durable ingestion."""
+        for watcher_name in work_item.watcher_names:
+            watcher = self.watchers_by_name.get(watcher_name)
+            if watcher is None:
+                await self.db.record_pipeline_outcome(
+                    PipelineOutcome(
+                        message_id=work_item.message_id,
+                        watcher_name=watcher_name,
+                        processing_status=PipelineRunStatus.FAILED,
+                        error_code="watcher_removed",
+                    )
+                )
+                continue
             try:
                 await self._process_watcher(
                     watcher=watcher,
-                    message_id=msg_id,
-                    text=event.text,
-                    chat_title=chat_title,
-                    sender_name=sender_name,
+                    message_id=work_item.message_id,
+                    text=work_item.text,
                 )
             except Exception:
                 logger.exception(
                     "Watcher processing failed: watcher=%s message_id=%d",
                     watcher.name,
-                    msg_id,
+                    work_item.message_id,
                 )
 
     async def _process_watcher(
@@ -231,98 +397,134 @@ class Eidolon:
         watcher: Watcher,
         message_id: int,
         text: str | None,
-        chat_title: str,
-        sender_name: str,
     ) -> None:
-        """Run one watcher and persist exactly one idempotent outcome."""
-        outcome = PipelineOutcome(message_id=message_id, watcher_name=watcher.name)
-        filter_level = 1
-        llm_response: str | None = None
-        matched_keyword: str | None = None
+        """Run one watcher through the injected, independently testable processor."""
+        outcome = await self.processor.process(
+            watcher=watcher,
+            message_id=message_id,
+            text=text,
+        )
+        if outcome.alert_created:
+            self._outbox_wakeup.set()
 
-        try:
-            rule_filter = self.filters[watcher.name]
-            result = rule_filter.check(text)
-            if not result:
-                return
-            outcome.rule_passed = True
-            matched_keyword = result.matched_keyword
-
-            # Level 2: Embedding similarity (if configured)
-            if watcher.llm_level >= 2 and text:
-                embedding = await self.embedding_filter.check(text, watcher.name)
-                outcome.embedding_status = embedding.status
-                outcome.embedding_passed = embedding.passed
-                outcome.embedding_score = embedding.score
-                if embedding.error_code:
-                    outcome.error_code = embedding.error_code
-                if not embedding.passed:
-                    logger.info(
-                        "Embedding filtered message: watcher=%s message_id=%d score=%s",
-                        watcher.name,
-                        message_id,
-                        embedding.score,
+    async def _recover_pending_pipeline_jobs(self) -> None:
+        """Finish message/watcher jobs left pending by an interrupted process."""
+        recovered = 0
+        while True:
+            jobs = await self.db.get_pending_pipeline_jobs(settings.recovery_batch_size)
+            if not jobs:
+                break
+            pending_keys = {(job.message_id, job.watcher_name) for job in jobs}
+            for job in jobs:
+                watcher = self.watchers_by_name.get(job.watcher_name)
+                if watcher is None:
+                    await self.db.record_pipeline_outcome(
+                        PipelineOutcome(
+                            message_id=job.message_id,
+                            watcher_name=job.watcher_name,
+                            processing_status=PipelineRunStatus.FAILED,
+                            error_code="watcher_removed",
+                        )
                     )
-                    return
-                if embedding.status is StageStatus.OK:
-                    filter_level = 2
-
-            # Level 3: LLM classification (if configured)
-            if watcher.llm_level >= 3 and text:
-                objective = "\n\n".join(
-                    part for part in (watcher.description.strip(), watcher.prompt.strip()) if part
-                )
-                classification = await self.llm_classifier.classify(
-                    text=text,
-                    watcher_prompt=objective,
-                )
-                verdict = decision_verdict(classification)
-                outcome.llm_status = classification.status
-                outcome.llm_relevant = classification.result.relevant
-                outcome.llm_verdict = verdict.value
-                outcome.llm_confidence = classification.result.confidence
-                if classification.error_code:
-                    outcome.error_code = classification.error_code
-                llm_response = classification.result.model_dump_json()
-                if classification.status is StageStatus.OK:
-                    filter_level = 3
-                if not classification.result.relevant:
-                    logger.info(
-                        "LLM filtered message: watcher=%s message_id=%d confidence=%.3f",
-                        watcher.name,
-                        message_id,
-                        classification.result.confidence,
+                    continue
+                if job.watcher_config_fingerprint != self.watcher_fingerprints[job.watcher_name]:
+                    await self.db.record_pipeline_outcome(
+                        PipelineOutcome(
+                            message_id=job.message_id,
+                            watcher_name=job.watcher_name,
+                            processing_status=PipelineRunStatus.FAILED,
+                            error_code="watcher_policy_changed",
+                        )
                     )
-                    return
+                    logger.warning(
+                        "Skipped pending job created under another policy: "
+                        "watcher=%s message_id=%d",
+                        job.watcher_name,
+                        job.message_id,
+                    )
+                    continue
+                try:
+                    await self._process_watcher(
+                        watcher=watcher,
+                        message_id=job.message_id,
+                        text=job.text,
+                    )
+                    recovered += 1
+                except Exception:
+                    logger.exception(
+                        "Recovered pipeline job failed: watcher=%s message_id=%d",
+                        job.watcher_name,
+                        job.message_id,
+                    )
 
-            # Store alert in DB
-            alert_id = await self.db.store_alert(
-                watcher_name=watcher.name,
-                message_id=message_id,
-                filter_level=filter_level,
-                score=outcome.embedding_score,
-                llm_response=llm_response,
+            remaining = await self.db.get_pending_pipeline_jobs(settings.recovery_batch_size)
+            if not remaining:
+                break
+            remaining_keys = {(job.message_id, job.watcher_name) for job in remaining}
+            if pending_keys & remaining_keys:
+                raise RuntimeError("pending pipeline recovery made no progress")
+
+        if recovered:
+            logger.info("Recovered %d interrupted pipeline jobs", recovered)
+
+    async def _run_outbox_worker(self) -> None:
+        """Continuously deliver committed alerts and recover retryable failures."""
+        while not self._shutdown_event.is_set():
+            self._outbox_wakeup.clear()
+            try:
+                delivered = await self._deliver_due_alerts()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Alert outbox cycle failed")
+                delivered = 0
+
+            if delivered >= settings.outbox_batch_size:
+                continue
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._outbox_wakeup.wait(),
+                    timeout=settings.outbox_poll_seconds,
+                )
+
+    async def _deliver_due_alerts(self) -> int:
+        """Deliver a bounded number of rows, leasing each just before use."""
+        delivered = 0
+        for _ in range(settings.outbox_batch_size):
+            alerts = await self.db.claim_due_alerts(
+                limit=1,
+                lease_seconds=settings.outbox_lease_seconds,
             )
-            outcome.alert_created = True
-
-            # Dispatch alert
-            if watcher.alert == "immediate":
-                sent = await self.dispatcher.send_alert(
-                    watcher_name=watcher.name,
-                    chat_title=chat_title,
-                    sender_name=sender_name,
-                    text=text or "",
-                    matched_keyword=matched_keyword,
-                    filter_level=filter_level,
+            if not alerts:
+                break
+            alert = alerts[0]
+            try:
+                result = await self.dispatcher.deliver_alert(
+                    watcher_name=alert.watcher_name,
+                    chat_title=alert.chat_title,
+                    sender_name=alert.sender_name,
+                    text=alert.text,
+                    matched_keyword=alert.matched_keyword,
+                    filter_level=alert.filter_level,
                 )
-                if sent:
-                    await self.db.mark_alert_sent(alert_id)
-                    outcome.alert_sent = True
-        except Exception as error:
-            outcome.error_code = type(error).__name__
-            raise
-        finally:
-            await self.db.record_pipeline_outcome(outcome)
+                await self.db.mark_alert_delivery_result(
+                    alert.alert_id,
+                    result,
+                    claim_token=alert.claim_token,
+                    max_attempts=settings.outbox_max_attempts,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The persisted lease expires, making this row recoverable
+                # without storing exception text or losing the alert.
+                logger.exception(
+                    "Outbox item failed: alert_id=%d watcher=%s",
+                    alert.alert_id,
+                    alert.watcher_name,
+                )
+            delivered += 1
+        return delivered
 
     async def _run_summary_scheduler(self) -> None:
         """Sleep until summary_hour_utc each day, then generate and send digests."""
@@ -350,31 +552,67 @@ class Eidolon:
             except TimeoutError:
                 pass  # time to generate summary
 
-            await self._generate_summaries()
+            try:
+                await self._generate_summaries(window_end=target)
+            except Exception:
+                logger.exception("Scheduled summary cycle failed")
 
-    async def _generate_summaries(self) -> None:
-        """Generate and send summaries for all watchers."""
-        today = datetime.now(UTC).date()
-        date_str = today.isoformat()
+    async def _run_retention_sweeper(self) -> None:
+        """Continuously enforce the configured message-retention window."""
+        interval_seconds = settings.retention_sweep_hours * 3600
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=interval_seconds,
+                )
+                return
+            except TimeoutError:
+                try:
+                    purged = await self.db.purge_expired_data(settings.retention_days)
+                except Exception:
+                    logger.exception("Retention sweep failed")
+                else:
+                    if purged:
+                        logger.info("Retention sweep purged %d messages", purged)
+
+    async def _generate_summaries(self, *, window_end: datetime | None = None) -> None:
+        """Generate one best-effort 24-hour summary window for every watcher."""
+        end = window_end or datetime.now(UTC)
+        start = end - timedelta(days=1)
+        date_str = f"{start.strftime('%Y-%m-%d %H:%MZ')} → {end.strftime('%Y-%m-%d %H:%MZ')}"
 
         for watcher in self.watchers:
-            messages = await self.db.get_daily_messages(watcher.chats, date_str)
-            if not messages:
-                logger.info("No messages for [%s] on %s, skipping summary", watcher.name, date_str)
-                continue
+            try:
+                messages = await self.db.get_accepted_messages_between(
+                    watcher.name,
+                    start.isoformat(),
+                    end.isoformat(),
+                )
+                if not messages:
+                    logger.info(
+                        "No messages for [%s] on %s, skipping summary",
+                        watcher.name,
+                        date_str,
+                    )
+                    continue
 
-            summary = await self.summarizer.summarize(
-                messages=messages,
-                watcher_name=watcher.name,
-                target_date=today,
-            )
-            if summary:
-                await self.dispatcher.send_summary(
+                summary = await self.summarizer.summarize(
+                    messages=messages,
+                    watcher_name=watcher.name,
+                    target_date=end.date(),
+                )
+                if summary and not await self.dispatcher.send_summary(
                     watcher_name=watcher.name,
                     summary=summary,
                     date_str=date_str,
                     message_count=len(messages),
-                )
+                ):
+                    logger.error("Best-effort summary delivery failed: watcher=%s", watcher.name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Summary watcher failed: watcher=%s", watcher.name)
 
     def _setup_signals(self) -> None:
         """Handle SIGINT/SIGTERM for graceful shutdown."""
@@ -391,11 +629,11 @@ class Eidolon:
 
 
 def main() -> None:
-    if not settings.telegram_session_string:
-        logger.error("TELEGRAM_SESSION_STRING is empty. Run 'python3 auth.py' first.")
-        sys.exit(1)
-
-    app = Eidolon()
+    try:
+        app = Eidolon()
+    except (RuntimeConfigurationError, WatcherConfigError) as error:
+        logger.error("Startup configuration error: %s", error)
+        sys.exit(2)
     asyncio.run(app.start())
 
 

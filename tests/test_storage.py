@@ -10,11 +10,17 @@ import pytest
 
 from pipeline.models import (
     AlertDeliveryStatus,
+    AlertDraft,
     DeliveryResult,
     PipelineOutcome,
+    PipelineRunStatus,
     StageStatus,
 )
 from storage.db import Database
+
+
+def _fingerprints(*watcher_names: str) -> dict[str, str]:
+    return {name: f"{name}-policy-v1" for name in watcher_names}
 
 
 @pytest.fixture
@@ -85,6 +91,11 @@ async def test_connect_migrates_legacy_alerts_without_losing_sent_state(
         ) VALUES (
             'legacy-watcher', 1, 3, NULL
         );
+        INSERT INTO alerts (
+            watcher_name, message_id, filter_level, sent_at
+        ) VALUES (
+            'orphan-watcher', NULL, 1, NULL
+        );
         """
     )
     legacy.commit()
@@ -107,6 +118,14 @@ async def test_connect_migrates_legacy_alerts_without_losing_sent_state(
         row = await cursor.fetchone()
         assert row is not None
         assert tuple(row) == (1, "sent", 0, None)
+        cursor = await migrated.conn.execute(
+            """
+            SELECT delivery_status, last_error
+            FROM alerts
+            WHERE watcher_name = 'orphan-watcher'
+            """
+        )
+        assert tuple(await cursor.fetchone()) == ("failed", "orphaned_message")
         assert await migrated.claim_due_alerts() == []
 
         cursor = await migrated.conn.execute("PRAGMA table_info(pipeline_runs)")
@@ -220,7 +239,8 @@ async def test_store_alert_upserts_unique_watcher_message_pair(db: Database) -> 
     assert row is not None
     assert tuple(row) == (1, 3, 0.91, "updated")
 
-    await db.mark_alert_sent(first_id)
+    first_claim = (await db.claim_due_alerts(limit=1))[0]
+    await db.mark_alert_sent(first_id, claim_token=first_claim.claim_token)
     third_id = await db.store_alert(
         watcher_name="phangan-housing",
         message_id=msg_id,
@@ -231,7 +251,13 @@ async def test_store_alert_upserts_unique_watcher_message_pair(db: Database) -> 
     assert third_id == first_id
     cursor = await db.conn.execute(
         """
-        SELECT delivery_status, delivery_attempts, last_error
+        SELECT
+            delivery_status,
+            delivery_attempts,
+            last_error,
+            filter_level,
+            score,
+            llm_response
         FROM alerts
         WHERE id = ?
         """,
@@ -239,7 +265,7 @@ async def test_store_alert_upserts_unique_watcher_message_pair(db: Database) -> 
     )
     row = await cursor.fetchone()
     assert row is not None
-    assert tuple(row) == ("sent", 1, None)
+    assert tuple(row) == ("sent", 1, None, 3, 0.91, "updated")
 
 
 async def test_mark_alert_sent(db: Database) -> None:
@@ -257,8 +283,9 @@ async def test_mark_alert_sent(db: Database) -> None:
         message_id=msg_id,
         filter_level=1,
     )
-    await db.mark_alert_sent(alert_id)
-    await db.mark_alert_sent(alert_id)
+    claim = (await db.claim_due_alerts(limit=1))[0]
+    await db.mark_alert_sent(alert_id, claim_token=claim.claim_token)
+    await db.mark_alert_sent(alert_id, claim_token=claim.claim_token)
 
     cursor = await db.conn.execute(
         """
@@ -295,6 +322,7 @@ async def test_pending_alert_survives_restart_and_claim_is_leased(
         watcher_name="recovery-watcher",
         message_id=message_id,
         filter_level=2,
+        matched_keyword="villa",
     )
     assert len(await initial.claim_due_alerts(limit=10, lease_seconds=60)) == 1
     # Simulate process downtime lasting beyond the persisted delivery lease.
@@ -315,6 +343,7 @@ async def test_pending_alert_survives_restart_and_claim_is_leased(
         assert claimed[0].chat_title == "Recovery Chat"
         assert claimed[0].sender_name == "Alice"
         assert claimed[0].text == "Recover this alert"
+        assert claimed[0].matched_keyword == "villa"
         assert claimed[0].delivery_attempts == 0
 
         assert await recovered.claim_due_alerts(limit=10, lease_seconds=60) == []
@@ -348,6 +377,46 @@ async def test_concurrent_claimers_receive_each_alert_once(db: Database) -> None
     assert claimed_ids == [alert_id]
 
 
+async def test_stale_outbox_owner_cannot_commit_after_reclaim(db: Database) -> None:
+    message_id = await db.store_message(
+        telegram_msg_id=212,
+        chat_id=-100810,
+        sender_id=8,
+        sender_name="Alice",
+        text="Fence this delivery",
+        date="2026-07-17 12:00:00",
+    )
+    assert message_id is not None
+    alert_id = await db.store_alert(
+        watcher_name="fenced-watcher",
+        message_id=message_id,
+        filter_level=1,
+    )
+    first_claim = (await db.claim_due_alerts(limit=1, lease_seconds=1))[0]
+    await db.conn.execute(
+        "UPDATE alerts SET claimed_until = datetime('now', '-1 second') WHERE id = ?",
+        (alert_id,),
+    )
+    await db.conn.commit()
+    second_claim = (await db.claim_due_alerts(limit=1, lease_seconds=60))[0]
+
+    with pytest.raises(RuntimeError, match="no longer owned"):
+        await db.mark_alert_delivery_result(
+            alert_id,
+            DeliveryResult.success(),
+            claim_token=first_claim.claim_token,
+        )
+
+    assert (
+        await db.mark_alert_delivery_result(
+            alert_id,
+            DeliveryResult.success(),
+            claim_token=second_claim.claim_token,
+        )
+        is AlertDeliveryStatus.SENT
+    )
+
+
 async def test_retryable_delivery_reschedules_without_persisting_error_text(
     db: Database,
 ) -> None:
@@ -366,7 +435,7 @@ async def test_retryable_delivery_reschedules_without_persisting_error_text(
         message_id=message_id,
         filter_level=1,
     )
-    assert len(await db.claim_due_alerts(lease_seconds=60)) == 1
+    claim = (await db.claim_due_alerts(lease_seconds=60))[0]
 
     status = await db.mark_alert_delivery_result(
         alert_id,
@@ -376,6 +445,7 @@ async def test_retryable_delivery_reschedules_without_persisting_error_text(
             error_code="timeout for Alice: Retry this alert",
             retry_after=30,
         ),
+        claim_token=claim.claim_token,
     )
 
     assert status is AlertDeliveryStatus.PENDING
@@ -440,10 +510,12 @@ async def test_terminal_or_exhausted_delivery_is_marked_failed(
         message_id=message_id,
         filter_level=1,
     )
+    claim = (await db.claim_due_alerts(limit=1))[0]
 
     status = await db.mark_alert_delivery_result(
         alert_id,
         result,
+        claim_token=claim.claim_token,
         max_attempts=max_attempts,
     )
 
@@ -497,13 +569,18 @@ async def test_record_pipeline_outcome_counts_once_and_is_idempotent(
         embedding_score=0.88,
         embedding_model="text-embedding-test",
         embedding_latency_ms=12.5,
+        embedding_input_tokens=8,
         llm_status=StageStatus.OK,
         llm_relevant=True,
+        llm_passed=True,
         llm_verdict="offer",
         llm_confidence=0.95,
         llm_model="test-model",
         llm_prompt_version="classifier-v2",
         llm_latency_ms=42.0,
+        llm_input_tokens=20,
+        llm_output_tokens=5,
+        accepted=True,
         alert_created=True,
         alert_sent=True,
     )
@@ -513,7 +590,13 @@ async def test_record_pipeline_outcome_counts_once_and_is_idempotent(
 
     cursor = await db.conn.execute(
         """
-        SELECT messages_total, passed_level1, passed_level2, passed_level3, alerts_sent
+        SELECT
+            messages_total,
+            passed_level1,
+            passed_level2,
+            passed_level3,
+            accepted,
+            alerts_sent
         FROM filter_stats
         WHERE watcher_name = ?
         """,
@@ -521,7 +604,7 @@ async def test_record_pipeline_outcome_counts_once_and_is_idempotent(
     )
     row = await cursor.fetchone()
     assert row is not None
-    assert tuple(row) == (1, 1, 1, 1, 1)
+    assert tuple(row) == (1, 1, 1, 1, 1, 1)
 
     cursor = await db.conn.execute(
         "SELECT COUNT(*) FROM pipeline_runs WHERE message_id = ? AND watcher_name = ?",
@@ -534,9 +617,14 @@ async def test_record_pipeline_outcome_counts_once_and_is_idempotent(
         SELECT
             embedding_model,
             embedding_latency_ms,
+            embedding_input_tokens,
             llm_model,
             llm_prompt_version,
-            llm_latency_ms
+            llm_latency_ms,
+            llm_input_tokens,
+            llm_output_tokens,
+            processing_status,
+            accepted
         FROM pipeline_runs
         WHERE message_id = ? AND watcher_name = ?
         """,
@@ -547,10 +635,240 @@ async def test_record_pipeline_outcome_counts_once_and_is_idempotent(
     assert tuple(row) == (
         "text-embedding-test",
         12.5,
+        8,
         "test-model",
         "classifier-v2",
         42.0,
+        20,
+        5,
+        "completed",
+        1,
     )
+
+
+async def test_message_and_pipeline_jobs_are_atomic_and_recoverable(
+    tmp_path: Path,
+) -> None:
+    """Pending watcher work must survive a clean reconnect until it is completed."""
+    db_path = tmp_path / "pipeline-recovery.db"
+    initial = Database(db_path)
+    await initial.connect()
+    message_id = await initial.store_message(
+        telegram_msg_id=77,
+        chat_id=-100777,
+        chat_title="Recovery Chat",
+        sender_id=7,
+        sender_name="Alice",
+        text="Villa for rent after restart",
+        date="2026-07-17 12:00:00",
+        watcher_names=("housing-watch", "housing-watch", "audit-watch"),
+        watcher_fingerprints=_fingerprints("housing-watch", "audit-watch"),
+    )
+    assert message_id is not None
+    await initial.close()
+
+    recovered = Database(db_path)
+    await recovered.connect()
+    try:
+        jobs = await recovered.get_pending_pipeline_jobs()
+        assert [(job.message_id, job.watcher_name) for job in jobs] == [
+            (message_id, "housing-watch"),
+            (message_id, "audit-watch"),
+        ]
+
+        assert await recovered.record_pipeline_outcome(
+            PipelineOutcome(
+                message_id=message_id,
+                watcher_name="housing-watch",
+                rule_passed=True,
+                accepted=True,
+            )
+        )
+        assert [job.watcher_name for job in await recovered.get_pending_pipeline_jobs()] == [
+            "audit-watch"
+        ]
+    finally:
+        await recovered.close()
+
+
+async def test_invalid_watcher_job_rolls_back_message_instead_of_looking_duplicate(
+    db: Database,
+) -> None:
+    with pytest.raises(ValueError, match="policy fingerprint"):
+        await db.store_message(
+            telegram_msg_id=771,
+            chat_id=-100777,
+            sender_id=7,
+            sender_name="Alice",
+            text="Villa for rent",
+            date="2026-07-17 12:00:00",
+            watcher_names=("housing-watch",),
+        )
+
+    cursor = await db.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE telegram_msg_id = ?",
+        (771,),
+    )
+    assert (await cursor.fetchone())[0] == 0
+
+
+async def test_replayed_outbox_success_updates_stats_exactly_once(db: Database) -> None:
+    """A recovered delivery should reconcile provenance without double-counting."""
+    message_id = await db.store_message(
+        telegram_msg_id=78,
+        chat_id=-100778,
+        sender_id=8,
+        sender_name="Bob",
+        text="House available",
+        date="2026-07-17 12:00:00",
+        watcher_names=("housing-watch",),
+        watcher_fingerprints=_fingerprints("housing-watch"),
+    )
+    assert message_id is not None
+    await db.record_pipeline_outcome(
+        PipelineOutcome(
+            message_id=message_id,
+            watcher_name="housing-watch",
+            rule_passed=True,
+            accepted=True,
+            alert_created=True,
+        )
+    )
+
+    assert await db.mark_pipeline_alert_sent(
+        message_id=message_id,
+        watcher_name="housing-watch",
+    )
+    assert not await db.mark_pipeline_alert_sent(
+        message_id=message_id,
+        watcher_name="housing-watch",
+    )
+
+    cursor = await db.conn.execute(
+        """
+        SELECT accepted, alerts_sent
+        FROM filter_stats
+        WHERE watcher_name = 'housing-watch'
+        """
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert tuple(row) == (1, 1)
+
+
+async def test_pipeline_completion_alert_and_delivery_stats_are_atomic(
+    db: Database,
+) -> None:
+    message_id = await db.store_message(
+        telegram_msg_id=781,
+        chat_id=-100778,
+        sender_id=8,
+        sender_name="Bob",
+        text="House available",
+        date="2026-07-17 12:00:00",
+        watcher_names=("atomic-watch",),
+        watcher_fingerprints=_fingerprints("atomic-watch"),
+    )
+    assert message_id is not None
+    outcome = PipelineOutcome(
+        message_id=message_id,
+        watcher_name="atomic-watch",
+        rule_passed=True,
+        accepted=True,
+        alert_created=True,
+    )
+
+    assert await db.record_pipeline_outcome(
+        outcome,
+        alert=AlertDraft(filter_level=1, matched_keyword="house"),
+    )
+    cursor = await db.conn.execute(
+        """
+        SELECT p.processing_status, a.delivery_status
+        FROM pipeline_runs AS p
+        JOIN alerts AS a
+          ON a.message_id = p.message_id
+         AND a.watcher_name = p.watcher_name
+        WHERE p.message_id = ?
+        """,
+        (message_id,),
+    )
+    assert tuple(await cursor.fetchone()) == ("completed", "pending")
+
+    claimed = await db.claim_due_alerts()
+    assert len(claimed) == 1
+    assert (
+        await db.mark_alert_delivery_result(
+            claimed[0].alert_id,
+            DeliveryResult.success(),
+            claim_token=claimed[0].claim_token,
+        )
+        is AlertDeliveryStatus.SENT
+    )
+    cursor = await db.conn.execute(
+        """
+        SELECT p.alert_sent, s.alerts_sent
+        FROM pipeline_runs AS p
+        JOIN filter_stats AS s
+          ON s.watcher_name = p.watcher_name
+         AND s.date = DATE(p.created_at)
+        WHERE p.message_id = ?
+        """,
+        (message_id,),
+    )
+    assert tuple(await cursor.fetchone()) == (1, 1)
+
+
+async def test_daily_digest_reads_only_messages_accepted_by_watcher(
+    db: Database,
+) -> None:
+    accepted_id = await db.store_message(
+        telegram_msg_id=79,
+        chat_id=-100779,
+        chat_title="Digest Chat",
+        sender_id=9,
+        sender_name="Carol",
+        text="Accepted villa offer",
+        date="2026-07-17 09:00:00",
+        watcher_names=("digest-watch",),
+        watcher_fingerprints=_fingerprints("digest-watch"),
+    )
+    rejected_id = await db.store_message(
+        telegram_msg_id=80,
+        chat_id=-100779,
+        chat_title="Digest Chat",
+        sender_id=10,
+        sender_name="Dave",
+        text="Rejected chatter",
+        date="2026-07-17 10:00:00",
+        watcher_names=("digest-watch",),
+        watcher_fingerprints=_fingerprints("digest-watch"),
+    )
+    assert accepted_id is not None
+    assert rejected_id is not None
+    await db.record_pipeline_outcome(
+        PipelineOutcome(
+            message_id=accepted_id,
+            watcher_name="digest-watch",
+            rule_passed=True,
+            accepted=True,
+        )
+    )
+    await db.record_pipeline_outcome(
+        PipelineOutcome(
+            message_id=rejected_id,
+            watcher_name="digest-watch",
+        )
+    )
+
+    messages = await db.get_daily_accepted_messages("digest-watch", "2026-07-17")
+    assert [message["text"] for message in messages] == ["Accepted villa offer"]
+    window_messages = await db.get_accepted_messages_between(
+        "digest-watch",
+        "2026-07-16 13:00:00",
+        "2026-07-17 13:00:00",
+    )
+    assert [message["text"] for message in window_messages] == ["Accepted villa offer"]
 
 
 async def test_store_message_with_chat_title(db: Database) -> None:
@@ -666,6 +984,13 @@ async def test_purge_expired_data_removes_related_rows_and_keeps_recent_data(
                 alert_created=True,
             )
         )
+        alert_id = await db.store_alert(
+            watcher_name="retention-watcher",
+            message_id=message_id,
+            filter_level=1,
+        )
+        claim = (await db.claim_due_alerts(limit=1))[0]
+        await db.mark_alert_sent(alert_id, claim_token=claim.claim_token)
 
     assert await db.purge_expired_data(retention_days=30) == 1
 
@@ -678,6 +1003,49 @@ async def test_purge_expired_data_removes_related_rows_and_keeps_recent_data(
         cursor = await db.conn.execute(query)
         remaining_ids = {row[0] for row in await cursor.fetchall()}
         assert remaining_ids == {recent_id}
+
+
+async def test_retention_preserves_pending_pipeline_and_outbox_work(
+    db: Database,
+) -> None:
+    old_id = await db.store_message(
+        telegram_msg_id=103,
+        chat_id=-100701,
+        sender_id=3,
+        sender_name="Pending",
+        text="Pending old message",
+        date=(datetime.now(UTC) - timedelta(days=31)).isoformat(),
+        watcher_names=("pending-watch",),
+        watcher_fingerprints=_fingerprints("pending-watch"),
+    )
+    assert old_id is not None
+    alert_id = await db.store_alert(
+        watcher_name="pending-watch",
+        message_id=old_id,
+        filter_level=1,
+    )
+
+    assert await db.purge_expired_data(retention_days=30) == 0
+
+    await db.record_pipeline_outcome(
+        PipelineOutcome(
+            message_id=old_id,
+            watcher_name="pending-watch",
+            processing_status=PipelineRunStatus.FAILED,
+            error_code="watcher_removed",
+        )
+    )
+    claim = (await db.claim_due_alerts(limit=1))[0]
+    await db.mark_alert_delivery_result(
+        alert_id,
+        DeliveryResult(
+            sent=False,
+            retryable=False,
+            error_code="telegram_http_403",
+        ),
+        claim_token=claim.claim_token,
+    )
+    assert await db.purge_expired_data(retention_days=30) == 1
 
 
 async def test_conn_raises_when_not_connected(tmp_path: Path) -> None:

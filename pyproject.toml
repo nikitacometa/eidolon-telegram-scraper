@@ -16,6 +16,8 @@ dependencies = [
     "chromadb==0.6.3",
     "fastapi>=0.128,<1",
     "openai>=2.24,<3",
+    # Chroma 0.6.3 still uses PostHog's pre-6 positional capture API.
+    "posthog>=5.4,<6",
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.13,<3",
     "pyyaml>=6,<7",
@@ -28,6 +30,7 @@ eidolon-scraper = "main:main"
 eidolon-auth = "auth:main"
 eidolon-chats = "list_chats:main"
 eidolon-eval = "evals.runner:main"
+eidolon-calibrate = "evals.calibrate:main"
 
 [dependency-groups]
 dev = [
@@ -54,6 +57,10 @@ include = ["config*", "evals*", "pipeline*", "storage*"]
 testpaths = ["tests"]
 addopts = "-ra -q --strict-markers --timeout=15"
 asyncio_mode = "auto"
+filterwarnings = [
+    # Chroma 0.6.3 is intentionally held below the unpatched 1.x advisory.
+    "ignore:Accessing the 'model_fields' attribute on the instance is deprecated:DeprecationWarning:chromadb.types",
+]
 
 [tool.ruff]
 target-version = "py312"

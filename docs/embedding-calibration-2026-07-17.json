@@ -1,0 +1,24 @@
+{
+  "threshold": 0.432398,
+  "negative_margin": -0.05,
+  "evaluated_thresholds": 25,
+  "metrics": {
+    "dataset": "calibration",
+    "level": 2,
+    "total": 24,
+    "true_positive": 10,
+    "false_positive": 2,
+    "true_negative": 12,
+    "false_negative": 0,
+    "precision": 0.8333,
+    "recall": 1.0,
+    "f1": 0.9091,
+    "accuracy": 0.9167,
+    "mean_latency_ms": 497.777,
+    "total_input_tokens": 513,
+    "total_output_tokens": 0,
+    "provider_calls": 23,
+    "degraded_predictions": 0,
+    "passed_gates": true
+  }
+}

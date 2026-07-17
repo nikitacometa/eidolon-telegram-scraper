@@ -10,6 +10,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
+TargetIntent = Literal["offer", "seek", "other"]
+DegradedPolicy = Literal["reject", "accept"]
+
+
+def _default_target_intents() -> list[TargetIntent]:
+    return ["offer"]
 
 
 class WatcherConfigError(ValueError):
@@ -38,8 +44,14 @@ class WatcherExamples(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    positive: list[str] = Field(default_factory=list)
-    negative: list[str] = Field(default_factory=list)
+    positive: list[str] = Field(default_factory=list, max_length=100)
+    negative: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("positive", "negative")
+    @classmethod
+    def normalize_examples(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values if value.strip()]
+        return list(dict.fromkeys(normalized))
 
 
 class Watcher(BaseModel):
@@ -53,6 +65,11 @@ class Watcher(BaseModel):
     description: str = ""
     alert: Literal["immediate", "digest"] = "immediate"
     llm_level: int = Field(default=1, ge=1, le=3)
+    target_intents: list[TargetIntent] = Field(
+        default_factory=_default_target_intents,
+        min_length=1,
+    )
+    degraded_policy: DegradedPolicy = "reject"
     prompt: str = ""
     examples: WatcherExamples = Field(default_factory=WatcherExamples)
     embedding_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -63,6 +80,25 @@ class Watcher(BaseModel):
         if any(chat_id >= 0 for chat_id in values):
             raise ValueError("Telegram group/channel chat IDs must be negative")
         return list(dict.fromkeys(values))
+
+    @field_validator("target_intents")
+    @classmethod
+    def unique_target_intents(
+        cls,
+        values: list[TargetIntent],
+    ) -> list[TargetIntent]:
+        return list(dict.fromkeys(values))
+
+    @model_validator(mode="after")
+    def require_semantic_reference_source(self) -> Watcher:
+        if (
+            self.llm_level >= 2
+            and not self.examples.positive
+            and not self.rules.keywords
+            and not self.prompt.strip()
+        ):
+            raise ValueError("llm_level >= 2 requires positive examples, keywords, or a prompt")
+        return self
 
 
 class WatcherFile(BaseModel):
@@ -95,14 +131,22 @@ def load_watchers(config_path: Path) -> list[Watcher]:
         with config_path.open(encoding="utf-8") as file:
             data = yaml.safe_load(file)
         config = WatcherFile.model_validate(data)
-    except (OSError, yaml.YAMLError, ValidationError) as error:
-        raise WatcherConfigError(f"invalid watchers config {config_path}: {error}") from error
+    except ValidationError as error:
+        # Pydantic's rendered message includes input values, which may contain
+        # private chat IDs or monitoring objectives. Keep only schema locations
+        # and machine-readable error types.
+        issues = ", ".join(
+            f"{'.'.join(str(part) for part in issue['loc'])}:{issue['type']}"
+            for issue in error.errors(include_input=False)
+        )
+        raise WatcherConfigError(f"invalid watchers config {config_path}: {issues}") from error
+    except (OSError, yaml.YAMLError) as error:
+        raise WatcherConfigError(
+            f"invalid watchers config {config_path}: {type(error).__name__}"
+        ) from error
 
-    logger.info(
-        "Loaded %d watchers: %s",
-        len(config.watchers),
-        [watcher.name for watcher in config.watchers],
-    )
+    logger.info("Loaded %d watcher policies", len(config.watchers))
+    logger.debug("Loaded watcher names: %s", [watcher.name for watcher in config.watchers])
     return config.watchers
 
 

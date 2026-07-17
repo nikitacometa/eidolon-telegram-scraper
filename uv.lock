@@ -474,6 +474,7 @@ dependencies = [
     { name = "chromadb" },
     { name = "fastapi" },
     { name = "openai" },
+    { name = "posthog" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
@@ -503,6 +504,7 @@ requires-dist = [
     { name = "chromadb", specifier = "==0.6.3" },
     { name = "fastapi", specifier = ">=0.128,<1" },
     { name = "openai", specifier = ">=2.24,<3" },
+    { name = "posthog", specifier = ">=5.4,<6" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pydantic-settings", specifier = ">=2.13,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
@@ -1492,17 +1494,18 @@ wheels = [
 
 [[package]]
 name = "posthog"
-version = "7.25.0"
+version = "5.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "backoff" },
     { name = "distro" },
+    { name = "python-dateutil" },
     { name = "requests" },
-    { name = "typing-extensions" },
+    { name = "six" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/28/b1/a52ac5e432715e651b149803f0f0d766af20e8e3c0836049e32933601618/posthog-7.25.0.tar.gz", hash = "sha256:3a7aeab611ba48824e700314d5f81e00e0ff8a1c169a244c0fa18c6f7960f61f", size = 345904, upload-time = "2026-07-16T12:11:24.557Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/48/20/60ae67bb9d82f00427946218d49e2e7e80fb41c15dc5019482289ec9ce8d/posthog-5.4.0.tar.gz", hash = "sha256:701669261b8d07cdde0276e5bc096b87f9e200e3b9589c5ebff14df658c5893c", size = 88076, upload-time = "2025-06-20T23:19:23.485Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a6/01/e828586e7d51ca693a522cb347a92f6ed26e3ca3a0d3916fe9ab5f1bebfd/posthog-7.25.0-py3-none-any.whl", hash = "sha256:63b7879cd066f6a621327db449f831392e6a79226892417dc20701f037ad34d3", size = 413751, upload-time = "2026-07-16T12:11:23.04Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/98/e480cab9a08d1c09b1c59a93dade92c1bb7544826684ff2acbfd10fcfbd4/posthog-5.4.0-py3-none-any.whl", hash = "sha256:284dfa302f64353484420b52d4ad81ff5c2c2d1d607c4e2db602ac72761831bd", size = 105364, upload-time = "2025-06-20T23:19:22.001Z" },
 ]
 
 [[package]]

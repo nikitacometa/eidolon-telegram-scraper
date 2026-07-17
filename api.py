@@ -60,6 +60,7 @@ class ReadOnlySQLite:
         self._conn = await aiosqlite.connect(uri, uri=True)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA query_only=ON")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -97,6 +98,7 @@ class MetricCounts(BaseModel):
     passed_level1: int = Field(ge=0)
     passed_level2: int = Field(ge=0)
     passed_level3: int = Field(ge=0)
+    accepted: int = Field(ge=0)
     alerts_sent: int = Field(ge=0)
 
 
@@ -109,10 +111,18 @@ class StatsProvenance(BaseModel):
     timezone: Literal["UTC"] = "UTC"
 
 
+class OperationalBacklog(BaseModel):
+    pending_pipeline_jobs: int = Field(ge=0)
+    failed_pipeline_jobs: int = Field(ge=0)
+    pending_alerts: int = Field(ge=0)
+    failed_alerts: int = Field(ge=0)
+
+
 class StatsResponse(BaseModel):
     date: date
     watchers: list[WatcherMetrics]
     totals: MetricCounts
+    backlog: OperationalBacklog
     provenance: StatsProvenance = Field(default_factory=StatsProvenance)
 
 
@@ -288,6 +298,7 @@ async def _stats(
         date=selected_date,
         watchers=watcher_metrics,
         totals=_sum_counts(metrics.values()),
+        backlog=await _read_operational_backlog(control_plane.database),
     )
 
 
@@ -352,6 +363,7 @@ async def _read_daily_metrics(
             passed_level1,
             passed_level2,
             passed_level3,
+            accepted,
             alerts_sent
         FROM filter_stats
         WHERE date = ?
@@ -367,10 +379,34 @@ async def _read_daily_metrics(
             passed_level1=int(row["passed_level1"] or 0),
             passed_level2=int(row["passed_level2"] or 0),
             passed_level3=int(row["passed_level3"] or 0),
+            accepted=int(row["accepted"] or 0),
             alerts_sent=int(row["alerts_sent"] or 0),
         )
         for row in rows
     }
+
+
+async def _read_operational_backlog(
+    database: ControlPlaneDatabase,
+) -> OperationalBacklog:
+    async with database.conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM pipeline_runs WHERE processing_status = 'pending'),
+            (SELECT COUNT(*) FROM pipeline_runs WHERE processing_status = 'failed'),
+            (SELECT COUNT(*) FROM alerts WHERE delivery_status = 'pending'),
+            (SELECT COUNT(*) FROM alerts WHERE delivery_status = 'failed')
+        """
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("SQLite did not return operational backlog counts")
+    return OperationalBacklog(
+        pending_pipeline_jobs=int(row[0]),
+        failed_pipeline_jobs=int(row[1]),
+        pending_alerts=int(row[2]),
+        failed_alerts=int(row[3]),
+    )
 
 
 def _empty_counts() -> MetricCounts:
@@ -379,6 +415,7 @@ def _empty_counts() -> MetricCounts:
         passed_level1=0,
         passed_level2=0,
         passed_level3=0,
+        accepted=0,
         alerts_sent=0,
     )
 
@@ -390,6 +427,7 @@ def _watcher_metrics(watcher_name: str, counts: MetricCounts) -> WatcherMetrics:
         passed_level1=counts.passed_level1,
         passed_level2=counts.passed_level2,
         passed_level3=counts.passed_level3,
+        accepted=counts.accepted,
         alerts_sent=counts.alerts_sent,
     )
 
@@ -400,6 +438,7 @@ def _sum_counts(counts: Iterable[MetricCounts]) -> MetricCounts:
         passed_level1=sum(item.passed_level1 for item in counts),
         passed_level2=sum(item.passed_level2 for item in counts),
         passed_level3=sum(item.passed_level3 for item in counts),
+        accepted=sum(item.accepted for item in counts),
         alerts_sent=sum(item.alerts_sent for item in counts),
     )
 

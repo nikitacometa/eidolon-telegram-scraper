@@ -7,13 +7,27 @@ watchers:
     rules:
       keywords:
         - house
+        - home
         - villa
         - rent
+        - rental
+        - lease
         - bungalow
         - apartment
+        - studio
+        - condo
+        - cottage
+        - room
         - сдаю
+        - сдаётся
+        - сдается
         - аренда
+        - дом
+        - квартира
         - вилла
+        - бунгало
+        - жильё
+        - жилье
       keywords_negative:
         - looking for
         - ищу
@@ -24,12 +38,28 @@ watchers:
       positive:
         - "Villa for rent near Srithanu, 2 bedrooms, 25000 THB per month"
         - "Сдаю дом на Пангане, две спальни, свободен с августа"
+        - "Long-term two-bedroom house available from the owner with a monthly price"
+        - "Furnished apartment is available for lease on Koh Phangan"
+        - "Six-month villa lease offered directly by the owner and available now"
+        - "A tenant offers a lease transfer for an available island home"
+        - "Beachside bungalow offered for rent and ready for the next tenant"
+        - "Бунгало свободно для помесячной аренды, объявление собственника"
+        - "Вилла сдаётся на долгий срок, указана стоимость за месяц"
       negative:
         - "Looking for a villa to rent next month"
         - "Scooter for rent, weekly and monthly rates"
+        - "Need a house for my family, please send available options"
+        - "Ищу дом или виллу на несколько месяцев"
+        - "Car rental available with daily delivery"
+        - "Commercial warehouse space for rent"
+        - "House and villa for sale, contact the real-estate agent to purchase"
+        - "Apartment renovation, villa cleaning, and property maintenance services"
     alert: immediate
     llm_level: 3
-    embedding_threshold: 0.70
+    target_intents: [offer]
+    degraded_policy: reject
+    embedding_threshold: 0.42
     prompt: |
       Decide whether this message offers residential property for rent on Phangan.
+      Messages already come from Phangan-focused chats, so the island name may be implicit.
       Ignore requests from people looking for property and unrelated rentals.

@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import secrets
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TypedDict
 
@@ -12,10 +14,12 @@ import aiosqlite
 
 from pipeline.models import (
     AlertDeliveryStatus,
+    AlertDraft,
     AlertOutboxItem,
     DeliveryResult,
     PipelineOutcome,
     StageStatus,
+    StoredPipelineJob,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +31,7 @@ _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 class DailyMessage(TypedDict):
     """Message shape consumed by the daily summarizer."""
 
+    message_id: int
     chat_id: int
     chat_title: str
     sender_name: str
@@ -47,7 +52,9 @@ class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
-        self._outbox_lock = asyncio.Lock()
+        # One aiosqlite connection cannot safely host overlapping transactions
+        # or interleaved reads inside another task's transaction.
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open the database connection and run migrations."""
@@ -58,6 +65,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._migrate()
         logger.info("Database connected: %s", self.db_path)
 
@@ -89,6 +97,8 @@ class Database:
             "next_attempt_at": "ALTER TABLE alerts ADD COLUMN next_attempt_at TIMESTAMP",
             "last_error": "ALTER TABLE alerts ADD COLUMN last_error TEXT",
             "claimed_until": "ALTER TABLE alerts ADD COLUMN claimed_until TIMESTAMP",
+            "lease_owner": "ALTER TABLE alerts ADD COLUMN lease_owner TEXT",
+            "matched_keyword": "ALTER TABLE alerts ADD COLUMN matched_keyword TEXT",
         }
         for column, statement in alert_migrations.items():
             if column not in alert_columns:
@@ -102,8 +112,25 @@ class Database:
             UPDATE alerts
             SET delivery_status = 'sent',
                 next_attempt_at = NULL,
-                claimed_until = NULL
+                claimed_until = NULL,
+                lease_owner = NULL
             WHERE sent_at IS NOT NULL
+            """
+        )
+        # Legacy schemas allowed nullable/orphaned foreign keys. Such rows
+        # cannot be delivered because there is no immutable source payload.
+        await self.conn.execute(
+            """
+            UPDATE alerts
+            SET delivery_status = 'failed',
+                next_attempt_at = NULL,
+                claimed_until = NULL,
+                lease_owner = NULL,
+                last_error = 'orphaned_message'
+            WHERE message_id IS NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM messages WHERE messages.id = alerts.message_id
+               )
             """
         )
         await self.conn.execute(
@@ -153,18 +180,107 @@ class Database:
         cursor = await self.conn.execute("PRAGMA table_info(pipeline_runs)")
         pipeline_columns = {row[1] for row in await cursor.fetchall()}
         provenance_migrations = {
+            "embedding_negative_score": (
+                "ALTER TABLE pipeline_runs ADD COLUMN embedding_negative_score REAL"
+            ),
+            "embedding_threshold": (
+                "ALTER TABLE pipeline_runs ADD COLUMN embedding_threshold REAL"
+            ),
             "embedding_model": "ALTER TABLE pipeline_runs ADD COLUMN embedding_model TEXT",
             "embedding_latency_ms": (
                 "ALTER TABLE pipeline_runs ADD COLUMN embedding_latency_ms REAL"
             ),
+            "embedding_input_tokens": (
+                "ALTER TABLE pipeline_runs ADD COLUMN "
+                "embedding_input_tokens INTEGER NOT NULL DEFAULT 0"
+            ),
             "llm_model": "ALTER TABLE pipeline_runs ADD COLUMN llm_model TEXT",
             "llm_prompt_version": ("ALTER TABLE pipeline_runs ADD COLUMN llm_prompt_version TEXT"),
             "llm_latency_ms": "ALTER TABLE pipeline_runs ADD COLUMN llm_latency_ms REAL",
+            "llm_input_tokens": (
+                "ALTER TABLE pipeline_runs ADD COLUMN llm_input_tokens INTEGER NOT NULL DEFAULT 0"
+            ),
+            "llm_output_tokens": (
+                "ALTER TABLE pipeline_runs ADD COLUMN llm_output_tokens INTEGER NOT NULL DEFAULT 0"
+            ),
+            "llm_passed": (
+                "ALTER TABLE pipeline_runs ADD COLUMN llm_passed INTEGER NOT NULL DEFAULT 0"
+            ),
         }
         for column, statement in provenance_migrations.items():
             if column not in pipeline_columns:
                 await self.conn.execute(statement)
                 logger.info("Migration: added pipeline_runs.%s", column)
+        if "llm_passed" not in pipeline_columns:
+            await self.conn.execute("UPDATE pipeline_runs SET llm_passed = llm_relevant")
+
+        lifecycle_migrations = {
+            "watcher_config_fingerprint": (
+                "ALTER TABLE pipeline_runs ADD COLUMN watcher_config_fingerprint "
+                "TEXT NOT NULL DEFAULT 'legacy-unknown'"
+            ),
+            "processing_status": (
+                "ALTER TABLE pipeline_runs ADD COLUMN processing_status "
+                "TEXT NOT NULL DEFAULT 'completed'"
+            ),
+            "accepted": (
+                "ALTER TABLE pipeline_runs ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0"
+            ),
+            "completed_at": "ALTER TABLE pipeline_runs ADD COLUMN completed_at TIMESTAMP",
+        }
+        added_processing_status = "processing_status" not in pipeline_columns
+        added_accepted = "accepted" not in pipeline_columns
+        for column, statement in lifecycle_migrations.items():
+            if column not in pipeline_columns:
+                await self.conn.execute(statement)
+                logger.info("Migration: added pipeline_runs.%s", column)
+        if added_processing_status:
+            await self.conn.execute(
+                """
+                UPDATE pipeline_runs
+                SET processing_status = 'completed',
+                    completed_at = COALESCE(completed_at, created_at)
+                """
+            )
+        if added_accepted:
+            await self.conn.execute(
+                """
+                UPDATE pipeline_runs
+                SET accepted = CASE
+                    WHEN llm_status = 'ok' THEN llm_passed
+                    WHEN embedding_status = 'ok' THEN embedding_passed
+                    ELSE rule_passed
+                END
+                """
+            )
+        await self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pending
+            ON pipeline_runs(processing_status, created_at, id)
+            """
+        )
+
+        cursor = await self.conn.execute("PRAGMA table_info(filter_stats)")
+        filter_stats_columns = {row[1] for row in await cursor.fetchall()}
+        if "accepted" not in filter_stats_columns:
+            await self.conn.execute(
+                "ALTER TABLE filter_stats ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0"
+            )
+            await self.conn.execute(
+                """
+                UPDATE filter_stats
+                SET accepted = COALESCE(
+                    (
+                        SELECT SUM(p.accepted)
+                        FROM pipeline_runs AS p
+                        WHERE p.watcher_name = filter_stats.watcher_name
+                          AND DATE(p.created_at) = filter_stats.date
+                    ),
+                    0
+                )
+                """
+            )
+            logger.info("Migration: added filter_stats.accepted")
 
         await self.conn.commit()
 
@@ -187,36 +303,97 @@ class Database:
         telegram_msg_id: int,
         chat_id: int,
         chat_title: str | None = None,
+        chat_type: str | None = None,
         sender_id: int | None,
         sender_name: str | None,
         text: str | None,
         date: str,
         raw_json: str | None = None,
+        watcher_names: Sequence[str] = (),
+        watcher_fingerprints: Mapping[str, str] | None = None,
     ) -> int | None:
-        """Store a message and return its row ID. Returns None if duplicate."""
-        try:
-            cursor = await self.conn.execute(
-                """
-                INSERT INTO messages
-                    (telegram_msg_id, chat_id, chat_title, sender_id, sender_name, text, date, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    telegram_msg_id,
-                    chat_id,
-                    chat_title,
-                    sender_id,
-                    sender_name,
-                    text,
-                    date,
-                    raw_json,
-                ),
-            )
-            await self.conn.commit()
-            return cursor.lastrowid
-        except aiosqlite.IntegrityError:
-            logger.debug("Duplicate message %d in chat %d", telegram_msg_id, chat_id)
-            return None
+        """Atomically store a message and its expected watcher jobs.
+
+        The pending rows close the crash window between Telegram ingestion and
+        pipeline execution. They can be reconstructed from SQLite on restart.
+        Returns ``None`` when Telegram replays an existing message.
+        """
+        async with self._write_lock:
+            try:
+                cursor = await self.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        telegram_msg_id, chat_id, chat_title, sender_id,
+                        sender_name, text, date, raw_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        telegram_msg_id,
+                        chat_id,
+                        chat_title,
+                        sender_id,
+                        sender_name,
+                        text,
+                        date,
+                        raw_json,
+                    ),
+                )
+                inserted = await cursor.fetchone()
+                if inserted is None:
+                    await self.conn.rollback()
+                    logger.debug(
+                        "Duplicate message %d in chat %d",
+                        telegram_msg_id,
+                        chat_id,
+                    )
+                    return None
+                row_id = int(inserted[0])
+                unique_watchers = tuple(dict.fromkeys(watcher_names))
+                if unique_watchers:
+                    if watcher_fingerprints is None or any(
+                        watcher_name not in watcher_fingerprints for watcher_name in unique_watchers
+                    ):
+                        raise ValueError("every durable watcher job requires a policy fingerprint")
+                    await self.conn.executemany(
+                        """
+                        INSERT INTO pipeline_runs (
+                            message_id, watcher_name,
+                            watcher_config_fingerprint, processing_status
+                        )
+                        VALUES (?, ?, ?, 'pending')
+                        ON CONFLICT(message_id, watcher_name) DO NOTHING
+                        """,
+                        [
+                            (
+                                row_id,
+                                watcher_name,
+                                watcher_fingerprints[watcher_name],
+                            )
+                            for watcher_name in unique_watchers
+                        ],
+                    )
+                await self.conn.execute(
+                    """
+                    INSERT INTO chats (
+                        chat_id, title, type, last_message_at, message_count
+                    )
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        title = COALESCE(excluded.title, chats.title),
+                        type = COALESCE(excluded.type, chats.type),
+                        last_message_at = CURRENT_TIMESTAMP,
+                        message_count = chats.message_count + 1
+                    """,
+                    (chat_id, chat_title, chat_type),
+                )
+                await self.conn.commit()
+                return row_id
+            except BaseException:
+                await self.conn.rollback()
+                raise
 
     async def store_alert(
         self,
@@ -226,36 +403,85 @@ class Database:
         filter_level: int,
         score: float | None = None,
         llm_response: str | None = None,
+        matched_keyword: str | None = None,
     ) -> int:
         """Idempotently enqueue an alert and return its durable outbox row ID.
 
-        Re-evaluating the same watcher/message refreshes the payload but never
-        resets terminal delivery state or attempt history.
+        Re-evaluating the same watcher/message may refresh an unclaimed pending
+        payload. Claimed and terminal rows remain immutable audit records.
         """
-        async with self._outbox_lock:
+        async with self._write_lock:
+            try:
+                alert_id = await self._enqueue_alert_locked(
+                    watcher_name=watcher_name,
+                    message_id=message_id,
+                    alert=AlertDraft(
+                        filter_level=filter_level,
+                        score=score,
+                        llm_response=llm_response,
+                        matched_keyword=matched_keyword,
+                    ),
+                )
+                await self.conn.commit()
+                return alert_id
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def _enqueue_alert_locked(
+        self,
+        *,
+        watcher_name: str,
+        message_id: int,
+        alert: AlertDraft,
+    ) -> int:
+        """Upsert an alert payload inside the caller's transaction."""
+        cursor = await self.conn.execute(
+            """
+            INSERT INTO alerts (
+                watcher_name, message_id, filter_level, score,
+                llm_response, matched_keyword
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(watcher_name, message_id) DO UPDATE SET
+                filter_level = excluded.filter_level,
+                score = excluded.score,
+                llm_response = excluded.llm_response,
+                matched_keyword = excluded.matched_keyword
+            WHERE alerts.delivery_status = 'pending'
+              AND alerts.claimed_until IS NULL
+            RETURNING id
+            """,
+            (
+                watcher_name,
+                message_id,
+                alert.filter_level,
+                alert.score,
+                alert.llm_response,
+                alert.matched_keyword,
+            ),
+        )
+        row = await cursor.fetchone()
+        if row is None:
             cursor = await self.conn.execute(
                 """
-                INSERT INTO alerts (watcher_name, message_id, filter_level, score, llm_response)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(watcher_name, message_id) DO UPDATE SET
-                    filter_level = excluded.filter_level,
-                    score = excluded.score,
-                    llm_response = excluded.llm_response
-                RETURNING id
+                SELECT id
+                FROM alerts
+                WHERE watcher_name = ? AND message_id = ?
                 """,
-                (watcher_name, message_id, filter_level, score, llm_response),
+                (watcher_name, message_id),
             )
             row = await cursor.fetchone()
-            await self.conn.commit()
-            if row is None:
-                raise RuntimeError("SQLite did not return an alert row ID")
-            return int(row[0])
+        if row is None:
+            raise RuntimeError("SQLite did not return an alert row ID")
+        return int(row[0])
 
-    async def mark_alert_sent(self, alert_id: int) -> None:
+    async def mark_alert_sent(self, alert_id: int, *, claim_token: str) -> None:
         """Compatibility wrapper for the existing immediate-delivery path."""
         await self.mark_alert_delivery_result(
             alert_id,
             DeliveryResult.success(),
+            claim_token=claim_token,
         )
 
     async def claim_due_alerts(
@@ -275,7 +501,7 @@ class Database:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be at least 1")
 
-        async with self._outbox_lock:
+        async with self._write_lock:
             return await self._claim_due_alerts_locked(
                 limit=limit,
                 lease_seconds=lease_seconds,
@@ -289,31 +515,34 @@ class Database:
     ) -> list[AlertOutboxItem]:
         """Claim one batch while the process-local outbox lock is held."""
         lease_modifier = f"+{lease_seconds} seconds"
+        claim_token = secrets.token_urlsafe(24)
         await self.conn.execute("BEGIN IMMEDIATE")
         try:
             cursor = await self.conn.execute(
                 """
                 WITH due AS (
-                    SELECT id
-                    FROM alerts
-                    WHERE delivery_status = 'pending'
+                    SELECT a.id
+                    FROM alerts AS a
+                    JOIN messages AS m ON m.id = a.message_id
+                    WHERE a.delivery_status = 'pending'
                       AND (
-                          next_attempt_at IS NULL
-                          OR datetime(next_attempt_at) <= CURRENT_TIMESTAMP
+                          a.next_attempt_at IS NULL
+                          OR datetime(a.next_attempt_at) <= CURRENT_TIMESTAMP
                       )
                       AND (
-                          claimed_until IS NULL
-                          OR datetime(claimed_until) <= CURRENT_TIMESTAMP
+                          a.claimed_until IS NULL
+                          OR datetime(a.claimed_until) <= CURRENT_TIMESTAMP
                       )
-                    ORDER BY datetime(created_at), id
+                    ORDER BY datetime(a.created_at), a.id
                     LIMIT ?
                 )
                 UPDATE alerts
-                SET claimed_until = datetime('now', ?)
+                SET claimed_until = datetime('now', ?),
+                    lease_owner = ?
                 WHERE id IN (SELECT id FROM due)
                 RETURNING id
                 """,
-                (limit, lease_modifier),
+                (limit, lease_modifier, claim_token),
             )
             claimed_ids = [int(row[0]) for row in await cursor.fetchall()]
             if not claimed_ids:
@@ -329,9 +558,11 @@ class Database:
                     a.message_id,
                     a.filter_level,
                     a.delivery_attempts,
+                    a.lease_owner,
                     m.chat_title,
                     m.sender_name,
-                    m.text
+                    m.text,
+                    a.matched_keyword
                 FROM alerts AS a
                 JOIN messages AS m ON m.id = a.message_id
                 WHERE a.id IN (
@@ -356,8 +587,12 @@ class Database:
                 chat_title=str(row["chat_title"] or "Unknown"),
                 sender_name=str(row["sender_name"] or "Unknown"),
                 text=str(row["text"] or ""),
+                matched_keyword=(
+                    str(row["matched_keyword"]) if row["matched_keyword"] is not None else None
+                ),
                 filter_level=int(row["filter_level"]),
                 delivery_attempts=int(row["delivery_attempts"]),
+                claim_token=str(row["lease_owner"]),
             )
             for row in rows
         ]
@@ -367,6 +602,7 @@ class Database:
         alert_id: int,
         result: DeliveryResult,
         *,
+        claim_token: str,
         max_attempts: int = 5,
         base_delay_seconds: int = 5,
     ) -> AlertDeliveryStatus:
@@ -376,10 +612,11 @@ class Database:
         if base_delay_seconds < 1:
             raise ValueError("base_delay_seconds must be at least 1")
 
-        async with self._outbox_lock:
+        async with self._write_lock:
             return await self._mark_alert_delivery_result_locked(
                 alert_id,
                 result,
+                claim_token=claim_token,
                 max_attempts=max_attempts,
                 base_delay_seconds=base_delay_seconds,
             )
@@ -389,6 +626,7 @@ class Database:
         alert_id: int,
         result: DeliveryResult,
         *,
+        claim_token: str,
         max_attempts: int,
         base_delay_seconds: int,
     ) -> AlertDeliveryStatus:
@@ -397,7 +635,12 @@ class Database:
         try:
             cursor = await self.conn.execute(
                 """
-                SELECT delivery_status, delivery_attempts
+                SELECT
+                    delivery_status,
+                    delivery_attempts,
+                    message_id,
+                    watcher_name,
+                    lease_owner
                 FROM alerts
                 WHERE id = ?
                 """,
@@ -414,6 +657,12 @@ class Database:
             if current_status is AlertDeliveryStatus.FAILED and not result.sent:
                 await self.conn.commit()
                 return current_status
+            stored_claim_token = row["lease_owner"]
+            if not isinstance(stored_claim_token, str) or not secrets.compare_digest(
+                stored_claim_token,
+                claim_token,
+            ):
+                raise RuntimeError("alert delivery claim is no longer owned")
 
             attempts = int(row["delivery_attempts"]) + 1
             if result.sent:
@@ -426,10 +675,15 @@ class Database:
                         next_attempt_at = NULL,
                         last_error = NULL,
                         claimed_until = NULL,
+                        lease_owner = NULL,
                         sent_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (status.value, attempts, alert_id),
+                )
+                await self._mark_pipeline_alert_sent_locked(
+                    message_id=int(row["message_id"]),
+                    watcher_name=str(row["watcher_name"]),
                 )
             else:
                 error_code = _normalize_delivery_error_code(result.error_code)
@@ -446,7 +700,8 @@ class Database:
                             delivery_attempts = ?,
                             next_attempt_at = datetime('now', ?),
                             last_error = ?,
-                            claimed_until = NULL
+                            claimed_until = NULL,
+                            lease_owner = NULL
                         WHERE id = ?
                         """,
                         (
@@ -466,7 +721,8 @@ class Database:
                             delivery_attempts = ?,
                             next_attempt_at = NULL,
                             last_error = ?,
-                            claimed_until = NULL
+                            claimed_until = NULL,
+                            lease_owner = NULL
                         WHERE id = ?
                         """,
                         (status.value, attempts, error_code, alert_id),
@@ -486,90 +742,256 @@ class Database:
         chat_type: str | None = None,
     ) -> None:
         """Upsert chat metadata and increment message count."""
-        await self.conn.execute(
-            """
-            INSERT INTO chats (chat_id, title, type, last_message_at, message_count)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                title = COALESCE(excluded.title, chats.title),
-                type = COALESCE(excluded.type, chats.type),
-                last_message_at = CURRENT_TIMESTAMP,
-                message_count = chats.message_count + 1
-            """,
-            (chat_id, title, chat_type),
-        )
-        await self.conn.commit()
+        async with self._write_lock:
+            try:
+                await self.conn.execute(
+                    """
+                    INSERT INTO chats (chat_id, title, type, last_message_at, message_count)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        title = COALESCE(excluded.title, chats.title),
+                        type = COALESCE(excluded.type, chats.type),
+                        last_message_at = CURRENT_TIMESTAMP,
+                        message_count = chats.message_count + 1
+                    """,
+                    (chat_id, title, chat_type),
+                )
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
 
-    async def record_pipeline_outcome(self, outcome: PipelineOutcome) -> bool:
-        """Persist one message/watcher outcome and update aggregate stats once.
+    async def record_pipeline_outcome(
+        self,
+        outcome: PipelineOutcome,
+        *,
+        alert: AlertDraft | None = None,
+    ) -> bool:
+        """Atomically finish one pipeline job, optional alert, and its stats.
 
-        Returns True when a new run was inserted and False for an idempotent
-        duplicate. Aggregate counters only change for a new run.
+        A pre-enqueued ``pending`` job is completed in place. Direct callers
+        may still insert an already-completed outcome. Returns ``False`` for a
+        terminal duplicate; aggregate counters change exactly once.
         """
-        async with self.conn.execute(
-            """
-            INSERT INTO pipeline_runs (
-                message_id, watcher_name, rule_passed,
-                embedding_status, embedding_passed, embedding_score,
-                embedding_model, embedding_latency_ms,
-                llm_status, llm_relevant, llm_verdict, llm_confidence,
-                llm_model, llm_prompt_version, llm_latency_ms,
-                alert_created, alert_sent, error_code
+        if alert is not None and not outcome.alert_created:
+            raise ValueError("an alert draft requires outcome.alert_created")
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.conn.execute(
+                    """
+                    INSERT INTO pipeline_runs (
+                        message_id, watcher_name, processing_status, rule_passed,
+                        embedding_status, embedding_passed, embedding_score,
+                        embedding_negative_score, embedding_threshold,
+                        embedding_model, embedding_latency_ms, embedding_input_tokens,
+                        llm_status, llm_relevant, llm_passed, llm_verdict,
+                        llm_confidence, llm_model, llm_prompt_version, llm_latency_ms,
+                        llm_input_tokens, llm_output_tokens,
+                        accepted, alert_created, alert_sent, error_code,
+                        completed_at
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        CURRENT_TIMESTAMP
+                    )
+                    ON CONFLICT(message_id, watcher_name) DO UPDATE SET
+                        processing_status = excluded.processing_status,
+                        rule_passed = excluded.rule_passed,
+                        embedding_status = excluded.embedding_status,
+                        embedding_passed = excluded.embedding_passed,
+                        embedding_score = excluded.embedding_score,
+                        embedding_negative_score = excluded.embedding_negative_score,
+                        embedding_threshold = excluded.embedding_threshold,
+                        embedding_model = excluded.embedding_model,
+                        embedding_latency_ms = excluded.embedding_latency_ms,
+                        embedding_input_tokens = excluded.embedding_input_tokens,
+                        llm_status = excluded.llm_status,
+                        llm_relevant = excluded.llm_relevant,
+                        llm_passed = excluded.llm_passed,
+                        llm_verdict = excluded.llm_verdict,
+                        llm_confidence = excluded.llm_confidence,
+                        llm_model = excluded.llm_model,
+                        llm_prompt_version = excluded.llm_prompt_version,
+                        llm_latency_ms = excluded.llm_latency_ms,
+                        llm_input_tokens = excluded.llm_input_tokens,
+                        llm_output_tokens = excluded.llm_output_tokens,
+                        accepted = excluded.accepted,
+                        alert_created = excluded.alert_created,
+                        alert_sent = excluded.alert_sent,
+                        error_code = excluded.error_code,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE pipeline_runs.processing_status = 'pending'
+                    RETURNING DATE(created_at)
+                    """,
+                    (
+                        outcome.message_id,
+                        outcome.watcher_name,
+                        outcome.processing_status.value,
+                        outcome.rule_passed,
+                        outcome.embedding_status.value,
+                        outcome.embedding_passed,
+                        outcome.embedding_score,
+                        outcome.embedding_negative_score,
+                        outcome.embedding_threshold,
+                        outcome.embedding_model,
+                        outcome.embedding_latency_ms,
+                        outcome.embedding_input_tokens,
+                        outcome.llm_status.value,
+                        outcome.llm_relevant,
+                        outcome.llm_passed,
+                        outcome.llm_verdict,
+                        outcome.llm_confidence,
+                        outcome.llm_model,
+                        outcome.llm_prompt_version,
+                        outcome.llm_latency_ms,
+                        outcome.llm_input_tokens,
+                        outcome.llm_output_tokens,
+                        outcome.accepted,
+                        outcome.alert_created,
+                        outcome.alert_sent,
+                        outcome.error_code,
+                    ),
+                )
+                terminal_row = await cursor.fetchone()
+                if terminal_row is None:
+                    await self.conn.commit()
+                    return False
+
+                if alert is not None:
+                    await self._enqueue_alert_locked(
+                        watcher_name=outcome.watcher_name,
+                        message_id=outcome.message_id,
+                        alert=alert,
+                    )
+
+                outcome_date = str(terminal_row[0])
+                await self.conn.execute(
+                    """
+                    INSERT INTO filter_stats (
+                        watcher_name, date, messages_total,
+                        passed_level1, passed_level2, passed_level3,
+                        accepted, alerts_sent
+                    )
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(watcher_name, date) DO UPDATE SET
+                        messages_total = filter_stats.messages_total + 1,
+                        passed_level1 = filter_stats.passed_level1 + excluded.passed_level1,
+                        passed_level2 = filter_stats.passed_level2 + excluded.passed_level2,
+                        passed_level3 = filter_stats.passed_level3 + excluded.passed_level3,
+                        accepted = filter_stats.accepted + excluded.accepted,
+                        alerts_sent = filter_stats.alerts_sent + excluded.alerts_sent
+                    """,
+                    (
+                        outcome.watcher_name,
+                        outcome_date,
+                        int(outcome.rule_passed),
+                        int(
+                            outcome.embedding_status is StageStatus.OK and outcome.embedding_passed
+                        ),
+                        int(outcome.llm_status is StageStatus.OK and outcome.llm_passed),
+                        int(outcome.accepted),
+                        int(outcome.alert_sent),
+                    ),
+                )
+                await self.conn.commit()
+                return True
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def get_pending_pipeline_jobs(self, limit: int = 500) -> list[StoredPipelineJob]:
+        """Return durable jobs left unfinished by an interrupted worker."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """
+                SELECT
+                    p.message_id,
+                    p.watcher_name,
+                    p.watcher_config_fingerprint,
+                    m.chat_id,
+                    m.chat_title,
+                    m.sender_name,
+                    m.text
+                FROM pipeline_runs AS p
+                JOIN messages AS m ON m.id = p.message_id
+                WHERE p.processing_status = 'pending'
+                ORDER BY datetime(p.created_at), p.id
+                LIMIT ?
+                """,
+                (limit,),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(message_id, watcher_name) DO NOTHING
-            RETURNING id
+            rows = await cursor.fetchall()
+        return [
+            StoredPipelineJob(
+                message_id=int(row["message_id"]),
+                watcher_name=str(row["watcher_name"]),
+                chat_id=int(row["chat_id"]),
+                chat_title=str(row["chat_title"] or "Unknown"),
+                sender_name=str(row["sender_name"] or "Unknown"),
+                text=str(row["text"] or ""),
+                watcher_config_fingerprint=str(row["watcher_config_fingerprint"]),
+            )
+            for row in rows
+        ]
+
+    async def mark_pipeline_alert_sent(
+        self,
+        *,
+        message_id: int,
+        watcher_name: str,
+    ) -> bool:
+        """Reconcile a replayed outbox success into provenance and daily stats."""
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                updated = await self._mark_pipeline_alert_sent_locked(
+                    message_id=message_id,
+                    watcher_name=watcher_name,
+                )
+                await self.conn.commit()
+                return updated
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def _mark_pipeline_alert_sent_locked(
+        self,
+        *,
+        message_id: int,
+        watcher_name: str,
+    ) -> bool:
+        """Reconcile delivery provenance inside the caller's transaction."""
+        cursor = await self.conn.execute(
+            """
+            UPDATE pipeline_runs
+            SET alert_sent = 1
+            WHERE message_id = ?
+              AND watcher_name = ?
+              AND processing_status = 'completed'
+              AND alert_sent = 0
+            RETURNING DATE(created_at)
             """,
-            (
-                outcome.message_id,
-                outcome.watcher_name,
-                outcome.rule_passed,
-                outcome.embedding_status.value,
-                outcome.embedding_passed,
-                outcome.embedding_score,
-                outcome.embedding_model,
-                outcome.embedding_latency_ms,
-                outcome.llm_status.value,
-                outcome.llm_relevant,
-                outcome.llm_verdict,
-                outcome.llm_confidence,
-                outcome.llm_model,
-                outcome.llm_prompt_version,
-                outcome.llm_latency_ms,
-                outcome.alert_created,
-                outcome.alert_sent,
-                outcome.error_code,
-            ),
-        ) as cursor:
-            inserted = await cursor.fetchone()
-
-        if inserted is None:
-            await self.conn.commit()
+            (message_id, watcher_name),
+        )
+        updated = await cursor.fetchone()
+        if updated is None:
             return False
-
         await self.conn.execute(
             """
             INSERT INTO filter_stats (
-                watcher_name, date, messages_total,
-                passed_level1, passed_level2, passed_level3, alerts_sent
+                watcher_name, date, messages_total, passed_level1,
+                passed_level2, passed_level3, accepted, alerts_sent
             )
-            VALUES (?, DATE('now'), 1, ?, ?, ?, ?)
+            VALUES (?, ?, 0, 0, 0, 0, 0, 1)
             ON CONFLICT(watcher_name, date) DO UPDATE SET
-                messages_total = filter_stats.messages_total + 1,
-                passed_level1 = filter_stats.passed_level1 + excluded.passed_level1,
-                passed_level2 = filter_stats.passed_level2 + excluded.passed_level2,
-                passed_level3 = filter_stats.passed_level3 + excluded.passed_level3,
-                alerts_sent = filter_stats.alerts_sent + excluded.alerts_sent
+                alerts_sent = filter_stats.alerts_sent + 1
             """,
-            (
-                outcome.watcher_name,
-                int(outcome.rule_passed),
-                int(outcome.embedding_status is StageStatus.OK and outcome.embedding_passed),
-                int(outcome.llm_status is StageStatus.OK and outcome.llm_relevant),
-                int(outcome.alert_sent),
-            ),
+            (watcher_name, str(updated[0])),
         )
-        await self.conn.commit()
         return True
 
     async def get_daily_messages(
@@ -584,63 +1006,189 @@ class Database:
         if not chat_ids:
             return []
         chat_ids_json = json.dumps(chat_ids, separators=(",", ":"))
-        cursor = await self.conn.execute(
-            """
-            SELECT chat_id, chat_title, sender_name, text, date
-            FROM messages
-            WHERE chat_id IN (
-                SELECT CAST(value AS INTEGER)
-                FROM json_each(?)
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """
+                SELECT id, chat_id, chat_title, sender_name, text, date
+                FROM messages
+                WHERE chat_id IN (
+                    SELECT CAST(value AS INTEGER)
+                    FROM json_each(?)
+                )
+                  AND DATE(date) = ?
+                  AND text IS NOT NULL
+                ORDER BY date ASC
+                """,
+                (chat_ids_json, date),
             )
-              AND DATE(date) = ?
-              AND text IS NOT NULL
-            ORDER BY date ASC
-            """,
-            (chat_ids_json, date),
-        )
-        rows = await cursor.fetchall()
+            rows = await cursor.fetchall()
         return [
             DailyMessage(
-                chat_id=row[0],
-                chat_title=row[1] or "Unknown",
-                sender_name=row[2] or "Unknown",
-                text=row[3],
-                date=row[4],
+                message_id=int(row[0]),
+                chat_id=int(row[1]),
+                chat_title=str(row[2] or "Unknown"),
+                sender_name=str(row[3] or "Unknown"),
+                text=str(row[4]),
+                date=str(row[5]),
+            )
+            for row in rows
+        ]
+
+    async def get_daily_accepted_messages(
+        self,
+        watcher_name: str,
+        date: str,
+    ) -> list[DailyMessage]:
+        """Fetch only messages accepted by one watcher for a grounded digest."""
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """
+                SELECT
+                    m.id AS message_id,
+                    m.chat_id,
+                    m.chat_title,
+                    m.sender_name,
+                    m.text,
+                    m.date
+                FROM pipeline_runs AS p
+                JOIN messages AS m ON m.id = p.message_id
+                WHERE p.watcher_name = ?
+                  AND p.processing_status = 'completed'
+                  AND p.accepted = 1
+                  AND DATE(m.date) = ?
+                  AND m.text IS NOT NULL
+                ORDER BY datetime(m.date), m.id
+                """,
+                (watcher_name, date),
+            )
+            rows = await cursor.fetchall()
+        return [
+            DailyMessage(
+                message_id=int(row["message_id"]),
+                chat_id=int(row["chat_id"]),
+                chat_title=str(row["chat_title"] or "Unknown"),
+                sender_name=str(row["sender_name"] or "Unknown"),
+                text=str(row["text"]),
+                date=str(row["date"]),
+            )
+            for row in rows
+        ]
+
+    async def get_accepted_messages_between(
+        self,
+        watcher_name: str,
+        window_start: str,
+        window_end: str,
+    ) -> list[DailyMessage]:
+        """Fetch accepted messages in the half-open digest window ``(start, end]``."""
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """
+                SELECT
+                    m.id AS message_id,
+                    m.chat_id,
+                    m.chat_title,
+                    m.sender_name,
+                    m.text,
+                    m.date
+                FROM pipeline_runs AS p
+                JOIN messages AS m ON m.id = p.message_id
+                WHERE p.watcher_name = ?
+                  AND p.processing_status = 'completed'
+                  AND p.accepted = 1
+                  AND datetime(m.date) > datetime(?)
+                  AND datetime(m.date) <= datetime(?)
+                  AND m.text IS NOT NULL
+                ORDER BY datetime(m.date), m.id
+                """,
+                (watcher_name, window_start, window_end),
+            )
+            rows = await cursor.fetchall()
+        return [
+            DailyMessage(
+                message_id=int(row["message_id"]),
+                chat_id=int(row["chat_id"]),
+                chat_title=str(row["chat_title"] or "Unknown"),
+                sender_name=str(row["sender_name"] or "Unknown"),
+                text=str(row["text"]),
+                date=str(row["date"]),
             )
             for row in rows
         ]
 
     async def purge_expired_data(self, retention_days: int) -> int:
         """Delete message content older than the configured retention window."""
-        async with self._outbox_lock:
+        async with self._write_lock:
             return await self._purge_expired_data_locked(retention_days)
 
     async def _purge_expired_data_locked(self, retention_days: int) -> int:
-        """Purge content without racing an active outbox claim."""
+        """Purge terminal content without deleting recoverable work."""
         cutoff = f"-{retention_days} days"
-        await self.conn.execute(
-            """
-            DELETE FROM pipeline_runs
-            WHERE message_id IN (
-                SELECT id FROM messages
-                WHERE datetime(date) < datetime('now', ?)
+        await self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            await self.conn.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS retention_candidates (
+                    message_id INTEGER PRIMARY KEY
+                )
+                """
             )
-            """,
-            (cutoff,),
-        )
-        await self.conn.execute(
-            """
-            DELETE FROM alerts
-            WHERE message_id IN (
-                SELECT id FROM messages
-                WHERE datetime(date) < datetime('now', ?)
+            await self.conn.execute("DELETE FROM retention_candidates")
+            await self.conn.execute(
+                """
+                INSERT INTO retention_candidates (message_id)
+                SELECT m.id
+                FROM messages AS m
+                WHERE datetime(m.date) < datetime('now', ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pipeline_runs AS p
+                      WHERE p.message_id = m.id
+                        AND p.processing_status = 'pending'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM alerts AS a
+                      WHERE a.message_id = m.id
+                        AND a.delivery_status = 'pending'
+                  )
+                """,
+                (cutoff,),
             )
-            """,
-            (cutoff,),
-        )
-        cursor = await self.conn.execute(
-            "DELETE FROM messages WHERE datetime(date) < datetime('now', ?)",
-            (cutoff,),
-        )
-        await self.conn.commit()
-        return max(cursor.rowcount, 0)
+            cursor = await self.conn.execute("SELECT COUNT(*) FROM retention_candidates")
+            row = await cursor.fetchone()
+            candidate_count = int(row[0]) if row is not None else 0
+            if candidate_count == 0:
+                await self.conn.commit()
+                return 0
+
+            await self.conn.execute(
+                """
+                DELETE FROM pipeline_runs
+                WHERE message_id IN (
+                    SELECT message_id FROM retention_candidates
+                )
+                """
+            )
+            await self.conn.execute(
+                """
+                DELETE FROM alerts
+                WHERE message_id IN (
+                    SELECT message_id FROM retention_candidates
+                )
+                """
+            )
+            await self.conn.execute(
+                """
+                DELETE FROM messages
+                WHERE id IN (
+                    SELECT message_id FROM retention_candidates
+                )
+                """
+            )
+            await self.conn.execute("DELETE FROM retention_candidates")
+            await self.conn.commit()
+            return candidate_count
+        except BaseException:
+            await self.conn.rollback()
+            raise
