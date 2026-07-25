@@ -248,6 +248,8 @@ class ScoutChat:
     username: str | None = None
     title: str | None = None
     chat_type: str | None = None
+    participants: int | None = None
+    risk_flags: tuple[str, ...] = ()
     visibility: ChatVisibility = ChatVisibility.UNKNOWN
     visibility_source: str | None = None
     membership: ChatMembership = ChatMembership.NONE

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from pipeline.discovery import DiscoveredChat
 from pipeline.recon_models import CandidateState, ChatVisibility
@@ -239,8 +239,8 @@ def build_policy(
     *,
     topic: str,
     location: str | None,
-    auto_join_threshold: float = 85.0,
-    approval_threshold: float = 65.0,
+    auto_join_threshold: float | None = None,
+    approval_threshold: float | None = None,
 ) -> ScoringPolicy:
     """Derive a scoring policy from what the owner asked for.
 
@@ -258,12 +258,17 @@ def build_policy(
 
     topic_keywords = [word for word in re.split(r"[\s,]+", topic.lower()) if len(word) > 3]
 
-    return ScoringPolicy(
+    # Thresholds are only overridden when a caller asks, so the defaults live
+    # in exactly one place and cannot drift apart.
+    policy = ScoringPolicy(
         location_keywords=tuple(dict.fromkeys(location_keywords)),
         topic_keywords=tuple(dict.fromkeys(topic_keywords)),
-        auto_join_threshold=auto_join_threshold,
-        approval_threshold=approval_threshold,
     )
+    if auto_join_threshold is not None:
+        policy = replace(policy, auto_join_threshold=auto_join_threshold)
+    if approval_threshold is not None:
+        policy = replace(policy, approval_threshold=approval_threshold)
+    return policy
 
 
 # Cities where the owner's chats are likely to be multilingual. Kept small and

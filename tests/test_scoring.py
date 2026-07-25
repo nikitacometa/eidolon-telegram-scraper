@@ -263,3 +263,19 @@ def test_impossible_thresholds_are_rejected() -> None:
     """A policy where approval outranks auto-join would never ask anyone."""
     with pytest.raises(ValueError):
         ScoringPolicy(auto_join_threshold=50.0, approval_threshold=80.0)
+
+
+def test_built_policy_keeps_the_single_source_of_truth_for_thresholds() -> None:
+    """Thresholds must not be duplicated where they can drift apart."""
+    built = build_policy(topic="housing", location="Da Nang")
+    default = ScoringPolicy()
+
+    assert built.auto_join_threshold == default.auto_join_threshold
+    assert built.approval_threshold == default.approval_threshold
+
+
+def test_built_policy_still_accepts_explicit_thresholds() -> None:
+    """A caller that wants stricter behaviour can still ask for it."""
+    built = build_policy(topic="housing", location="Da Nang", auto_join_threshold=95.0)
+
+    assert built.auto_join_threshold == 95.0

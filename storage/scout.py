@@ -414,6 +414,36 @@ class ScoutDatabase:
             row = await cursor.fetchone()
         return _chat_from_row(row) if row is not None else None
 
+    async def record_chat_profile(
+        self,
+        chat_uuid: str,
+        *,
+        participants: int | None = None,
+        risk_flags: Iterable[str] = (),
+        chat_type: str | None = None,
+        title: str | None = None,
+    ) -> None:
+        """Store the profile fields scoring depends on.
+
+        Scoring runs from the stored record rather than from the search
+        response, so anything the scorer reads has to survive the write.
+        """
+        flags = json.dumps(sorted(set(risk_flags)), separators=(",", ":"))
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE scout_chats
+                SET participants = COALESCE(?, participants),
+                    risk_flags = CASE WHEN ? = '[]' THEN risk_flags ELSE ? END,
+                    chat_type = COALESCE(?, chat_type),
+                    title = COALESCE(?, title),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (participants, flags, flags, chat_type, title, chat_uuid),
+            )
+            await self.conn.commit()
+
     async def set_chat_visibility(
         self,
         chat_uuid: str,
@@ -1178,6 +1208,8 @@ def _chat_from_row(row: aiosqlite.Row) -> ScoutChat:
         username=str(row["username"]) if row["username"] is not None else None,
         title=str(row["title"]) if row["title"] is not None else None,
         chat_type=str(row["chat_type"]) if row["chat_type"] is not None else None,
+        participants=int(row["participants"]) if row["participants"] is not None else None,
+        risk_flags=tuple(json.loads(str(row["risk_flags"]))),
         visibility=ChatVisibility(str(row["visibility"])),
         visibility_source=(
             str(row["visibility_source"]) if row["visibility_source"] is not None else None

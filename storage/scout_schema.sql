@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS scout_chats (
     username TEXT,
     title TEXT,
     chat_type TEXT,
+    participants INTEGER,
+    -- Telegram's own scam/fake labels. Scoring happens after the chat is
+    -- stored, so dropping these here would silently disarm the risk check.
+    risk_flags TEXT NOT NULL DEFAULT '[]',
     visibility TEXT NOT NULL DEFAULT 'unknown'
         CHECK(visibility IN ('unknown', 'public', 'private')),
     visibility_source TEXT,
