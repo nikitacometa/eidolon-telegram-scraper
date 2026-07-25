@@ -162,3 +162,7 @@ Tasks in `BOARD.md`. Format: Pantheon table (E-NNN IDs).
 - **Task file:** `BOARD.md` (pantheon format, E-NNN IDs)
 - **Cross-project status:** `/status` from any project
 - **Alerts:** via @ClaudePantheon_Bot (shared infrastructure)
+
+## Code Review Tools
+
+After writing significant code, use **Codex MCP** `review` tool for second-opinion review (GPT-5.x). Codex reviews uncommitted changes by default. Synthesize findings with your own analysis — don't blindly apply.

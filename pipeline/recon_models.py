@@ -125,6 +125,16 @@ class ActionKind(StrEnum):
     INVITE_CHECK = "invite_check"
     HISTORY_PAGE = "history_page"
 
+    @property
+    def is_mutating(self) -> bool:
+        """Whether repeating this action changes something outside the process.
+
+        Reads can safely run again after a crash; a join cannot, because the
+        first attempt may already have succeeded without the outcome ever
+        being recorded.
+        """
+        return self is ActionKind.JOIN
+
 
 class ActionOutcome(StrEnum):
     """Terminal state of a reserved action.

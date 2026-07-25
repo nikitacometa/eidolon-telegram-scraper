@@ -366,3 +366,61 @@ async def test_platform_scam_label_survives_storage_and_blocks_the_join(
     assert stored is not None
     assert stored.risk_flags == ("scam",)
     assert stored.participants == 9000
+
+
+async def test_join_attempt_cap_is_enforced_during_the_wave(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """The cap has to bite while joining, not in the report afterwards."""
+    channels = [
+        _channel(200 + index, f"danang_housing_{index}", f"Da Nang Housing {index}")
+        for index in range(4)
+    ]
+    client = FakeTelegram(
+        search_results=channels,
+        history={channel.username: [] for channel in channels},
+    )
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="recon-capped",
+            topic="housing rent",
+            location="Da Nang, Vietnam",
+            max_join_attempts=2,
+        )
+    )
+
+    report = await _runner(
+        scout,
+        db,
+        client,
+        policy={ActionKind.JOIN: BudgetRule(per_hour=None, per_day=10)},
+        pages=1,
+    ).run(job)
+
+    assert len(client.joined) == 2
+    assert report.stop_reason == "join attempt limit reached"
+
+
+async def test_history_older_than_the_lookback_window_is_not_stored(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A job that asked for a week must not quietly archive a year."""
+    housing = _channel(210, "danang_housing", "Da Nang Housing")
+    recent = _message(20, "recent listing", 210)
+    recent.date = datetime.now(UTC)
+    ancient = _message(19, "listing from last year", 210)
+    ancient.date = datetime(2024, 1, 1, tzinfo=UTC)
+    client = FakeTelegram(search_results=[housing], history={"danang_housing": [recent, ancient]})
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="recon-lookback",
+            topic="housing rent",
+            location="Da Nang, Vietnam",
+            lookback_days=7,
+        )
+    )
+
+    report = await _runner(scout, db, client, pages=5).run(job)
+
+    assert report.messages_stored == 1
+    assert client.history_calls == 1

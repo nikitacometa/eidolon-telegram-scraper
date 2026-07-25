@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from telethon import errors
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -112,12 +113,15 @@ class TelegramCrawler:
         peer: object,
         offset_id: int = 0,
         min_id: int = 0,
+        not_before: datetime | None = None,
     ) -> ActionResult[HistoryPage]:
         """Read one page of history, oldest-bound by ``min_id``.
 
         Paging walks backwards from ``offset_id``; ``min_id`` is where a
         previous run stopped, so a resumed crawl does not re-read what it
-        already stored.
+        already stored. ``not_before`` is the job's lookback window: messages
+        older than it are dropped and end the walk, so a job that asked for a
+        week does not quietly archive a year.
         """
 
         async def call() -> HistoryPage:
@@ -133,7 +137,7 @@ class TelegramCrawler:
                     hash=0,
                 )
             )
-            return self._read_page(response, chat_id=chat_id)
+            return self._read_page(response, chat_id=chat_id, not_before=not_before)
 
         return await self._governor.run(
             ActionKind.HISTORY_PAGE,
@@ -142,8 +146,15 @@ class TelegramCrawler:
             job_id=job_id,
         )
 
-    def _read_page(self, response: object, *, chat_id: int) -> HistoryPage:
+    def _read_page(
+        self,
+        response: object,
+        *,
+        chat_id: int,
+        not_before: datetime | None = None,
+    ) -> HistoryPage:
         raw = list(getattr(response, "messages", ()) or ())
+        crossed_cutoff = False
         messages: list[ScoutMessage] = []
         links: list[ChatLink] = []
         seen_links: set[str] = set()
@@ -151,6 +162,10 @@ class TelegramCrawler:
         for item in raw:
             message_id = getattr(item, "id", None)
             if message_id is None:
+                continue
+            posted = getattr(item, "date", None)
+            if not_before is not None and isinstance(posted, datetime) and posted < not_before:
+                crossed_cutoff = True
                 continue
             text = getattr(item, "message", None)
             entities = getattr(item, "entities", None)
@@ -182,8 +197,9 @@ class TelegramCrawler:
             messages=tuple(messages),
             links=tuple(links),
             next_offset_id=oldest,
-            # A short page means Telegram has nothing older to give.
-            exhausted=len(raw) < HISTORY_PAGE_SIZE,
+            # A short page means Telegram has nothing older to give; crossing
+            # the lookback window means we no longer want what it has.
+            exhausted=len(raw) < HISTORY_PAGE_SIZE or crossed_cutoff,
         )
 
 

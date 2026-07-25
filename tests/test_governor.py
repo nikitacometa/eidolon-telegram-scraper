@@ -221,7 +221,11 @@ async def test_unexpected_failure_propagates_and_spends_the_slot(
 
 
 async def test_replayed_key_does_not_double_spend(scout: ScoutDatabase) -> None:
-    """Retrying a submitted action must not consume a second slot."""
+    """Retrying a submitted action must not consume a second slot.
+
+    The retry is also refused outright for a join: the budget is only half
+    the protection, the other half is not repeating the request.
+    """
     governor = TelegramActionGovernor(
         scout=scout,
         policy={ActionKind.JOIN: BudgetRule(per_day=1)},
@@ -234,7 +238,7 @@ async def test_replayed_key_does_not_double_spend(scout: ScoutDatabase) -> None:
     second = await governor.run(ActionKind.JOIN, "join-once", call)
 
     assert first.ok
-    assert second.ok
+    assert second.status is ActionStatus.REPLAYED
     assert await scout.budget_usage(account_id="owner-primary", kind=ActionKind.JOIN) == (1, 1)
 
 
@@ -283,3 +287,44 @@ async def test_slow_call_is_flagged_as_a_hidden_flood_wait(
     assert "may hide a short FloodWait" in caplog.text
     row = await _action_row(scout, "page-slow")
     assert float(row["duration_ms"] or 0) >= 10
+
+
+async def test_replayed_join_is_not_sent_again(scout: ScoutDatabase) -> None:
+    """A join that already reached Telegram must never be repeated.
+
+    Resuming after a crash replays the same idempotency key. Re-sending the
+    request there is exactly the blind retry that turns one ambiguous join
+    into two memberships.
+    """
+    governor = TelegramActionGovernor(scout=scout)
+    calls = 0
+
+    async def call() -> str:
+        nonlocal calls
+        calls += 1
+        return "joined"
+
+    first = await governor.run(ActionKind.JOIN, "join-resumed", call)
+    second = await governor.run(ActionKind.JOIN, "join-resumed", call)
+
+    assert first.ok
+    assert second.status is ActionStatus.REPLAYED
+    assert second.error_code == "already_attempted"
+    assert calls == 1
+
+
+async def test_replayed_read_is_allowed_to_run_again(scout: ScoutDatabase) -> None:
+    """Reads have no external effect, so a resumed crawl may re-fetch."""
+    governor = TelegramActionGovernor(scout=scout)
+    calls = 0
+
+    async def call() -> str:
+        nonlocal calls
+        calls += 1
+        return "page"
+
+    await governor.run(ActionKind.HISTORY_PAGE, "page-resumed", call)
+    second = await governor.run(ActionKind.HISTORY_PAGE, "page-resumed", call)
+
+    assert second.ok
+    assert calls == 2

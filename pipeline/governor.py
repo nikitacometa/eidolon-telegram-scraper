@@ -48,6 +48,7 @@ class ActionStatus(StrEnum):
 
     OK = "ok"
     DENIED = "denied"
+    REPLAYED = "replayed"
     FLOOD_WAIT = "flood_wait"
     HALTED = "halted"
     REJECTED = "rejected"
@@ -138,6 +139,17 @@ class TelegramActionGovernor:
                 else ActionStatus.DENIED
             )
             return ActionResult(status=status, denial=reservation)
+
+        if reservation.replayed and kind.is_mutating:
+            # The first attempt already reached Telegram. Running it again is
+            # exactly the blind retry that turns one ambiguous join into two,
+            # so the caller has to reconcile the real state instead.
+            logger.warning(
+                "Refusing to repeat a %s already attempted under key %s",
+                kind.value,
+                idempotency_key,
+            )
+            return ActionResult(status=ActionStatus.REPLAYED, error_code="already_attempted")
 
         async with self._slot:
             return await self._execute(kind, reservation, call)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from pipeline.crawler import TelegramCrawler
 from pipeline.discovery import ChatLink, DiscoveredChat, TelegramDiscovery
@@ -89,6 +90,9 @@ class ReconRunner:
         self._discovery = discovery
         self._crawler = crawler
         self._backfill_pages = backfill_pages_per_chat
+        # Every attempt counts, including one that only produced a pending
+        # request or an ambiguous failure: each of those reached Telegram.
+        self._join_attempts = 0
 
     async def run(self, job: ReconJob) -> ReconReport:
         """Execute a job wave by wave until a stop condition is reached."""
@@ -188,7 +192,10 @@ class ReconRunner:
 
             if score.decision is not CandidateState.APPROVED:
                 continue
-            if len(report.joined) >= job.max_join_attempts:
+            # Counted here rather than from the report, which is only filled
+            # once the wave loop is over: reading it during the loop would
+            # always see zero and the cap would never bite.
+            if self._join_attempts >= job.max_join_attempts:
                 return "join attempt limit reached"
 
             halt = await self._join_and_read(job, candidate.id, chat, wave, report)
@@ -235,12 +242,19 @@ class ReconRunner:
             await self._scout.transition_candidate(candidate_id, CandidateState.JOIN_FAILED)
             return None
 
+        self._join_attempts += 1
         result = await self._crawler.join(
             job_id=job.id,
             candidate_id=candidate_id,
             channel=entity,
             chat_ref=chat_ref,
         )
+        if result.status is ActionStatus.REPLAYED:
+            # A previous run already attempted this join. Its real outcome has
+            # to be reconciled against Telegram rather than guessed at here.
+            await self._scout.transition_candidate(candidate_id, CandidateState.JOIN_FAILED)
+            logger.warning("Join for %s was already attempted; leaving it for review", chat_ref)
+            return None
         halt = _halt_reason(result)
         if halt is not None:
             return halt
@@ -290,6 +304,7 @@ class ReconRunner:
                 chat_id=chat_id,
                 peer=entity,
                 offset_id=offset_id,
+                not_before=_lookback_cutoff(job.lookback_days),
             )
             if not result.ok or result.value is None:
                 break
@@ -415,6 +430,11 @@ class ReconRunner:
                 report.blocked_private += 1
             elif candidate.state in {CandidateState.REJECTED, CandidateState.JOIN_FAILED}:
                 report.rejected += 1
+
+
+def _lookback_cutoff(lookback_days: int) -> datetime:
+    """The oldest message a job asked to read."""
+    return datetime.now(UTC) - timedelta(days=lookback_days)
 
 
 def _from_stored(chat: object) -> DiscoveredChat:
