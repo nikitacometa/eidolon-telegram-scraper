@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-047**
+- Next available ID: **E-048**
 
 ---
 
@@ -15,7 +15,7 @@
 
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
-| E-036 | Split monitoring policy from chat binding | todo | critical | `observed_chats` registry in DB; `Watcher.chats` becomes an optional seed; ingest routes by observation mode |
+| E-036 | Split monitoring policy from chat binding | done | critical | `observed_chats` registry in DB; `Watcher.chats` becomes an optional seed; ingest routes by observation mode |
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
@@ -28,13 +28,14 @@ Scope B "Recon" adds E-041 to E-045.
 | E-035 | Scout store: jobs, candidates, evidence, frontier, action budgets | done | critical | `storage/scout.py` + `scout_schema.sql`, own connection and lock — 49 tests |
 | E-037 | Probe: SQLite contention under crawl load | todo | high | Baseline p99 of `claim_due_alerts`, then synthetic scout writes; accept ≤1.2× baseline |
 | E-038 | Probe: `tools.mcp` spawn and hot-reload on the live gateway | todo | high | Echo MCP server, no restart expected; decides transport before any bridge code |
-| E-039 | Telegram action governor | todo | critical | `pipeline/governor.py` — single gateway for MTProto calls, reserves budget, wall-clock timing, FloodWait ladder |
-| E-040 | Discovery sources and deterministic scoring | todo | critical | `channels.searchPosts` (hashtag first), recommendations, `contacts.search`; public-scope hard gate before any LLM call |
+| E-039 | Telegram action governor | done | critical | `pipeline/governor.py` — single gateway for MTProto calls, reserves budget, wall-clock timing, FloodWait ladder |
+| E-040 | Discovery sources and deterministic scoring | done | critical | `channels.searchPosts` (hashtag first), recommendations, `contacts.search`; public-scope hard gate before any LLM call |
 | E-041 | Command API over a unix socket | todo | high | In-process, submit/status/result/cancel; no Telegram RPC inside a request |
 | E-042 | MCP stdio bridge and OpenClaw skill | todo | high | Stateless: no Telethon, no database, no session; typed tools only |
 | E-043 | Approval flow on inline buttons | todo | high | `getUpdates` consumer on @EidolonSpyBot, persistent offset, owner-only callbacks, batched digests |
 | E-044 | Safe join with membership reconciliation | todo | critical | `INVITE_REQUEST_SENT` is not membership; no blind retry after an ambiguous crash |
-| E-045 | Two-wave snowball with history backfill | todo | high | Link/mention/forward extraction, priority frontier, scout live-capture, map-reduce summaries |
+| E-045 | Two-wave snowball with history backfill | done | high | Runner joins, backfills pages, follows links; `recon_cli.py` runs a job end to end |
+| E-047 | Enforce one process per Telegram session | done | critical | `storage/session_lock.py`; the CLI refuses to start while the daemon holds it |
 | E-046 | Coordinated backups for both databases | todo | high | `sqlite3 .backup` timer; today nothing is backed up at all |
 
 ## Backlog — Phase 3: Autonomous Agent
