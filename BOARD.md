@@ -5,9 +5,9 @@
 ## Conventions
 
 - **ID format**: `E-NNN` (sequential, never reuse)
-- **Statuses**: `todo` | `in_progress` | `blocked` | `done`
+- **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-035**
+- Next available ID: **E-047**
 
 ---
 
@@ -15,7 +15,27 @@
 
 | ID | Task | Status | Priority | Notes |
 |----|------|--------|----------|-------|
+| E-036 | Split monitoring policy from chat binding | todo | critical | `observed_chats` registry in DB; `Watcher.chats` becomes an optional seed; ingest routes by observation mode |
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
+
+## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
+
+Scope A "Scout" is E-035 to E-040: discovery and reporting with no join at all.
+Scope B "Recon" adds E-041 to E-045.
+
+| ID | Task | Status | Priority | Notes |
+|----|------|--------|----------|-------|
+| E-035 | Scout store: jobs, candidates, evidence, frontier, action budgets | done | critical | `storage/scout.py` + `scout_schema.sql`, own connection and lock — 49 tests |
+| E-037 | Probe: SQLite contention under crawl load | todo | high | Baseline p99 of `claim_due_alerts`, then synthetic scout writes; accept ≤1.2× baseline |
+| E-038 | Probe: `tools.mcp` spawn and hot-reload on the live gateway | todo | high | Echo MCP server, no restart expected; decides transport before any bridge code |
+| E-039 | Telegram action governor | todo | critical | `pipeline/governor.py` — single gateway for MTProto calls, reserves budget, wall-clock timing, FloodWait ladder |
+| E-040 | Discovery sources and deterministic scoring | todo | critical | `channels.searchPosts` (hashtag first), recommendations, `contacts.search`; public-scope hard gate before any LLM call |
+| E-041 | Command API over a unix socket | todo | high | In-process, submit/status/result/cancel; no Telegram RPC inside a request |
+| E-042 | MCP stdio bridge and OpenClaw skill | todo | high | Stateless: no Telethon, no database, no session; typed tools only |
+| E-043 | Approval flow on inline buttons | todo | high | `getUpdates` consumer on @EidolonSpyBot, persistent offset, owner-only callbacks, batched digests |
+| E-044 | Safe join with membership reconciliation | todo | critical | `INVITE_REQUEST_SENT` is not membership; no blind retry after an ambiguous crash |
+| E-045 | Two-wave snowball with history backfill | todo | high | Link/mention/forward extraction, priority frontier, scout live-capture, map-reduce summaries |
+| E-046 | Coordinated backups for both databases | todo | high | `sqlite3 .backup` timer; today nothing is backed up at all |
 
 ## Backlog — Phase 3: Autonomous Agent
 
@@ -24,9 +44,9 @@
 | E-019 | Entity extraction from L3-passed messages | todo | high | `pipeline/entities.py` — LLM extracts persons, properties, contacts, locations into SQLite |
 | E-020 | Contact tracking and relevance scoring | todo | high | `contacts` table, auto-populate from alerts, increment `relevance_score` |
 | E-021 | Cognitive loop (read-only, insights only) | todo | high | `pipeline/cognitive.py` — OBSERVE→THINK→PLAN→REFLECT, cron or threshold-triggered, sends insights via bot |
-| E-022 | Group discovery with approval workflow | todo | medium | `pipeline/discovery.py` — `SearchGlobalRequest`, LLM relevance scoring, inline keyboard approve/skip |
+| E-022 | Group discovery with approval workflow | superseded | medium | Replaced by E-039/E-040/E-043 with rolling budgets and a public-scope gate |
 | E-023 | Outreach pipeline (strictly gated) | todo | medium | `pipeline/outreach.py` — double approval, rate limits (5 DM/day, 3 joins/day), FloodWait budget |
-| E-024 | Schema v2: entities, contacts, actions tables | todo | high | `storage/schema_v2.sql` — entities, entity_mentions, entity_relations, contacts, actions |
+| E-024 | Schema v2: entities, contacts, actions tables | superseded | high | Action ledger now lives in `storage/scout_schema.sql` |
 | E-025 | Persona config and disclosure system | todo | low | `config/persona.yml` — style per chat type, AI disclosure in first DM |
 
 ## Backlog — Other
