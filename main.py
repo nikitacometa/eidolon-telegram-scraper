@@ -40,6 +40,7 @@ from pipeline.recon_models import ScoutMessage
 from pipeline.summarizer import DailySummarizer
 from storage.db import Database
 from storage.scout import ScoutDatabase
+from storage.session_lock import SessionLock
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +144,11 @@ class Eidolon:
 
         try:
             async with AsyncExitStack() as stack:
+                # Taken before the client exists: a second holder of this
+                # session would invalidate the authorisation for both.
+                session_lock = SessionLock(settings.db_path.parent / "session.lock")
+                session_lock.acquire()
+                stack.callback(session_lock.release)
                 await self.db.connect()
                 stack.push_async_callback(self.db.close)
                 await self.scout.connect()
