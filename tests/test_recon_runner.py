@@ -424,3 +424,32 @@ async def test_history_older_than_the_lookback_window_is_not_stored(
 
     assert report.messages_stored == 1
     assert client.history_calls == 1
+
+
+async def test_discovery_only_run_scores_without_touching_anything(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A read-only pass must survey the ground without stepping on it.
+
+    Nothing the account does becomes visible to a chat admin, so this is the
+    safe way to see what a topic actually returns before spending standing.
+    """
+    good = _channel(300, "danang_housing", "Da Nang Housing and Rent")
+    junk = _channel(301, "danang_pump", "Da Nang PUMP 100x")
+    client = FakeTelegram(search_results=[good, junk])
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="recon-survey",
+            topic="housing rent",
+            location="Da Nang, Vietnam",
+            max_join_attempts=0,
+        )
+    )
+
+    report = await _runner(scout, db, client, pages=1).run(job)
+
+    assert client.joined == []
+    assert client.history_calls == 0
+    assert [finding.chat_ref for finding in report.recommended] == ["danang_housing"]
+    assert report.rejected == 1
+    assert await db.observation_snapshot() == {}

@@ -52,6 +52,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--key", default=None, help="idempotency key; repeats resume the same job")
     parser.add_argument("--waves", type=int, default=2, help="how far to follow links (max 2)")
     parser.add_argument("--pages", type=int, default=3, help="history pages per joined chat")
+    parser.add_argument("--lookback", type=int, default=30, help="how many days of history to read")
+    parser.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="search and score without joining anything",
+    )
+    parser.add_argument(
+        "--joins",
+        type=int,
+        default=3,
+        help="maximum join attempts for this run",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -73,6 +85,13 @@ def _render(report: ReconReport) -> str:
             lines.append(
                 f"  @{finding.chat_ref} — {finding.title or 'untitled'} "
                 f"[score {finding.score:.0f}, {finding.messages_stored} messages]"
+            )
+        lines.append("")
+    if report.recommended:
+        lines.append(f"worth joining ({len(report.recommended)}):")
+        for finding in report.recommended:
+            lines.append(
+                f"  @{finding.chat_ref} — {finding.title or 'untitled'} [score {finding.score:.0f}]"
             )
         lines.append("")
     if report.awaiting_approval:
@@ -108,6 +127,8 @@ async def _run(args: argparse.Namespace) -> int:
         location=args.location,
         seeds=tuple(args.seeds),
         max_waves=max(1, min(args.waves, 2)),
+        lookback_days=max(1, min(args.lookback, 90)),
+        max_join_attempts=0 if args.discover_only else max(0, args.joins),
     )
 
     lock = SessionLock(settings.db_path.parent / "session.lock", owner="recon-cli")

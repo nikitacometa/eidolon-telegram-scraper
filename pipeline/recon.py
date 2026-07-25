@@ -58,6 +58,7 @@ class ReconReport:
     stop_reason: str
     waves_completed: int = 0
     joined: list[ChatFinding] = field(default_factory=list)
+    recommended: list[ChatFinding] = field(default_factory=list)
     awaiting_approval: list[ChatFinding] = field(default_factory=list)
     rejected: int = 0
     blocked_private: int = 0
@@ -66,7 +67,13 @@ class ReconReport:
     @property
     def total_candidates(self) -> int:
         """Every chat the job considered."""
-        return len(self.joined) + len(self.awaiting_approval) + self.rejected + self.blocked_private
+        return (
+            len(self.joined)
+            + len(self.recommended)
+            + len(self.awaiting_approval)
+            + self.rejected
+            + self.blocked_private
+        )
 
 
 class ReconRunner:
@@ -191,6 +198,10 @@ class ReconRunner:
             )
 
             if score.decision is not CandidateState.APPROVED:
+                continue
+            if job.max_join_attempts == 0:
+                # Discovery-only run: everything is scored and recorded, but
+                # nothing the account does is visible to anyone.
                 continue
             # Counted here rather than from the report, which is only filled
             # once the wave loop is over: reading it during the loop would
@@ -424,6 +435,8 @@ class ReconRunner:
             )
             if candidate.state is CandidateState.JOINED:
                 report.joined.append(finding)
+            elif candidate.state is CandidateState.APPROVED:
+                report.recommended.append(finding)
             elif candidate.state is CandidateState.AWAITING_APPROVAL:
                 report.awaiting_approval.append(finding)
             elif candidate.state is CandidateState.BLOCKED_PRIVATE:
