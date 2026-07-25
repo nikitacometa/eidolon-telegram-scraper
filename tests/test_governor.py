@@ -38,7 +38,7 @@ async def _action_row(scout: ScoutDatabase, key: str) -> dict[str, object]:
     )
     row = await cursor.fetchone()
     assert row is not None
-    return {key: row[key] for key in row.keys()}
+    return dict(row)
 
 
 async def test_successful_call_returns_the_value(scout: ScoutDatabase) -> None:

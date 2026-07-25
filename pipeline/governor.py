@@ -15,7 +15,6 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Generic, TypeVar
 
 from telethon import errors
 
@@ -29,8 +28,6 @@ from pipeline.recon_models import (
 from storage.scout import ScoutDatabase
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 # A FloodWait this long stops the whole crawl rather than one action class:
 # repeated waits at this scale mean Telegram is pushing back on the account,
@@ -57,7 +54,7 @@ class ActionStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ActionResult(Generic[T]):
+class ActionResult[T]:
     """Outcome of one governed call.
 
     Expected refusals are values rather than exceptions: a crawl spends most
@@ -109,7 +106,7 @@ class TelegramActionGovernor:
         """Account these budgets belong to."""
         return self._account_id
 
-    async def run(
+    async def run[T](
         self,
         kind: ActionKind,
         idempotency_key: str,
@@ -145,7 +142,7 @@ class TelegramActionGovernor:
         async with self._slot:
             return await self._execute(kind, reservation, call)
 
-    async def _execute(
+    async def _execute[T](
         self,
         kind: ActionKind,
         reservation: ActionReservation,
@@ -214,7 +211,7 @@ class TelegramActionGovernor:
             )
         return ActionResult(status=ActionStatus.OK, value=value, duration_ms=duration_ms)
 
-    async def _handle_flood_wait(
+    async def _handle_flood_wait[T](
         self,
         kind: ActionKind,
         reservation: ActionReservation,
@@ -265,7 +262,7 @@ class TelegramActionGovernor:
             duration_ms=duration_ms,
         )
 
-    async def _handle_spam_limit(
+    async def _handle_spam_limit[T](
         self,
         kind: ActionKind,
         reservation: ActionReservation,
