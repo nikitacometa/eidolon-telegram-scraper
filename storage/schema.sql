@@ -79,6 +79,35 @@ CREATE TABLE IF NOT EXISTS chats (
     message_count INTEGER DEFAULT 0
 );
 
+-- Which chats the daemon observes, and how. Chat membership is runtime state
+-- that reconnaissance changes on its own, so it lives here rather than in the
+-- git-tracked policy file: promoting a discovered chat is a row, not a rewrite
+-- of a configuration file that the process cannot even write to under
+-- ProtectSystem=strict.
+CREATE TABLE IF NOT EXISTS observed_chats (
+    chat_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'monitor'
+        CHECK(mode IN ('monitor', 'recon', 'paused')),
+    title TEXT,
+    source TEXT NOT NULL DEFAULT 'config'
+        CHECK(source IN ('config', 'recon', 'manual')),
+    job_id TEXT,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Which policies apply to an observed chat. A reconnaissance chat has none
+-- until it is promoted; a monitored chat may have several.
+CREATE TABLE IF NOT EXISTS chat_policy_bindings (
+    chat_id INTEGER NOT NULL REFERENCES observed_chats(chat_id) ON DELETE CASCADE,
+    watcher_name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'config'
+        CHECK(source IN ('config', 'recon', 'manual')),
+    job_id TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, watcher_name)
+);
+
 CREATE TABLE IF NOT EXISTS filter_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     watcher_name TEXT NOT NULL,
@@ -97,3 +126,4 @@ CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 CREATE INDEX IF NOT EXISTS idx_alerts_watcher ON alerts(watcher_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_watcher
     ON pipeline_runs(watcher_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_bindings_watcher ON chat_policy_bindings(watcher_name);

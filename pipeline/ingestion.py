@@ -26,6 +26,8 @@ class TelegramMessage(Protocol):
     chat_id: int | None
     text: str | None
     date: object
+    sender_id: int | None
+    fwd_from: object | None
 
     def to_dict(self) -> dict[str, object]: ...
 

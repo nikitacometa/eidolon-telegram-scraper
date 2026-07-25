@@ -21,7 +21,6 @@ from config.settings import settings
 from config.watchers import (
     Watcher,
     WatcherConfigError,
-    get_chat_watchers,
     load_watchers,
 )
 from pipeline.dispatcher import AlertDispatcher
@@ -29,11 +28,18 @@ from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.ingestion import NewMessageEvent, ingest_message
 from pipeline.llm import LLMClassifier
-from pipeline.models import PipelineOutcome, PipelineRunStatus
+from pipeline.models import (
+    ObservationMode,
+    ObservedChat,
+    PipelineOutcome,
+    PipelineRunStatus,
+)
 from pipeline.policy import effective_policy_fingerprint
 from pipeline.processor import MessageProcessor
+from pipeline.recon_models import ScoutMessage
 from pipeline.summarizer import DailySummarizer
 from storage.db import Database
+from storage.scout import ScoutDatabase
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +96,7 @@ class Eidolon:
 
     def __init__(self) -> None:
         self.db = Database(settings.db_path)
+        self.scout = ScoutDatabase(settings.scout_db_path)
         self.client = TelegramClient(
             StringSession(settings.telegram_session_string),
             settings.telegram_api_id,
@@ -111,14 +118,16 @@ class Eidolon:
         self._outbox_wakeup = asyncio.Event()
         self._fatal_ingress_error: BaseException | None = None
 
-        # Load watcher configs
+        # Load watcher policies. Which chats they apply to comes from the
+        # registry once the database is open, not from the file.
         self.watchers = load_watchers(settings.watchers_path)
         _validate_runtime_configuration(self.watchers)
         self.watchers_by_name = {watcher.name: watcher for watcher in self.watchers}
         self.watcher_fingerprints = {
             watcher.name: effective_policy_fingerprint(watcher) for watcher in self.watchers
         }
-        self.chat_watchers = get_chat_watchers(self.watchers)
+        self.chat_watchers: dict[int, list[Watcher]] = {}
+        self.observed_chats: dict[int, ObservedChat] = {}
         self.filters: dict[str, RuleFilter] = {w.name: RuleFilter(w) for w in self.watchers}
         self.processor = MessageProcessor(
             store=self.db,
@@ -136,6 +145,9 @@ class Eidolon:
             async with AsyncExitStack() as stack:
                 await self.db.connect()
                 stack.push_async_callback(self.db.close)
+                await self.scout.connect()
+                stack.push_async_callback(self.scout.close)
+                await self.reload_observation()
                 purged = await self.db.purge_expired_data(settings.retention_days)
                 if purged:
                     logger.info("Purged %d messages beyond retention window", purged)
@@ -299,6 +311,73 @@ class Eidolon:
             finally:
                 self._message_queue.task_done()
 
+    async def reload_observation(self) -> None:
+        """Rebuild routing from the chat registry without restarting.
+
+        Every structure is mutated in place rather than rebound: the rule
+        filters were handed to :class:`MessageProcessor` by reference at
+        construction time, so rebinding the attribute here would leave the
+        processor holding the previous mapping and a newly promoted chat would
+        raise ``KeyError`` on its first message.
+        """
+        await self.db.sync_config_bindings(self.watchers)
+        snapshot = await self.db.observation_snapshot()
+
+        self.observed_chats.clear()
+        self.observed_chats.update(snapshot)
+
+        routing: dict[int, list[Watcher]] = {}
+        for chat_id, observed in snapshot.items():
+            if observed.mode is not ObservationMode.MONITOR:
+                continue
+            bound = [
+                self.watchers_by_name[name]
+                for name in observed.watcher_names
+                if name in self.watchers_by_name
+            ]
+            if bound:
+                routing[chat_id] = bound
+        self.chat_watchers.clear()
+        self.chat_watchers.update(routing)
+
+        self.filters.clear()
+        self.filters.update({watcher.name: RuleFilter(watcher) for watcher in self.watchers})
+
+        logger.info(
+            "Observation reloaded: %d monitored, %d under reconnaissance, %d paused",
+            sum(1 for c in snapshot.values() if c.mode is ObservationMode.MONITOR),
+            sum(1 for c in snapshot.values() if c.mode is ObservationMode.RECON),
+            sum(1 for c in snapshot.values() if c.mode is ObservationMode.PAUSED),
+        )
+
+    async def _capture_scout_message(self, event: NewMessageEvent, chat_id: int) -> None:
+        """Store a message from a chat that is being explored, not monitored.
+
+        Capture starts the moment a chat enters the registry, which closes the
+        window between joining a chat and promoting it: without this, every
+        message sent in that window would be lost, since backfill can only
+        reach what Telegram still serves as history.
+        """
+        message = event.message
+        forward = getattr(message, "fwd_from", None)
+        forward_peer = getattr(forward, "from_id", None)
+        await self.scout.store_message(
+            ScoutMessage(
+                chat_id=chat_id,
+                telegram_msg_id=int(message.id),
+                date=str(message.date),
+                text=event.text or None,
+                sender_id=int(message.sender_id) if message.sender_id is not None else None,
+                forward_chat_id=(
+                    int(getattr(forward_peer, "channel_id", 0)) or None if forward_peer else None
+                ),
+                forward_message_id=(
+                    int(getattr(forward, "channel_post", 0)) or None if forward else None
+                ),
+                source="live",
+            )
+        )
+
     async def _ingest_update(
         self,
         event: NewMessageEvent,
@@ -309,7 +388,13 @@ class Eidolon:
             logger.warning("Ignoring Telegram update without a chat ID")
             return None
 
-        # Check if any watcher monitors this chat
+        observed = self.observed_chats.get(chat_id)
+        if observed is None or observed.mode is ObservationMode.PAUSED:
+            return None
+        if observed.mode is ObservationMode.RECON:
+            await self._capture_scout_message(event, chat_id)
+            return None
+
         watchers = self.chat_watchers.get(chat_id, [])
         if not watchers:
             return None

@@ -55,12 +55,18 @@ class WatcherExamples(BaseModel):
 
 
 class Watcher(BaseModel):
-    """A single monitoring policy."""
+    """A single monitoring policy.
+
+    ``chats`` is a seed, not the source of truth. Which chats a policy actually
+    watches lives in the ``observed_chats`` registry, because reconnaissance
+    adds chats at runtime and this file is git-tracked and read-only to the
+    daemon. Chats listed here are reconciled into the registry on startup.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
-    chats: list[int] = Field(min_length=1)
+    chats: list[int] = Field(default_factory=list)
     rules: WatcherRules
     description: str = ""
     alert: Literal["immediate", "digest"] = "immediate"

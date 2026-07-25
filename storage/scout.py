@@ -43,6 +43,7 @@ from pipeline.recon_models import (
     ReconJobStatus,
     ReservationOutcome,
     ScoutChat,
+    ScoutMessage,
 )
 
 logger = logging.getLogger(__name__)
@@ -1012,6 +1013,118 @@ class ScoutDatabase:
                 (account_id, scope),
             )
             await self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Captured messages
+    # ------------------------------------------------------------------
+
+    async def store_message(self, message: ScoutMessage) -> bool:
+        """Persist one crawled message, reporting whether it was new.
+
+        Live capture and backfill converge on the same rows, so the primary key
+        is what makes the seam between them safe: whichever arrives second is
+        ignored instead of duplicating the message.
+        """
+        content_hash = (
+            hashlib.sha256(" ".join(message.text.split()).lower().encode("utf-8")).hexdigest()
+            if message.text
+            else None
+        )
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """
+                INSERT INTO scout_messages (
+                    chat_id, telegram_msg_id, sender_id, sender_name, text, date,
+                    entities_json, forward_chat_id, forward_message_id, content_hash, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
+                RETURNING telegram_msg_id
+                """,
+                (
+                    message.chat_id,
+                    message.telegram_msg_id,
+                    message.sender_id,
+                    message.sender_name,
+                    message.text,
+                    message.date,
+                    json.dumps(message.entities, separators=(",", ":"))
+                    if message.entities
+                    else None,
+                    message.forward_chat_id,
+                    message.forward_message_id,
+                    content_hash,
+                    message.source,
+                ),
+            )
+            stored = await cursor.fetchone()
+            await self.conn.commit()
+        return stored is not None
+
+    async def store_messages(self, messages: Sequence[ScoutMessage]) -> int:
+        """Persist a backfill page in one transaction, returning new rows.
+
+        Pages are written whole so that a crawl makes progress in units the
+        cursor can resume from, and so the lock is taken once per page rather
+        than once per message.
+        """
+        if not messages:
+            return 0
+        stored = 0
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for message in messages:
+                    content_hash = (
+                        hashlib.sha256(
+                            " ".join(message.text.split()).lower().encode("utf-8")
+                        ).hexdigest()
+                        if message.text
+                        else None
+                    )
+                    cursor = await self.conn.execute(
+                        """
+                        INSERT INTO scout_messages (
+                            chat_id, telegram_msg_id, sender_id, sender_name, text, date,
+                            entities_json, forward_chat_id, forward_message_id,
+                            content_hash, source
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
+                        RETURNING telegram_msg_id
+                        """,
+                        (
+                            message.chat_id,
+                            message.telegram_msg_id,
+                            message.sender_id,
+                            message.sender_name,
+                            message.text,
+                            message.date,
+                            json.dumps(message.entities, separators=(",", ":"))
+                            if message.entities
+                            else None,
+                            message.forward_chat_id,
+                            message.forward_message_id,
+                            content_hash,
+                            message.source,
+                        ),
+                    )
+                    if await cursor.fetchone() is not None:
+                        stored += 1
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
+        return stored
+
+    async def message_count(self, chat_id: int) -> int:
+        """Return how many messages are stored for a chat."""
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM scout_messages WHERE chat_id = ?",
+            (chat_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row is not None else 0
 
     async def budget_usage(self, *, account_id: str, kind: ActionKind) -> tuple[int, int]:
         """Return actions used in the rolling hour and rolling day."""

@@ -41,6 +41,40 @@ class Intent(StrEnum):
     OTHER = "other"
 
 
+class ObservationMode(StrEnum):
+    """How the daemon treats incoming messages from an observed chat.
+
+    ``RECON`` exists so that a chat discovered by a crawl is captured from the
+    moment it is joined. Without it, everything sent between joining a chat and
+    promoting it to monitoring is lost, because the live handler only persists
+    chats that already carry a policy.
+    """
+
+    MONITOR = "monitor"
+    RECON = "recon"
+    PAUSED = "paused"
+
+
+class ObservationSource(StrEnum):
+    """What put a chat or binding into the registry."""
+
+    CONFIG = "config"
+    RECON = "recon"
+    MANUAL = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedChat:
+    """Registry entry describing one observed chat and its policies."""
+
+    chat_id: int
+    mode: ObservationMode
+    source: ObservationSource
+    watcher_names: tuple[str, ...] = ()
+    title: str | None = None
+    job_id: str | None = None
+
+
 class ModelClassification(BaseModel):
     """Strict schema produced by an LLM provider."""
 

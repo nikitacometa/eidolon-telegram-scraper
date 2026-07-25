@@ -14,6 +14,9 @@ from pipeline.models import (
     AlertDeliveryStatus,
     AlertOutboxItem,
     DeliveryResult,
+    ObservationMode,
+    ObservationSource,
+    ObservedChat,
     PipelineRunStatus,
     StoredPipelineJob,
 )
@@ -104,6 +107,14 @@ async def test_ingress_retries_transient_sqlite_failure(
     )
     app = Eidolon.__new__(Eidolon)
     app.chat_watchers = {-100123: [watcher]}
+    app.observed_chats = {
+        -100123: ObservedChat(
+            chat_id=-100123,
+            mode=ObservationMode.MONITOR,
+            source=ObservationSource.CONFIG,
+            watcher_names=(watcher.name,),
+        )
+    }
     app.watcher_fingerprints = {watcher.name: effective_policy_fingerprint(watcher)}
     app.db = MagicMock()
     event = SimpleNamespace(chat_id=-100123, text="Villa for rent")

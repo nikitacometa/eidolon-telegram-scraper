@@ -300,6 +300,26 @@ class Evidence:
 
 
 @dataclass(frozen=True, slots=True)
+class ScoutMessage:
+    """One message captured from a chat under reconnaissance."""
+
+    chat_id: int
+    telegram_msg_id: int
+    date: str
+    text: str | None = None
+    sender_id: int | None = None
+    sender_name: str | None = None
+    entities: list[dict[str, object]] = field(default_factory=list)
+    forward_chat_id: int | None = None
+    forward_message_id: int | None = None
+    source: str = "live"
+
+    def __post_init__(self) -> None:
+        if self.source not in {"live", "backfill"}:
+            raise ValueError("source must be live or backfill")
+
+
+@dataclass(frozen=True, slots=True)
 class JobRequest:
     """Validated intent to start reconnaissance."""
 

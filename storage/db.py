@@ -12,11 +12,15 @@ from typing import TypedDict
 
 import aiosqlite
 
+from config.watchers import Watcher
 from pipeline.models import (
     AlertDeliveryStatus,
     AlertDraft,
     AlertOutboxItem,
     DeliveryResult,
+    ObservationMode,
+    ObservationSource,
+    ObservedChat,
     PipelineOutcome,
     StageStatus,
     StoredPipelineJob,
@@ -760,6 +764,146 @@ class Database:
             except BaseException:
                 await self.conn.rollback()
                 raise
+
+    async def sync_config_bindings(self, watchers: Sequence[Watcher]) -> None:
+        """Reconcile config-sourced observation with the policy file.
+
+        The YAML file stays authoritative for what it declares: a chat dropped
+        from a policy loses its config binding here too. Bindings created by
+        reconnaissance are left alone, so a promoted chat is not silently
+        un-promoted by the next deploy.
+        """
+        declared = {(chat_id, watcher.name) for watcher in watchers for chat_id in watcher.chats}
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for chat_id, watcher_name in sorted(declared):
+                    await self.conn.execute(
+                        """
+                        INSERT INTO observed_chats (chat_id, mode, source)
+                        VALUES (?, 'monitor', 'config')
+                        ON CONFLICT(chat_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (chat_id,),
+                    )
+                    await self.conn.execute(
+                        """
+                        INSERT INTO chat_policy_bindings (chat_id, watcher_name, source)
+                        VALUES (?, ?, 'config')
+                        ON CONFLICT(chat_id, watcher_name) DO NOTHING
+                        """,
+                        (chat_id, watcher_name),
+                    )
+
+                declared_json = json.dumps(
+                    [f"{chat_id}:{name}" for chat_id, name in sorted(declared)],
+                    separators=(",", ":"),
+                )
+                await self.conn.execute(
+                    """
+                    DELETE FROM chat_policy_bindings
+                    WHERE source = 'config'
+                      AND (chat_id || ':' || watcher_name) NOT IN (
+                          SELECT value FROM json_each(?)
+                      )
+                    """,
+                    (declared_json,),
+                )
+                # A config chat that lost every policy is no longer observed.
+                # Reconnaissance-owned rows are kept: they are not the file's.
+                await self.conn.execute(
+                    """
+                    DELETE FROM observed_chats
+                    WHERE source = 'config'
+                      AND chat_id NOT IN (SELECT chat_id FROM chat_policy_bindings)
+                    """
+                )
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def observation_snapshot(self) -> dict[int, ObservedChat]:
+        """Return the full chat registry keyed by chat id."""
+        async with self.conn.execute(
+            """
+            SELECT o.chat_id, o.mode, o.source, o.title, o.job_id,
+                   GROUP_CONCAT(b.watcher_name) AS watcher_names
+            FROM observed_chats AS o
+            LEFT JOIN chat_policy_bindings AS b ON b.chat_id = o.chat_id
+            GROUP BY o.chat_id
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        snapshot: dict[int, ObservedChat] = {}
+        for row in rows:
+            names = str(row["watcher_names"]) if row["watcher_names"] is not None else ""
+            snapshot[int(row["chat_id"])] = ObservedChat(
+                chat_id=int(row["chat_id"]),
+                mode=ObservationMode(str(row["mode"])),
+                source=ObservationSource(str(row["source"])),
+                watcher_names=tuple(sorted(name for name in names.split(",") if name)),
+                title=str(row["title"]) if row["title"] is not None else None,
+                job_id=str(row["job_id"]) if row["job_id"] is not None else None,
+            )
+        return snapshot
+
+    async def observe_chat(
+        self,
+        *,
+        chat_id: int,
+        mode: ObservationMode,
+        source: ObservationSource,
+        title: str | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        """Add or update one chat in the registry."""
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                INSERT INTO observed_chats (chat_id, mode, title, source, job_id)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    title = COALESCE(excluded.title, observed_chats.title),
+                    job_id = COALESCE(excluded.job_id, observed_chats.job_id),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, mode.value, title, source.value, job_id),
+            )
+            await self.conn.commit()
+
+    async def bind_policy(
+        self,
+        *,
+        chat_id: int,
+        watcher_name: str,
+        source: ObservationSource = ObservationSource.RECON,
+        job_id: str | None = None,
+    ) -> bool:
+        """Attach a policy to an observed chat.
+
+        Returns ``False`` when the chat is not observed: a binding without a
+        registry entry would be invisible to ingestion.
+        """
+        async with self._write_lock:
+            async with self.conn.execute(
+                "SELECT 1 FROM observed_chats WHERE chat_id = ?",
+                (chat_id,),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+            await self.conn.execute(
+                """
+                INSERT INTO chat_policy_bindings (chat_id, watcher_name, source, job_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, watcher_name) DO NOTHING
+                """,
+                (chat_id, watcher_name, source.value, job_id),
+            )
+            await self.conn.commit()
+        return True
 
     async def record_pipeline_outcome(
         self,

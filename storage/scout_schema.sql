@@ -153,8 +153,31 @@ CREATE TABLE IF NOT EXISTS account_cooldowns (
     PRIMARY KEY (account_id, scope)
 );
 
+-- Messages captured from chats under reconnaissance, both live and
+-- backfilled. Kept apart from the monitoring `messages` table: this is bulk
+-- crawl material that must never queue behind live alert delivery, and it
+-- carries no alerts, no pipeline runs, and no LLM cost.
+CREATE TABLE IF NOT EXISTS scout_messages (
+    chat_id INTEGER NOT NULL,
+    telegram_msg_id INTEGER NOT NULL,
+    sender_id INTEGER,
+    sender_name TEXT,
+    text TEXT,
+    date TIMESTAMP NOT NULL,
+    entities_json TEXT,
+    forward_chat_id INTEGER,
+    forward_message_id INTEGER,
+    content_hash TEXT,
+    source TEXT NOT NULL DEFAULT 'live' CHECK(source IN ('live', 'backfill')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, telegram_msg_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_actions_budget
     ON telegram_actions(account_id, kind, reserved_at);
+CREATE INDEX IF NOT EXISTS idx_scout_messages_chat_date ON scout_messages(chat_id, date);
+CREATE INDEX IF NOT EXISTS idx_scout_messages_forward
+    ON scout_messages(forward_chat_id, forward_message_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON recon_jobs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_candidates_job_state ON job_candidates(job_id, state);
 CREATE INDEX IF NOT EXISTS idx_frontier_claimable
