@@ -30,13 +30,15 @@ def _send(text: str) -> None:
         print(text)
         return
     payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode()
-    request = urllib.request.Request(
+    # The URL is a fixed https constant plus the bot token; no user input
+    # reaches the scheme.
+    request = urllib.request.Request(  # noqa: S310
         f"{TELEGRAM_API}/bot{token}/sendMessage",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
             response.read()
     except urllib.error.URLError as error:
         # A failed status report must not look like a failed crawl.
