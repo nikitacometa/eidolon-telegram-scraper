@@ -30,6 +30,7 @@ from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.governor import TelegramActionGovernor
 from pipeline.ingestion import NewMessageEvent, ingest_message
+from pipeline.joiner import JoinWorker
 from pipeline.llm import LLMClassifier
 from pipeline.models import (
     ObservationMode,
@@ -116,7 +117,15 @@ class Eidolon:
             resolve_peer=self._input_peer,
             is_idle=lambda: self._message_queue.empty(),
         )
+        self.joiner = JoinWorker(
+            scout=self.scout,
+            db=self.db,
+            crawler=self.crawler,
+            resolve_entity=self._named_entity,
+            on_joined=self.reload_observation,
+        )
         self._backfill_task: asyncio.Task[None] | None = None
+        self._joiner_task: asyncio.Task[None] | None = None
         self.embedding_filter = EmbeddingFilter()
         self.llm_classifier = LLMClassifier()
         self.summarizer = DailySummarizer()
@@ -229,6 +238,12 @@ class Eidolon:
             self._run_retention_sweeper(),
             name="retention-sweeper",
         )
+        if settings.join_queue_enabled:
+            self._joiner_task = asyncio.create_task(
+                self.joiner.run_forever(self._shutdown_event),
+                name="join-queue",
+            )
+            logger.info("Join queue worker enabled")
         if settings.backfill_enabled:
             self._backfill_task = asyncio.create_task(
                 self.backfill.run_forever(self._shutdown_event),
@@ -249,11 +264,13 @@ class Eidolon:
         # Stop the archive first. It is the only task that keeps a Telegram
         # request in flight for seconds at a time, and cutting the connection
         # underneath it turns a clean pause into an ambiguous outcome.
-        if self._backfill_task is not None:
-            self._backfill_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._backfill_task
-            self._backfill_task = None
+        for task in (self._backfill_task, self._joiner_task):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._backfill_task = None
+        self._joiner_task = None
 
         # Stop ingress before draining the bounded queue. A message committed
         # just before disconnect already has durable pending watcher jobs.
@@ -356,6 +373,15 @@ class Eidolon:
         except (ValueError, TypeError):
             return None
         return peer
+
+    async def _named_entity(self, reference: str) -> object | None:
+        """Resolve a public @username into an entity for the join queue."""
+        try:
+            entity: object = await self.client.get_entity(reference)
+        except Exception:
+            logger.warning("Cannot resolve %s", reference, exc_info=True)
+            return None
+        return entity
 
     async def reload_observation(self) -> None:
         """Rebuild routing from the chat registry without restarting.

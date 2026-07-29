@@ -64,16 +64,20 @@ class TelegramCrawler:
     async def join(
         self,
         *,
-        job_id: str,
-        candidate_id: int,
         channel: object,
         chat_ref: str,
+        job_id: str | None = None,
+        candidate_id: int | None = None,
     ) -> ActionResult[JoinOutcome]:
         """Attempt to join one public chat.
 
         A request awaiting admin approval is reported as ``REQUESTED``, never
         as membership: code that reads "no exception" as "joined" would start
         backfilling a chat it cannot read.
+
+        ``job_id`` is optional: the standing join queue belongs to no crawl,
+        and its attempts must not claim a foreign key into one. The chat
+        reference alone already makes the idempotency key unique.
         """
 
         async def call() -> JoinOutcome:
@@ -88,7 +92,7 @@ class TelegramCrawler:
 
         result: ActionResult[JoinOutcome] = await self._governor.run(
             ActionKind.JOIN,
-            f"{job_id}:join:{chat_ref}",
+            f"{job_id or 'queue'}:join:{chat_ref}",
             call,
             job_id=job_id,
             candidate_id=candidate_id,

@@ -41,11 +41,14 @@ from pipeline.recon_models import (
     Evidence,
     FrontierItem,
     JobRequest,
+    JoinQueueState,
+    QueuedJoin,
     ReconJob,
     ReconJobStatus,
     ReservationOutcome,
     ScoutChat,
     ScoutMessage,
+    normalize_username,
 )
 
 logger = logging.getLogger(__name__)
@@ -1159,6 +1162,113 @@ class ScoutDatabase:
         return int(row[0]) if row is not None else 0
 
     # ------------------------------------------------------------------
+    # Join queue
+    # ------------------------------------------------------------------
+
+    async def enqueue_join(
+        self,
+        *,
+        chat_ref: str,
+        label: str | None = None,
+        watcher_name: str | None = None,
+        target_days: int = 730,
+    ) -> None:
+        """Queue a public chat to be joined when the budget allows.
+
+        Re-queueing a chat that was already joined does nothing: the queue is
+        an intent to join once, not a standing instruction to keep trying.
+        """
+        normalized = normalize_username(chat_ref)
+        if not normalized:
+            raise ValueError("chat_ref must not be empty")
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                INSERT INTO join_queue (chat_ref, label, watcher_name, target_days)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_ref) DO UPDATE SET
+                    label = COALESCE(excluded.label, join_queue.label),
+                    watcher_name = COALESCE(excluded.watcher_name, join_queue.watcher_name),
+                    target_days = MAX(join_queue.target_days, excluded.target_days),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (normalized, label, watcher_name, target_days),
+            )
+            await self.conn.commit()
+
+    async def next_queued_join(self) -> QueuedJoin | None:
+        """Return the next chat due to be joined, oldest request first."""
+        async with self.conn.execute(
+            """
+            SELECT * FROM join_queue
+            WHERE state = 'pending'
+              AND (not_before IS NULL OR datetime(not_before) <= CURRENT_TIMESTAMP)
+            ORDER BY created_at, chat_ref
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _queued_join_from_row(row) if row is not None else None
+
+    async def settle_queued_join(
+        self,
+        chat_ref: str,
+        *,
+        state: JoinQueueState,
+        error: str | None = None,
+        joined_chat_id: int | None = None,
+    ) -> None:
+        """Record the terminal outcome of one queued join."""
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE join_queue
+                SET state = ?,
+                    attempts = attempts + 1,
+                    last_error = ?,
+                    joined_chat_id = COALESCE(?, joined_chat_id),
+                    not_before = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_ref = ?
+                """,
+                (state.value, error, joined_chat_id, normalize_username(chat_ref)),
+            )
+            await self.conn.commit()
+
+    async def defer_queued_join(
+        self,
+        chat_ref: str,
+        *,
+        seconds: int,
+        error: str | None = None,
+    ) -> None:
+        """Push a join back without counting it as an attempt.
+
+        Being refused by the budget is not a failed join: nothing reached
+        Telegram, so the chat keeps its place in the queue.
+        """
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE join_queue
+                SET not_before = datetime('now', ?),
+                    last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_ref = ?
+                """,
+                (f"+{max(seconds, 1)} seconds", error, normalize_username(chat_ref)),
+            )
+            await self.conn.commit()
+
+    async def join_queue(self) -> list[QueuedJoin]:
+        """Return the whole queue for reporting."""
+        async with self.conn.execute(
+            "SELECT * FROM join_queue ORDER BY state, created_at, chat_ref"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_queued_join_from_row(row) for row in rows]
+
+    # ------------------------------------------------------------------
     # Background history archive
     # ------------------------------------------------------------------
 
@@ -1319,6 +1429,19 @@ def _job_from_row(row: aiosqlite.Row) -> ReconJob:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
+    )
+
+
+def _queued_join_from_row(row: aiosqlite.Row) -> QueuedJoin:
+    return QueuedJoin(
+        chat_ref=str(row["chat_ref"]),
+        label=str(row["label"]) if row["label"] is not None else None,
+        watcher_name=str(row["watcher_name"]) if row["watcher_name"] is not None else None,
+        target_days=int(row["target_days"]),
+        state=JoinQueueState(str(row["state"])),
+        attempts=int(row["attempts"]),
+        last_error=str(row["last_error"]) if row["last_error"] is not None else None,
+        joined_chat_id=(int(row["joined_chat_id"]) if row["joined_chat_id"] is not None else None),
     )
 
 

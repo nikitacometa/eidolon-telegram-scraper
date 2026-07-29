@@ -340,6 +340,30 @@ class BackfillTarget:
         return self.state is BackfillState.PENDING
 
 
+class JoinQueueState(StrEnum):
+    """Progress of one queued join."""
+
+    PENDING = "pending"
+    JOINED = "joined"
+    REQUESTED = "requested"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedJoin:
+    """A chat waiting its turn to be joined."""
+
+    chat_ref: str
+    label: str | None = None
+    watcher_name: str | None = None
+    target_days: int = 730
+    state: JoinQueueState = JoinQueueState.PENDING
+    attempts: int = 0
+    last_error: str | None = None
+    joined_chat_id: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ScoutMessage:
     """One message captured from a chat under reconnaissance."""

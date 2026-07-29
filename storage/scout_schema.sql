@@ -197,9 +197,29 @@ CREATE TABLE IF NOT EXISTS backfill_targets (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Chats queued to be joined, worked one at a time. Joining is the only
+-- reconnaissance action other people can see, and the account's standing is
+-- spent per attempt, so the queue exists to spread attempts over hours
+-- instead of letting a batch land at once.
+CREATE TABLE IF NOT EXISTS join_queue (
+    chat_ref TEXT PRIMARY KEY,
+    label TEXT,
+    watcher_name TEXT,
+    target_days INTEGER NOT NULL DEFAULT 730,
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending', 'joined', 'requested', 'failed', 'skipped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    not_before TIMESTAMP,
+    last_error TEXT,
+    joined_chat_id INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_actions_budget
     ON telegram_actions(account_id, kind, reserved_at);
 CREATE INDEX IF NOT EXISTS idx_backfill_due ON backfill_targets(state, not_before, pages_done);
+CREATE INDEX IF NOT EXISTS idx_join_queue_due ON join_queue(state, not_before);
 CREATE INDEX IF NOT EXISTS idx_scout_messages_chat_date ON scout_messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_scout_messages_forward
     ON scout_messages(forward_chat_id, forward_message_id);

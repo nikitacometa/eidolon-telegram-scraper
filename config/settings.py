@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # The background archive is off unless asked for: it spends account
     # standing on history nobody requested.
     backfill_enabled: bool = False
+    join_queue_enabled: bool = False
     summary_enabled: bool = True
     summary_hour_utc: int = 13  # 20:00 ICT (UTC+7)
     summary_model: str = "gpt-4.1-mini"
