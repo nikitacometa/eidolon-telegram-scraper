@@ -177,8 +177,29 @@ CREATE TABLE IF NOT EXISTS scout_messages (
     PRIMARY KEY (chat_id, telegram_msg_id)
 );
 
+-- Chats whose history is being walked backwards in the background. A target
+-- is a standing intent measured in years, worked one page at a time whenever
+-- the daemon has nothing better to do, so a restart resumes from the cursor
+-- rather than starting the archive again.
+CREATE TABLE IF NOT EXISTS backfill_targets (
+    chat_id INTEGER PRIMARY KEY,
+    label TEXT,
+    target_days INTEGER NOT NULL DEFAULT 730,
+    oldest_message_id INTEGER,
+    oldest_message_date TIMESTAMP,
+    messages_stored INTEGER NOT NULL DEFAULT 0,
+    pages_done INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending', 'complete', 'exhausted', 'failed')),
+    last_error TEXT,
+    not_before TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_actions_budget
     ON telegram_actions(account_id, kind, reserved_at);
+CREATE INDEX IF NOT EXISTS idx_backfill_due ON backfill_targets(state, not_before, pages_done);
 CREATE INDEX IF NOT EXISTS idx_scout_messages_chat_date ON scout_messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_scout_messages_forward
     ON scout_messages(forward_chat_id, forward_message_id);

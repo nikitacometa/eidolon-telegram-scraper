@@ -311,6 +311,35 @@ class Evidence:
     snippet: str | None = None
 
 
+class BackfillState(StrEnum):
+    """Progress of a chat's historical archive."""
+
+    PENDING = "pending"
+    COMPLETE = "complete"
+    EXHAUSTED = "exhausted"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillTarget:
+    """A chat whose history is being walked backwards in the background."""
+
+    chat_id: int
+    target_days: int
+    label: str | None = None
+    oldest_message_id: int | None = None
+    oldest_message_date: str | None = None
+    messages_stored: int = 0
+    pages_done: int = 0
+    state: BackfillState = BackfillState.PENDING
+    last_error: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        """Whether this target still has history worth asking for."""
+        return self.state is BackfillState.PENDING
+
+
 @dataclass(frozen=True, slots=True)
 class ScoutMessage:
     """One message captured from a chat under reconnaissance."""

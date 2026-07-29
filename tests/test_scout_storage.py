@@ -60,6 +60,7 @@ async def test_connect_creates_tables(scout: ScoutDatabase) -> None:
         "recon_frontier",
         "recon_jobs",
         "scout_chats",
+        "backfill_targets",
         "scout_messages",
         "telegram_actions",
     }

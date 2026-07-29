@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = 15
 
     # Daily summary
+    # The background archive is off unless asked for: it spends account
+    # standing on history nobody requested.
+    backfill_enabled: bool = False
     summary_enabled: bool = True
     summary_hour_utc: int = 13  # 20:00 ICT (UTC+7)
     summary_model: str = "gpt-4.1-mini"

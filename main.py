@@ -23,9 +23,12 @@ from config.watchers import (
     WatcherConfigError,
     load_watchers,
 )
+from pipeline.backfill import BackfillWorker
+from pipeline.crawler import TelegramCrawler
 from pipeline.dispatcher import AlertDispatcher
 from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
+from pipeline.governor import TelegramActionGovernor
 from pipeline.ingestion import NewMessageEvent, ingest_message
 from pipeline.llm import LLMClassifier
 from pipeline.models import (
@@ -105,6 +108,15 @@ class Eidolon:
             sequential_updates=True,
         )
         self.dispatcher = AlertDispatcher()
+        self.governor = TelegramActionGovernor(scout=self.scout)
+        self.crawler = TelegramCrawler(client=self.client, governor=self.governor)
+        self.backfill = BackfillWorker(
+            scout=self.scout,
+            crawler=self.crawler,
+            resolve_peer=self._input_peer,
+            is_idle=lambda: self._message_queue.empty(),
+        )
+        self._backfill_task: asyncio.Task[None] | None = None
         self.embedding_filter = EmbeddingFilter()
         self.llm_classifier = LLMClassifier()
         self.summarizer = DailySummarizer()
@@ -217,6 +229,12 @@ class Eidolon:
             self._run_retention_sweeper(),
             name="retention-sweeper",
         )
+        if settings.backfill_enabled:
+            self._backfill_task = asyncio.create_task(
+                self.backfill.run_forever(self._shutdown_event),
+                name="history-backfill",
+            )
+            logger.info("Background history archive enabled")
         if settings.summary_enabled:
             self._summary_task = asyncio.create_task(
                 self._run_summary_scheduler(),
@@ -228,6 +246,15 @@ class Eidolon:
             )
 
     async def _stop_background_tasks(self) -> None:
+        # Stop the archive first. It is the only task that keeps a Telegram
+        # request in flight for seconds at a time, and cutting the connection
+        # underneath it turns a clean pause into an ambiguous outcome.
+        if self._backfill_task is not None:
+            self._backfill_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._backfill_task
+            self._backfill_task = None
+
         # Stop ingress before draining the bounded queue. A message committed
         # just before disconnect already has durable pending watcher jobs.
         if self.client.is_connected():
@@ -316,6 +343,19 @@ class Eidolon:
                 logger.exception("Message worker %d failed an update", worker_id)
             finally:
                 self._message_queue.task_done()
+
+    async def _input_peer(self, chat_id: int) -> object | None:
+        """Resolve a chat the account already knows, without a network call.
+
+        Only chats the session has seen are archived, so a cache miss means
+        the daemon has not met this chat yet and the target should wait rather
+        than spend a resolve on it.
+        """
+        try:
+            peer: object = await self.client.get_input_entity(chat_id)
+        except (ValueError, TypeError):
+            return None
+        return peer
 
     async def reload_observation(self) -> None:
         """Rebuild routing from the chat registry without restarting.

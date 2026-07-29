@@ -108,12 +108,12 @@ class TelegramCrawler:
     async def history_page(
         self,
         *,
-        job_id: str,
         chat_id: int,
         peer: object,
         offset_id: int = 0,
         min_id: int = 0,
         not_before: datetime | None = None,
+        job_id: str | None = None,
     ) -> ActionResult[HistoryPage]:
         """Read one page of history, oldest-bound by ``min_id``.
 
@@ -122,6 +122,10 @@ class TelegramCrawler:
         already stored. ``not_before`` is the job's lookback window: messages
         older than it are dropped and end the walk, so a job that asked for a
         week does not quietly archive a year.
+
+        ``job_id`` is optional because the background archive is a standing
+        intent rather than a job: its pages belong to no crawl and must not
+        claim a foreign key into one.
         """
 
         async def call() -> HistoryPage:
@@ -141,7 +145,7 @@ class TelegramCrawler:
 
         return await self._governor.run(
             ActionKind.HISTORY_PAGE,
-            f"{job_id}:history:{chat_id}:{offset_id}",
+            f"{job_id or 'backfill'}:history:{chat_id}:{offset_id}",
             call,
             job_id=job_id,
         )

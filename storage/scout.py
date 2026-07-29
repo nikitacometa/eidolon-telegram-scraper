@@ -28,6 +28,8 @@ from pipeline.recon_models import (
     ActionKind,
     ActionOutcome,
     ActionReservation,
+    BackfillState,
+    BackfillTarget,
     BudgetDenial,
     BudgetRule,
     BudgetScope,
@@ -1156,6 +1158,127 @@ class ScoutDatabase:
             row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
 
+    # ------------------------------------------------------------------
+    # Background history archive
+    # ------------------------------------------------------------------
+
+    async def add_backfill_target(
+        self,
+        *,
+        chat_id: int,
+        label: str | None = None,
+        target_days: int = 730,
+    ) -> None:
+        """Register a chat whose history should be walked back over time.
+
+        Re-registering an existing target only raises its horizon: a chat
+        already archived two years back must not restart because someone
+        later asked for one year.
+        """
+        if target_days < 1:
+            raise ValueError("target_days must be at least 1")
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                INSERT INTO backfill_targets (chat_id, label, target_days)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    label = COALESCE(excluded.label, backfill_targets.label),
+                    target_days = MAX(backfill_targets.target_days, excluded.target_days),
+                    state = CASE
+                        WHEN excluded.target_days > backfill_targets.target_days
+                            AND backfill_targets.state = 'complete'
+                        THEN 'pending'
+                        ELSE backfill_targets.state
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, label, target_days),
+            )
+            await self.conn.commit()
+
+    async def next_backfill_target(self) -> BackfillTarget | None:
+        """Return the least-advanced chat that is ready for another page.
+
+        Least-advanced first spreads the archive evenly instead of finishing
+        one chat while the rest sit at zero, because the value here is
+        comparable history across chats, not one deep hole.
+        """
+        async with self.conn.execute(
+            """
+            SELECT * FROM backfill_targets
+            WHERE state = 'pending'
+              AND (not_before IS NULL OR datetime(not_before) <= CURRENT_TIMESTAMP)
+            ORDER BY pages_done, chat_id
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _backfill_from_row(row) if row is not None else None
+
+    async def record_backfill_page(
+        self,
+        chat_id: int,
+        *,
+        stored: int,
+        oldest_message_id: int | None,
+        oldest_message_date: str | None,
+        finished: BackfillState | None = None,
+    ) -> None:
+        """Advance a target's cursor after one page."""
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE backfill_targets
+                SET messages_stored = messages_stored + ?,
+                    pages_done = pages_done + 1,
+                    oldest_message_id = COALESCE(?, oldest_message_id),
+                    oldest_message_date = COALESCE(?, oldest_message_date),
+                    state = COALESCE(?, state),
+                    not_before = NULL,
+                    last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (
+                    stored,
+                    oldest_message_id,
+                    oldest_message_date,
+                    finished.value if finished is not None else None,
+                    chat_id,
+                ),
+            )
+            await self.conn.commit()
+
+    async def defer_backfill_target(
+        self,
+        chat_id: int,
+        *,
+        seconds: int,
+        error: str | None = None,
+    ) -> None:
+        """Hold a target back, usually because Telegram asked us to wait."""
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE backfill_targets
+                SET not_before = datetime('now', ?),
+                    last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (f"+{max(seconds, 1)} seconds", error, chat_id),
+            )
+            await self.conn.commit()
+
+    async def backfill_targets(self) -> list[BackfillTarget]:
+        """Return every target, most complete first, for reporting."""
+        async with self.conn.execute(
+            "SELECT * FROM backfill_targets ORDER BY messages_stored DESC, chat_id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_backfill_from_row(row) for row in rows]
+
     async def budget_usage(self, *, account_id: str, kind: ActionKind) -> tuple[int, int]:
         """Return actions used in the rolling hour and rolling day."""
         async with self.conn.execute(
@@ -1196,6 +1319,24 @@ def _job_from_row(row: aiosqlite.Row) -> ReconJob:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
+    )
+
+
+def _backfill_from_row(row: aiosqlite.Row) -> BackfillTarget:
+    return BackfillTarget(
+        chat_id=int(row["chat_id"]),
+        target_days=int(row["target_days"]),
+        label=str(row["label"]) if row["label"] is not None else None,
+        oldest_message_id=(
+            int(row["oldest_message_id"]) if row["oldest_message_id"] is not None else None
+        ),
+        oldest_message_date=(
+            str(row["oldest_message_date"]) if row["oldest_message_date"] is not None else None
+        ),
+        messages_stored=int(row["messages_stored"]),
+        pages_done=int(row["pages_done"]),
+        state=BackfillState(str(row["state"])),
+        last_error=str(row["last_error"]) if row["last_error"] is not None else None,
     )
 
 
