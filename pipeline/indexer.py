@@ -144,47 +144,59 @@ class PlaceExtractor:
         client: AsyncOpenAI | None = None,
         model: str | None = None,
         concurrency: int = 8,
+        chunk_size: int = 100,
     ) -> None:
         self._search = search
         self._client = client or AsyncOpenAI(api_key=settings.openai_api_key)
         self._model = model or settings.llm_model
         self._concurrency = concurrency
+        self._chunk_size = chunk_size
 
     async def run(self, *, limit: int = 500) -> dict[str, int]:
-        rows = self._search.pending_extractions(limit=limit)
-        if not rows:
-            return {"processed": 0, "venues": 0, "errors": 0}
+        """Extract venues from up to ``limit`` queued messages.
 
+        Work is committed in chunks rather than in one gather over the whole
+        backlog. A full-corpus pass is tens of minutes of paid API calls, and
+        holding every result in memory until the end means an interruption
+        anywhere in it throws away all of them -- the rows stay ``pending``, so
+        nothing is corrupted, but the spend is gone. Chunking makes the cost of
+        an interruption one chunk.
+        """
         semaphore = asyncio.Semaphore(self._concurrency)
 
         async def one(row: Any) -> tuple[int, list[dict[str, Any]], str | None]:
             async with semaphore:
                 return await self._extract(row)
 
-        results = await asyncio.gather(*(one(r) for r in rows), return_exceptions=True)
-
-        venues = errors = 0
-        for row, result in zip(rows, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.warning("Extraction crashed for %s: %s", row["corpus_id"], result)
-                self._search.record_extraction(
-                    row["corpus_id"], [], model=self._model, error=str(result)
-                )
-                errors += 1
-                continue
-            corpus_id, places, error = result
-            if error:
-                errors += 1
-                self._search.record_extraction(corpus_id, [], model=self._model, error=error)
-            else:
-                venues += self._search.record_extraction(corpus_id, places, model=self._model)
-        logger.info(
-            "Extraction pass: %d messages, %d venue mentions, %d errors",
-            len(rows),
-            venues,
-            errors,
-        )
-        return {"processed": len(rows), "venues": venues, "errors": errors}
+        processed = venues = errors = 0
+        while processed < limit:
+            rows = self._search.pending_extractions(min(self._chunk_size, limit - processed))
+            if not rows:
+                break
+            results = await asyncio.gather(*(one(r) for r in rows), return_exceptions=True)
+            for row, result in zip(rows, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.warning("Extraction crashed for %s: %s", row["corpus_id"], result)
+                    self._search.record_extraction(
+                        row["corpus_id"], [], model=self._model, error=str(result)
+                    )
+                    errors += 1
+                    continue
+                corpus_id, places, error = result
+                if error:
+                    errors += 1
+                    self._search.record_extraction(corpus_id, [], model=self._model, error=error)
+                else:
+                    venues += self._search.record_extraction(corpus_id, places, model=self._model)
+            processed += len(rows)
+            logger.info(
+                "Extraction: %d/%d messages, %d venue mentions, %d errors",
+                processed,
+                limit,
+                venues,
+                errors,
+            )
+        return {"processed": processed, "venues": venues, "errors": errors}
 
     async def _extract(self, row: Any) -> tuple[int, list[dict[str, Any]], str | None]:
         text = (row["text"] or "")[:MAX_EXTRACT_CHARS]

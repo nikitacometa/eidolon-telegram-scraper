@@ -24,6 +24,12 @@ import sys
 from config.settings import settings
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
 from storage.search import SearchDatabase, build_fts_query
+from storage.session_lock import SessionInUseError, SessionLock
+
+# Commands that spend money or write the index. A timer tick landing on top of
+# a long manual pass would re-issue the same LLM calls for the same rows: the
+# writes are idempotent, the billing is not.
+_EXCLUSIVE = {"build", "sync", "embed", "extract"}
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -35,6 +41,25 @@ def _configure_logging(verbose: bool) -> None:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.command in _EXCLUSIVE:
+        lock = SessionLock(
+            settings.search_db_path.with_suffix(".lock"),
+            owner=f"index-{args.command}",
+            subject="The search index",
+        )
+        try:
+            lock.acquire()
+        except SessionInUseError as exc:
+            print(json.dumps({"skipped": str(exc)}))
+            return 0
+        try:
+            return await _dispatch(args)
+        finally:
+            lock.release()
+    return await _dispatch(args)
+
+
+async def _dispatch(args: argparse.Namespace) -> int:
     with SearchDatabase(settings.search_db_path) as search:
         search.connect()
 

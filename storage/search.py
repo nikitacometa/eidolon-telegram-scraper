@@ -661,7 +661,7 @@ class SearchDatabase:
     # Entity extraction
     # ------------------------------------------------------------------
 
-    def pending_extractions(self, *, limit: int) -> list[sqlite3.Row]:
+    def pending_extractions(self, limit: int) -> list[sqlite3.Row]:
         return self.conn.execute(
             """
             SELECT m.corpus_id, m.text, m.date, m.chat_id, c.title AS chat_title

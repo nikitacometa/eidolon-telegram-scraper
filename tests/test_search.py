@@ -592,7 +592,7 @@ class TestPlaces:
             "SELECT count(*) FROM extraction_state WHERE status = 'skipped'"
         ).fetchone()[0]
         assert skipped > 0
-        assert all(len(r["text"]) >= 80 for r in search.pending_extractions(limit=50))
+        assert all(len(r["text"]) >= 80 for r in search.pending_extractions(50))
 
 
 class TestChatReferences:
@@ -704,3 +704,104 @@ class TestJoinRequestNormalization:
         read_names = {t.name for t in READ_TOOLS}
         assert "queue_chat_join" not in read_names
         assert {t.name for t in WRITE_TOOLS} == {"queue_chat_join"}
+
+
+class HardStop(BaseException):
+    """Escapes gather(return_exceptions=True), as a signal or an OOM would."""
+
+
+class TestChunkedExtraction:
+    """A full-corpus pass is tens of minutes of paid calls; it must checkpoint."""
+
+    @staticmethod
+    def _queue(search: SearchDatabase, count: int) -> None:
+        for i in range(count):
+            search.conn.execute(
+                "INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, text, date,"
+                " content_hash) VALUES ('scout', -900, ?, ?, '2026-07-01T00:00:00+00:00', ?)",
+                (
+                    i,
+                    f"Концерт номер {i} в баре, живая музыка и хорошее настроение всем гостям",
+                    f"c{i}",
+                ),
+            )
+        search.conn.execute(
+            "INSERT INTO extraction_state (corpus_id, status)"
+            " SELECT corpus_id, 'pending' FROM corpus_messages WHERE chat_id = -900"
+        )
+        search.conn.commit()
+
+    async def test_finished_chunks_are_committed_before_the_pass_ends(
+        self, search: SearchDatabase
+    ) -> None:
+        # The distinguishing property of chunking is WHEN the write happens. A
+        # single gather over the whole backlog commits nothing until the end, so
+        # an interruption anywhere throws away the entire pass -- tens of
+        # minutes of paid calls. Here the pass dies between chunks; whatever the
+        # first chunk finished must already be on disk.
+        from pipeline.indexer import PlaceExtractor
+
+        self._queue(search, 12)
+        extractor = PlaceExtractor(search, client=object(), chunk_size=4, concurrency=2)
+
+        async def fake(row: object) -> tuple[int, list[dict[str, object]], str | None]:
+            return (
+                row["corpus_id"],  # type: ignore[index]
+                [
+                    {
+                        "name": "Corner Music Bar",
+                        "place_type": "bar",
+                        "city_area": "Da Nang",
+                        "event_types": ["concert"],
+                        "evidence": "в баре",
+                        "confidence": 0.9,
+                    }
+                ],
+                None,
+            )
+
+        extractor._extract = fake  # type: ignore[method-assign]
+
+        real_pending = search.pending_extractions
+        fetches = {"n": 0}
+
+        def dying_pending(limit: int) -> list[sqlite3.Row]:
+            fetches["n"] += 1
+            if fetches["n"] > 1:
+                raise HardStop("process died between chunks")
+            return real_pending(limit)
+
+        search.pending_extractions = dying_pending  # type: ignore[method-assign]
+        with pytest.raises(HardStop):
+            await extractor.run(limit=12)
+        search.pending_extractions = real_pending  # type: ignore[method-assign]
+
+        found = search.search_places(name_query="corner music bar")
+        assert found, "an interrupted pass lost every result it had already paid for"
+        assert found[0]["mentions"] == 4, "only the completed chunk should be committed"
+        assert (
+            search.conn.execute(
+                "SELECT count(*) FROM extraction_state WHERE status = 'pending'"
+            ).fetchone()[0]
+            == 8
+        ), "unfinished messages must stay pending so the next run resumes them"
+
+    async def test_a_second_run_does_not_redo_finished_work(self, search: SearchDatabase) -> None:
+        from pipeline.indexer import PlaceExtractor
+
+        self._queue(search, 6)
+        seen: list[int] = []
+
+        async def fake(row: object) -> tuple[int, list[dict[str, object]], str | None]:
+            seen.append(row["corpus_id"])  # type: ignore[index]
+            return (row["corpus_id"], [], None)  # type: ignore[index]
+
+        first = PlaceExtractor(search, client=object(), chunk_size=3)
+        first._extract = fake  # type: ignore[method-assign]
+        await first.run(limit=6)
+        assert len(seen) == 6
+
+        second = PlaceExtractor(search, client=object(), chunk_size=3)
+        second._extract = fake  # type: ignore[method-assign]
+        assert (await second.run(limit=6))["processed"] == 0
+        assert len(seen) == 6  # no message paid for twice

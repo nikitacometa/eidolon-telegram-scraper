@@ -24,9 +24,20 @@ class SessionInUseError(RuntimeError):
 class SessionLock:
     """An advisory exclusive lock on a session's lock file."""
 
-    def __init__(self, path: Path, *, owner: str = "eidolon") -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        owner: str = "eidolon",
+        subject: str = "Telegram session",
+    ) -> None:
         self.path = path
         self._owner = owner
+        # What the lock protects, named for the error message. The mechanism is
+        # generic; the consequence of losing the race is not, and a caller
+        # guarding an index rebuild should not tell the operator its Telegram
+        # session is in use.
+        self._subject = subject
         self._handle: int | None = None
 
     def acquire(self) -> None:
@@ -43,7 +54,7 @@ class SessionLock:
             holder = _read_holder(handle)
             os.close(handle)
             raise SessionInUseError(
-                f"Telegram session is already held by {holder or 'another process'}; "
+                f"{self._subject} is already held by {holder or 'another process'}; "
                 "stop it before starting a second client"
             ) from error
 
@@ -51,7 +62,7 @@ class SessionLock:
         os.write(handle, f"{self._owner} pid={os.getpid()}\n".encode())
         os.fsync(handle)
         self._handle = handle
-        logger.info("Telegram session lock acquired: %s", self.path)
+        logger.info("%s lock acquired: %s", self._subject, self.path)
 
     def release(self) -> None:
         """Release the lock if this process holds it."""
