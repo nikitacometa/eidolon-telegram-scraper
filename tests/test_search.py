@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -893,16 +894,39 @@ class TestExtractionRetry:
     def test_a_stale_failure_comes_back_as_work(
         self, search: SearchDatabase, sources: tuple[Path, Path]
     ) -> None:
+        # The timestamp is aged by rewriting it in the SAME format the code
+        # writes, ISO-8601 with a "T". Setting it with SQLite's own datetime()
+        # instead would compare space-separated text against space-separated
+        # text and pass no matter how the query is written.
         _sync(search, sources)
         corpus_id = self._one(search)
         search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
+        stale = (datetime.now(UTC) - timedelta(days=2)).isoformat(timespec="seconds")
         search.conn.execute(
-            "UPDATE extraction_state SET attempted_at = datetime('now', '-2 days')"
-            " WHERE corpus_id = ?",
-            (corpus_id,),
+            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?", (stale, corpus_id)
         )
         search.conn.commit()
         assert corpus_id in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+    def test_a_same_day_failure_past_the_cooldown_is_retried(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # The case a raw text comparison gets wrong: the date matches, so the
+        # separator decides. "…T04:00" sorts above "… 05:00", so a failure
+        # hours past the cooldown reads as newer than the cutoff and the
+        # six-hour window silently becomes "not until tomorrow".
+        _sync(search, sources)
+        corpus_id = self._one(search)
+        search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
+        seven_hours_ago = (datetime.now(UTC) - timedelta(hours=7)).isoformat(timespec="seconds")
+        search.conn.execute(
+            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?",
+            (seven_hours_ago, corpus_id),
+        )
+        search.conn.commit()
+        assert corpus_id in {
+            r["corpus_id"] for r in search.pending_extractions(50, retry_after_hours=6)
+        }
 
     def test_a_message_that_keeps_failing_is_eventually_left_alone(
         self, search: SearchDatabase, sources: tuple[Path, Path]
@@ -911,12 +935,12 @@ class TestExtractionRetry:
         # for the life of the corpus only spends money.
         _sync(search, sources)
         corpus_id = self._one(search)
+        stale = (datetime.now(UTC) - timedelta(days=2)).isoformat(timespec="seconds")
         for _ in range(3):
-            search.record_extraction(corpus_id, [], model="m", error="always fails")
+            search.record_extraction(corpus_id, [], model="m", error="connection reset")
             search.conn.execute(
-                "UPDATE extraction_state SET attempted_at = datetime('now', '-2 days')"
-                " WHERE corpus_id = ?",
-                (corpus_id,),
+                "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?",
+                (stale, corpus_id),
             )
             search.conn.commit()
         assert corpus_id not in {r["corpus_id"] for r in search.pending_extractions(50)}
@@ -927,10 +951,9 @@ class TestExtractionRetry:
         _sync(search, sources)
         corpus_id = self._one(search)
         search.record_extraction(corpus_id, [], model="m")
+        stale = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         search.conn.execute(
-            "UPDATE extraction_state SET attempted_at = datetime('now', '-9 days')"
-            " WHERE corpus_id = ?",
-            (corpus_id,),
+            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?", (stale, corpus_id)
         )
         search.conn.commit()
         assert corpus_id not in {r["corpus_id"] for r in search.pending_extractions(50)}
@@ -956,3 +979,67 @@ class TestExtractionRetry:
             == 0
         )
         db.close()
+
+
+class TestTransientErrorClassification:
+    """Only a provider fault is worth paying for the same call twice."""
+
+    @pytest.mark.parametrize(
+        "transient",
+        [
+            "APITimeoutError: Request timed out.",
+            "RateLimitError: rate limit exceeded",
+            "APIConnectionError: Connection error",
+            "InternalServerError: 503 Service Unavailable",
+            "server overloaded",
+        ],
+    )
+    def test_provider_faults_are_retryable(self, transient: str) -> None:
+        from storage.search import is_transient_error
+
+        assert is_transient_error(transient)
+
+    @pytest.mark.parametrize(
+        "terminal",
+        [
+            "unparsed response: refusal",
+            "unparsed response: no content",
+            "json decode: Expecting value",
+            "missing places array",
+        ],
+    )
+    def test_message_specific_failures_are_not(self, terminal: str) -> None:
+        from storage.search import is_transient_error
+
+        assert not is_transient_error(terminal)
+
+    def test_a_refusal_is_never_sent_back_to_the_model(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # The same input would produce the same refusal, at the same price.
+        _sync(search, sources)
+        corpus_id = int(
+            search.conn.execute("SELECT min(corpus_id) FROM corpus_messages").fetchone()[0]
+        )
+        search.record_extraction(corpus_id, [], model="m", error="unparsed response: refusal")
+        stale = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="seconds")
+        search.conn.execute(
+            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?", (stale, corpus_id)
+        )
+        search.conn.commit()
+        assert corpus_id not in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+    def test_a_timeout_on_the_same_message_still_is(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        corpus_id = int(
+            search.conn.execute("SELECT min(corpus_id) FROM corpus_messages").fetchone()[0]
+        )
+        search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
+        stale = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
+        search.conn.execute(
+            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?", (stale, corpus_id)
+        )
+        search.conn.commit()
+        assert corpus_id in {r["corpus_id"] for r in search.pending_extractions(50)}

@@ -94,6 +94,34 @@ def fold_ascii(value: str) -> str:
     return " ".join(stripped.lower().split())
 
 
+# Attempts a message gets before extraction gives up on it for good.
+MAX_EXTRACTION_ATTEMPTS = 3
+
+# Provider faults worth another call. Anything else -- a refusal, a truncated
+# completion, malformed output -- is a property of this particular message and
+# will reproduce exactly on a retry.
+_TRANSIENT_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "ratelimit",
+    "rate limit",
+    "connection",
+    "apiconnection",
+    "internalserver",
+    "service unavailable",
+    "overloaded",
+    "502",
+    "503",
+    "504",
+)
+
+
+def is_transient_error(error: str) -> bool:
+    """Whether an extraction failure is worth retrying later."""
+    lowered = error.lower()
+    return any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS)
+
+
 def is_venue_name(name: str) -> bool:
     """Reject values that are not names of places.
 
@@ -701,7 +729,11 @@ class SearchDatabase:
     # ------------------------------------------------------------------
 
     def pending_extractions(
-        self, limit: int, *, retry_after_hours: int = 6, max_attempts: int = 3
+        self,
+        limit: int,
+        *,
+        retry_after_hours: int = 6,
+        max_attempts: int = MAX_EXTRACTION_ATTEMPTS,
     ) -> list[sqlite3.Row]:
         """Return messages awaiting extraction, including retryable failures.
 
@@ -722,7 +754,14 @@ class SearchDatabase:
                     AND s.attempts < ?
                     AND (
                         s.attempted_at IS NULL
-                        OR s.attempted_at <= datetime('now', ?)
+                        -- datetime() on both sides, not a raw string compare:
+                        -- this column holds ISO-8601 with a "T" separator and
+                        -- an offset, while datetime('now') yields a space and
+                        -- none. Compared as text, "…T04:00" sorts ABOVE
+                        -- "… 05:00", so a same-day failure looks newer than a
+                        -- cutoff it is actually hours older than, and the
+                        -- cooldown silently becomes "not until tomorrow".
+                        OR datetime(s.attempted_at) <= datetime('now', ?)
                     )
                 )
              ORDER BY s.status = 'error', m.date DESC LIMIT ?
@@ -741,10 +780,16 @@ class SearchDatabase:
         """Persist one message's extracted venues and close out its state row."""
         conn = self.conn
         if error is not None:
+            # A terminal failure is burned to the attempt ceiling immediately.
+            # Retrying a refusal or a truncated completion sends the identical
+            # input back to a paid model to get the identical answer back; only
+            # a transient provider fault is worth another call.
+            attempts = 1 if is_transient_error(error) else MAX_EXTRACTION_ATTEMPTS
             conn.execute(
-                "UPDATE extraction_state SET status='error', attempts=attempts+1,"
-                " attempted_at=?, error=? WHERE corpus_id=?",
-                (_now(), error[:500], corpus_id),
+                "UPDATE extraction_state"
+                "   SET status='error', attempts=MAX(attempts + 1, ?), attempted_at=?, error=?"
+                " WHERE corpus_id=?",
+                (attempts, _now(), error[:500], corpus_id),
             )
             conn.commit()
             return 0
