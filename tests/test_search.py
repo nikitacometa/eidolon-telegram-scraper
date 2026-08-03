@@ -805,3 +805,71 @@ class TestChunkedExtraction:
         second._extract = fake  # type: ignore[method-assign]
         assert (await second.run(limit=6))["processed"] == 0
         assert len(seen) == 6  # no message paid for twice
+
+
+class TestVenueNameValidation:
+    """A bad name is permanent: nothing later in the pipeline removes it."""
+
+    @pytest.mark.parametrize(
+        "rejected",
+        [
+            "https://maps.app.goo.gl/z3HZSSKzKqAbC",
+            "http://example.com/place",
+            "www.somebar.vn",
+            "t.me/danangevents",
+            "@some_channel",
+            "maps.app.goo.gl/xyz",
+            "+84 905 123 456",
+            "18:30",
+            "",
+            "a",
+        ],
+    )
+    def test_non_names_never_enter_the_index(self, rejected: str) -> None:
+        from storage.search import is_venue_name
+
+        assert not is_venue_name(rejected)
+
+    @pytest.mark.parametrize(
+        "accepted",
+        ["Corner Music Bar", "SYNCHØUSE", "Sound Cafe", "PlantLab", "Кафе Пространство", "IMIX"],
+    )
+    def test_real_venue_names_pass(self, accepted: str) -> None:
+        from storage.search import is_venue_name
+
+        assert is_venue_name(accepted)
+
+    def test_a_url_returned_as_a_name_is_dropped_not_stored(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # Observed for real: the model was asked for the venue name and returned
+        # the Google Maps link that sat next to it in the message.
+        _sync(search, sources)
+        corpus_id = int(
+            search.conn.execute("SELECT min(corpus_id) FROM corpus_messages").fetchone()[0]
+        )
+        stored = search.record_extraction(
+            corpus_id,
+            [
+                {
+                    "name": "https://maps.app.goo.gl/z3HZSSKzKq",
+                    "place_type": "bar",
+                    "city_area": "Da Nang",
+                    "event_types": ["live_music"],
+                    "evidence": "📍 https://maps.app.goo.gl/z3HZSSKzKq",
+                    "confidence": 0.7,
+                },
+                {
+                    "name": "Corner Music Bar",
+                    "place_type": "bar",
+                    "city_area": "Da Nang",
+                    "event_types": ["live_music"],
+                    "evidence": "в Corner Music Bar",
+                    "confidence": 0.9,
+                },
+            ],
+            model="test-model",
+        )
+        assert stored == 1
+        names = {p["name"] for p in search.search_places()}
+        assert names == {"Corner Music Bar"}

@@ -46,6 +46,10 @@ _TME_RE = re.compile(
 )
 _AT_HANDLE_RE = re.compile(r"(?<![\w@/])@(?P<name>[A-Za-z][\w]{4,31})")
 
+# A bare domain with a path: "maps.app.goo.gl/xyz", "t.me/chan". Catches the
+# link-instead-of-name case even when the scheme was stripped upstream.
+_URLISH_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+/")
+
 # Handles that are people or bots we do not want in a chat-candidate list.
 _REF_STOPWORDS = frozenset({"joinchat", "share", "addstickers", "proxy", "socks"})
 
@@ -88,6 +92,27 @@ def fold_ascii(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", swapped)
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return " ".join(stripped.lower().split())
+
+
+def is_venue_name(name: str) -> bool:
+    """Reject values that are not names of places.
+
+    Extraction is an LLM reading messy chat text, and a message that names a
+    venue usually also carries its map link. Asked for the name, the model
+    sometimes hands back the link. One such row is not merely noise: it becomes
+    a permanent entry in the venue index that no later pass removes, and it is
+    what the agent reads back to the user as a place to hold a concert.
+    """
+    value = name.strip()
+    if len(value) < 2 or len(value) > 120:
+        return False
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://", "www.", "@")):
+        return False
+    if "://" in lowered or _URLISH_RE.search(lowered):
+        return False
+    # A name has to contain a letter; "+84 905 123 456" and "18:30" do not.
+    return any(ch.isalpha() for ch in value)
 
 
 def escape_fts_term(term: str) -> str:
@@ -696,6 +721,9 @@ class SearchDatabase:
         for entry in places:
             name = str(entry.get("name") or "").strip()
             if not name:
+                continue
+            if not is_venue_name(name):
+                logger.debug("Rejected extracted place name %r from %s", name, corpus_id)
                 continue
             canonical = fold_ascii(name)
             if not canonical or len(canonical) < 2:
