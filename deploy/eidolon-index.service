@@ -1,0 +1,14 @@
+[Unit]
+Description=Eidolon search index refresh
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/eidolon-telegram
+ExecStart=%h/eidolon-telegram/.venv/bin/python index_cli.py build --limit 200
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+# Reads the two live stores, writes only the derived index. A failure here
+# costs a stale index until the next tick, never a lost message.
+Nice=10
+TimeoutStartSec=900

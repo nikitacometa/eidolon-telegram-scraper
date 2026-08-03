@@ -46,6 +46,7 @@ async def _run(args: argparse.Namespace) -> int:
             settings.search_db_path.with_suffix(".lock"),
             owner=f"index-{args.command}",
             subject="The search index",
+            remedy="skipping this run, the next tick will pick the work up",
         )
         try:
             lock.acquire()

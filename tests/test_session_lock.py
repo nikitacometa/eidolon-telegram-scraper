@@ -134,3 +134,40 @@ def test_report_reads_as_an_answer_not_a_dump() -> None:
     assert "waiting for your decision (1)" in rendered
     assert "rejected: 7" in rendered
     assert "not provably public: 2" in rendered
+
+
+def test_the_message_names_what_is_locked_and_what_to_do(tmp_path: Path) -> None:
+    """A scheduled index refresh has no client to stop; the text must not say so."""
+    path = tmp_path / "index.lock"
+    held = SessionLock(path, owner="index-extract", subject="The search index")
+    held.acquire()
+    try:
+        waiting = SessionLock(
+            path,
+            owner="index-build",
+            subject="The search index",
+            remedy="skipping this run, the next tick will pick the work up",
+        )
+        with pytest.raises(SessionInUseError) as caught:
+            waiting.acquire()
+    finally:
+        held.release()
+    message = str(caught.value)
+    assert "The search index" in message
+    assert "index-extract" in message
+    assert "the next tick" in message
+    assert "client" not in message
+
+
+def test_the_default_message_is_still_the_telegram_one(tmp_path: Path) -> None:
+    """The daemon and recon CLI rely on the original wording."""
+    path = tmp_path / "session.lock"
+    held = SessionLock(path, owner="daemon")
+    held.acquire()
+    try:
+        with pytest.raises(SessionInUseError) as caught:
+            SessionLock(path, owner="cli").acquire()
+    finally:
+        held.release()
+    assert "Telegram session" in str(caught.value)
+    assert "stop it before starting a second client" in str(caught.value)

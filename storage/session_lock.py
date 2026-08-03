@@ -30,6 +30,7 @@ class SessionLock:
         *,
         owner: str = "eidolon",
         subject: str = "Telegram session",
+        remedy: str = "stop it before starting a second client",
     ) -> None:
         self.path = path
         self._owner = owner
@@ -38,6 +39,10 @@ class SessionLock:
         # guarding an index rebuild should not tell the operator its Telegram
         # session is in use.
         self._subject = subject
+        # What the caller should do about it. Generic for a session, but a
+        # scheduled index refresh has no "client" to stop -- it should simply
+        # come back later, and the message should say so.
+        self._remedy = remedy
         self._handle: int | None = None
 
     def acquire(self) -> None:
@@ -54,8 +59,7 @@ class SessionLock:
             holder = _read_holder(handle)
             os.close(handle)
             raise SessionInUseError(
-                f"{self._subject} is already held by {holder or 'another process'}; "
-                "stop it before starting a second client"
+                f"{self._subject} is already held by {holder or 'another process'}; {self._remedy}"
             ) from error
 
         os.ftruncate(handle, 0)

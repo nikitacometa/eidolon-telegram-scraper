@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh the Eidolon search index every 10 minutes
+
+[Timer]
+# Wall-clock, not OnBootSec/OnUnitActiveSec. The boot-relative trigger fires
+# once against a machine whose uptime is measured in months, and the
+# active-relative one has nothing to count from until this timer has itself
+# started the service -- between them the timer reaches "elapsed" with no next
+# trigger and silently stops refreshing.
+OnCalendar=*:0/10
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
