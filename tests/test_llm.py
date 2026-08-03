@@ -285,3 +285,34 @@ class TestEvidenceAgainstTelegramMarkup:
 
         assert _source_excerpt("", "любой текст") is None
         assert _source_excerpt('"  "', "любой текст") is None
+
+
+class TestModelCompatibility:
+    """A parameter the model rejects is a permanent outage, not a bad answer."""
+
+    def test_no_call_site_pins_temperature_to_zero(self) -> None:
+        # gpt-5.6 answers `temperature: 0` with a 400. Every such call becomes a
+        # degraded decision, and `degraded_policy: reject` turns that into
+        # silence — the exact failure this system already spent a month in.
+        # Measured 2026-08-03: with temperature=0 the holdout scored
+        # precision 0.0 / recall 0.0 with 23 degraded predictions out of 40.
+        from pathlib import Path
+
+        for module in ("pipeline/llm.py", "pipeline/indexer.py"):
+            source = Path(module).read_text(encoding="utf-8")
+            offending = [
+                line
+                for line in source.splitlines()
+                if "temperature=0," in line and not line.lstrip().startswith("#")
+            ]
+            assert not offending, f"{module} pins temperature to 0: {offending}"
+
+    def test_the_classifier_schema_tracks_the_model_it_parses(self) -> None:
+        # The engine path validates against a derived schema; if it were
+        # hand-written it would drift from ModelClassification silently.
+        from pipeline.llm import _classification_schema
+        from pipeline.models import ModelClassification
+
+        schema = _classification_schema()
+        assert schema["additionalProperties"] is False
+        assert set(ModelClassification.model_fields) <= set(schema["properties"])

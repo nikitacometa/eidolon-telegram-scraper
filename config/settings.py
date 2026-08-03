@@ -36,8 +36,28 @@ class Settings(BaseSettings):
     chroma_path: Path = Path("data/chroma")
 
     # LLM filtering (Level 3)
-    llm_model: str = "gpt-4.1-mini"
-    llm_timeout_seconds: int = 15
+    #
+    # gpt-4.1-mini is gone from here on quality, not on its retirement date: it
+    # scored recall 0.75 against a gate of 0.80 on the project's own holdout
+    # (docs/evaluation-holdout-v3-post-review-2026-07-17.json, passed_gates
+    # false). Terra is the balanced tier and this call decides whether the
+    # system ever alerts at all.
+    llm_model: str = "gpt-5.6-terra"
+    # Extraction is a different job from classification: a bounded schema over
+    # tens of thousands of messages where "no venue" is the common correct
+    # answer. It gets its own field so the two are not forced to share a model.
+    extraction_model: str = "gpt-5.6-luna"
+    # The 5.6 family reasons before answering, so the old budget no longer
+    # describes the same call. Measure p95 before tightening this again.
+    llm_timeout_seconds: int = 45
+    # Which engine answers the structured calls: `api` bills per token and
+    # replies in ~1.5s; `subscription` shells out to the Codex CLI on the
+    # ChatGPT plan, costs no money, and takes ~17s while carrying ~21.5k tokens
+    # of its own context per call against a quota shared with the assistant.
+    # Level 2 embeddings ignore this entirely — neither CLI has an embedding
+    # endpoint, so that stage is on the API whatever this says.
+    llm_engine: str = "api"
+    subscription_effort: str = "low"
 
     # Daily summary
     # The background archive is off unless asked for: it spends account
@@ -46,7 +66,7 @@ class Settings(BaseSettings):
     join_queue_enabled: bool = False
     summary_enabled: bool = True
     summary_hour_utc: int = 13  # 20:00 ICT (UTC+7)
-    summary_model: str = "gpt-4.1-mini"
+    summary_model: str = "gpt-5.6-terra"
 
     # Debug
     debug_echo: bool = False  # Forward ALL messages from monitored chats

@@ -133,6 +133,8 @@ class DailySummarizer:
                     },
                 ],
                 response_format=DigestResult,
+                # 0.3 is accepted by the 5.6 family; only 0 is rejected. Kept
+                # because digest prose reads better with a little slack.
                 temperature=0.3,
                 timeout=30,
             )

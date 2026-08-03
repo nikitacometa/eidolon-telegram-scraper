@@ -148,7 +148,7 @@ class PlaceExtractor:
     ) -> None:
         self._search = search
         self._client = client or AsyncOpenAI(api_key=settings.openai_api_key)
-        self._model = model or settings.llm_model
+        self._model = model or settings.extraction_model
         self._concurrency = concurrency
         self._chunk_size = chunk_size
 
@@ -213,7 +213,11 @@ class PlaceExtractor:
                     {"role": "user", "content": user},
                 ],
                 response_format=ExtractionResult,
-                temperature=0,
+                # No temperature: the gpt-5.6 family rejects 0 outright
+                # ("'temperature' does not support 0 with this model"), and a
+                # rejected call becomes a degraded decision, which this watcher's
+                # policy turns into silence. Determinism here comes from the
+                # strict schema and a low reasoning effort, not from sampling.
                 timeout=settings.llm_timeout_seconds * 2,
             )
         except Exception as exc:
