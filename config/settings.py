@@ -37,12 +37,18 @@ class Settings(BaseSettings):
 
     # LLM filtering (Level 3)
     #
-    # gpt-4.1-mini is gone from here on quality, not on its retirement date: it
-    # scored recall 0.75 against a gate of 0.80 on the project's own holdout
-    # (docs/evaluation-holdout-v3-post-review-2026-07-17.json, passed_gates
-    # false). Terra is the balanced tier and this call decides whether the
-    # system ever alerts at all.
-    llm_model: str = "gpt-5.6-terra"
+    # Chosen by measurement, not by tier. On evals/data/relevance-holdout-v3
+    # (40 labelled cases, 2026-08-03, all at precision 1.0):
+    #
+    #   gpt-5.6-luna   recall 0.75  f1 0.857  degraded 1   <- this
+    #   gpt-4.1-mini   recall 0.70  f1 0.824  degraded 2
+    #   gpt-5.6-terra  recall 0.45  f1 0.621  degraded 9
+    #
+    # Terra is the vendor's "balanced" tier and lost badly here: it reasons its
+    # way to a paraphrase where this stage demands a verbatim quote, and every
+    # paraphrase is a degraded decision that `degraded_policy: reject` turns
+    # into silence. Re-run the holdout before changing this line.
+    llm_model: str = "gpt-5.6-luna"
     # Extraction is a different job from classification: a bounded schema over
     # tens of thousands of messages where "no venue" is the common correct
     # answer. It gets its own field so the two are not forced to share a model.
@@ -66,7 +72,10 @@ class Settings(BaseSettings):
     join_queue_enabled: bool = False
     summary_enabled: bool = True
     summary_hour_utc: int = 13  # 20:00 ICT (UTC+7)
-    summary_model: str = "gpt-5.6-terra"
+    # Same family, same structured-output path: terra degraded on 9 of 40
+    # structured calls in the holdout above, and a degraded digest is a missing
+    # digest.
+    summary_model: str = "gpt-5.6-luna"
 
     # Debug
     debug_echo: bool = False  # Forward ALL messages from monitored chats
