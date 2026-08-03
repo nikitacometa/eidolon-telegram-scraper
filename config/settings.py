@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # Reconnaissance keeps its own file: bulk crawl writes must never queue
     # behind live alert delivery on the monitoring connection.
     scout_db_path: Path = Path("data/eidolon_scout.db")
+    # Derived search index over both stores. Purely a projection: safe to
+    # delete, rebuilt by `python3 index_cli.py build`.
+    search_db_path: Path = Path("data/eidolon_search.db")
     watchers_path: Path = Path("config/watchers.yml")
 
     # Embedding filter (Level 2)

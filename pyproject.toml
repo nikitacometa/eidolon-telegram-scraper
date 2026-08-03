@@ -15,6 +15,8 @@ dependencies = [
     "aiosqlite>=0.22,<1",
     "chromadb==0.6.3",
     "fastapi>=0.128,<1",
+    # Serves the corpus to OpenClaw agents over MCP stdio (eidolon_mcp.py).
+    "mcp>=1.2,<2",
     "openai>=2.24,<3",
     # Chroma 0.6.3 still uses PostHog's pre-6 positional capture API.
     "posthog>=5.4,<6",
@@ -82,6 +84,8 @@ warn_unused_ignores = true
 files = [
     "api.py",
     "auth.py",
+    "eidolon_mcp.py",
+    "index_cli.py",
     "config",
     "evals",
     "list_chats.py",
