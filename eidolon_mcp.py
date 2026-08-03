@@ -38,6 +38,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import ServerCapabilities, TextContent, Tool, ToolsCapability
 
 from config.settings import settings
+from pipeline.recon_models import normalize_username
 from storage.search import SearchDatabase, build_fts_query
 
 logger = logging.getLogger("eidolon.mcp")
@@ -233,10 +234,11 @@ class EidolonTools:
         """Ask the daemon to join a chat. It decides when, not the caller."""
         if not self._writable:
             raise PermissionError("this bridge runs read-only; joining is not available")
-        ref = chat_ref.strip().lstrip("@")
-        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-            if ref.lower().startswith(prefix):
-                ref = ref[len(prefix) :]
+        # The daemon stores queue rows under normalize_username(); anything
+        # else here -- a trailing slash, a ?start= suffix, different case --
+        # becomes a second row for the same chat and a second join attempt,
+        # which is exactly the budget this queue exists to protect.
+        ref = normalize_username(chat_ref)
         if not ref:
             raise ValueError("chat_ref is empty")
 

@@ -45,7 +45,8 @@ CREATE TABLE scout_messages (
     PRIMARY KEY (chat_id, telegram_msg_id)
 );
 CREATE TABLE backfill_targets (chat_id INTEGER PRIMARY KEY, label TEXT);
-CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, state TEXT);
+CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, target_days INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
 CREATE TABLE scout_chats (chat_id INTEGER PRIMARY KEY, username TEXT);
 """
 
@@ -403,6 +404,41 @@ class TestHybridFusion:
         assert rental in found  # semantic-only hit
         assert len(found) > 1  # lexical-only hits too
 
+    def test_each_result_reports_the_lane_that_found_it(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # Callers use `matched_via` to judge how much to trust a hit; a
+        # semantic-only result labelled with nothing reads as a lexical match
+        # that simply scored badly.
+        _sync(search, sources)
+        rows = search.conn.execute(
+            "SELECT corpus_id, text FROM corpus_messages ORDER BY corpus_id"
+        ).fetchall()
+        rental = next(r["corpus_id"] for r in rows if "Сдаю" in r["text"])
+        search.store_embeddings([(rental, [1.0, 0.0])], model="test")
+        fused = {
+            r.corpus_id: r
+            for r in search.hybrid_search(
+                match_query=build_fts_query(["концерт"]), query_vector=[1.0, 0.0], limit=10
+            )
+        }
+        assert fused[rental].lanes == ["semantic"]
+        lexical_only = next(r for cid, r in fused.items() if cid != rental)
+        assert lexical_only.lanes == ["lexical"]
+
+    def test_a_hit_in_both_lanes_reports_both(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        row = search.conn.execute(
+            "SELECT corpus_id FROM corpus_messages WHERE text LIKE '%Концерт%' ORDER BY corpus_id"
+        ).fetchone()
+        search.store_embeddings([(row["corpus_id"], [1.0, 0.0])], model="test")
+        fused = search.hybrid_search(
+            match_query=build_fts_query(["концерт"]), query_vector=[1.0, 0.0], limit=10
+        )
+        assert sorted(fused[0].lanes) == ["lexical", "semantic"]
+
     def test_no_query_at_all_returns_nothing(self, search: SearchDatabase) -> None:
         assert search.hybrid_search(match_query=None, query_vector=None, limit=5) == []
 
@@ -599,3 +635,72 @@ class TestStatus:
         assert status["embedding_backlog"] == 6
         assert status["extraction_backlog"] > 0
         assert {s["source"] for s in status["sync"]} == {"live", "scout"}
+
+
+class TestJoinRequestNormalization:
+    """The MCP bridge must key join requests exactly as the daemon does."""
+
+    @pytest.mark.parametrize(
+        "given",
+        [
+            "danangevents",
+            "@danangevents",
+            "https://t.me/danangevents",
+            "https://t.me/danangevents/",
+            "t.me/danangevents?start=1",
+            "DanangEvents",
+        ],
+    )
+    async def test_every_spelling_of_one_chat_queues_the_same_row(
+        self, tmp_path: Path, sources: tuple[Path, Path], given: str
+    ) -> None:
+        # Each distinct key would be a separate join_queue row and a separate
+        # join attempt against an action budget measured in a few per day.
+        from eidolon_mcp import EidolonTools
+
+        search_db = tmp_path / "search.db"
+        SearchDatabase(search_db).connect()
+        tools = EidolonTools(search_db=search_db, scout_db=sources[1], writable=True)
+        result = await tools.queue_chat_join(given)
+        assert result["chat_ref"] == "danangevents"
+        rows = sqlite3.connect(sources[1]).execute("SELECT chat_ref FROM join_queue").fetchall()
+        assert rows == [("danangevents",)]
+
+    async def test_requeueing_an_existing_chat_reports_it_instead_of_duplicating(
+        self, tmp_path: Path, sources: tuple[Path, Path]
+    ) -> None:
+        from eidolon_mcp import EidolonTools
+
+        search_db = tmp_path / "search.db"
+        SearchDatabase(search_db).connect()
+        tools = EidolonTools(search_db=search_db, scout_db=sources[1], writable=True)
+        await tools.queue_chat_join("danangevents")
+        again = await tools.queue_chat_join("https://t.me/danangevents/")
+        assert again["queued"] is False
+        assert again["already"] == "pending"
+
+    async def test_a_readonly_bridge_refuses_to_queue(
+        self, tmp_path: Path, sources: tuple[Path, Path]
+    ) -> None:
+        # Julia's instance runs read-only; a write reaching the daemon from
+        # there would spend Nikita's Telegram budget.
+        from eidolon_mcp import EidolonTools
+
+        search_db = tmp_path / "search.db"
+        SearchDatabase(search_db).connect()
+        tools = EidolonTools(search_db=search_db, scout_db=sources[1], writable=False)
+        with pytest.raises(PermissionError):
+            await tools.queue_chat_join("danangevents")
+        assert (
+            sqlite3.connect(sources[1]).execute("SELECT count(*) FROM join_queue").fetchone()[0]
+            == 0
+        )
+
+    async def test_readonly_profile_does_not_advertise_the_write_tool(
+        self, tmp_path: Path, sources: tuple[Path, Path]
+    ) -> None:
+        from eidolon_mcp import READ_TOOLS, WRITE_TOOLS
+
+        read_names = {t.name for t in READ_TOOLS}
+        assert "queue_chat_join" not in read_names
+        assert {t.name for t in WRITE_TOOLS} == {"queue_chat_join"}

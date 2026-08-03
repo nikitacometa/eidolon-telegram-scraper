@@ -585,35 +585,39 @@ class SearchDatabase:
         and semantic is the recall net for posts that use none of the expected
         vocabulary.
         """
-        lanes: list[list[CorpusRow]] = []
+        lanes: list[tuple[str, list[CorpusRow]]] = []
         if match_query:
             lanes.append(
-                self.lexical_search(
-                    match_query, limit=pool, chat_ids=chat_ids, since=since, until=until
+                (
+                    "lexical",
+                    self.lexical_search(
+                        match_query, limit=pool, chat_ids=chat_ids, since=since, until=until
+                    ),
                 )
             )
         if query_vector is not None:
             lanes.append(
-                self.semantic_search(
-                    query_vector, limit=pool, chat_ids=chat_ids, since=since, until=until
+                (
+                    "semantic",
+                    self.semantic_search(
+                        query_vector, limit=pool, chat_ids=chat_ids, since=since, until=until
+                    ),
                 )
             )
         if not lanes:
             return []
 
         fused: dict[int, CorpusRow] = {}
-        for lane in lanes:
-            for rank, item in enumerate(lane, start=1):
+        for lane_name, hits in lanes:
+            for rank, item in enumerate(hits, start=1):
                 existing = fused.get(item.corpus_id)
                 if existing is None:
                     item.score = 0.0
                     item.lanes = []
                     fused[item.corpus_id] = existing = item
                 existing.score += 1.0 / (RRF_K + rank)
-                if item.lanes:
-                    existing.lanes.extend(x for x in item.lanes if x not in existing.lanes)
-                elif lane is lanes[0] and match_query:
-                    existing.lanes.append("lexical")
+                if lane_name not in existing.lanes:
+                    existing.lanes.append(lane_name)
 
         return _rollup_duplicates(sorted(fused.values(), key=lambda x: -x.score), limit)
 
