@@ -873,3 +873,86 @@ class TestVenueNameValidation:
         assert stored == 1
         names = {p["name"] for p in search.search_places()}
         assert names == {"Corner Music Bar"}
+
+
+class TestExtractionRetry:
+    """A provider timeout must not become a permanent hole in the venue index."""
+
+    def _one(self, search: SearchDatabase) -> int:
+        return int(search.conn.execute("SELECT min(corpus_id) FROM corpus_messages").fetchone()[0])
+
+    def test_a_fresh_failure_is_not_retried_immediately(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # Retrying inside the same pass would just hit the same outage again.
+        _sync(search, sources)
+        corpus_id = self._one(search)
+        search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
+        assert corpus_id not in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+    def test_a_stale_failure_comes_back_as_work(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        corpus_id = self._one(search)
+        search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
+        search.conn.execute(
+            "UPDATE extraction_state SET attempted_at = datetime('now', '-2 days')"
+            " WHERE corpus_id = ?",
+            (corpus_id,),
+        )
+        search.conn.commit()
+        assert corpus_id in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+    def test_a_message_that_keeps_failing_is_eventually_left_alone(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # Something about this specific message breaks extraction. Retrying it
+        # for the life of the corpus only spends money.
+        _sync(search, sources)
+        corpus_id = self._one(search)
+        for _ in range(3):
+            search.record_extraction(corpus_id, [], model="m", error="always fails")
+            search.conn.execute(
+                "UPDATE extraction_state SET attempted_at = datetime('now', '-2 days')"
+                " WHERE corpus_id = ?",
+                (corpus_id,),
+            )
+            search.conn.commit()
+        assert corpus_id not in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+    def test_a_successful_extraction_is_never_retried(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        corpus_id = self._one(search)
+        search.record_extraction(corpus_id, [], model="m")
+        search.conn.execute(
+            "UPDATE extraction_state SET attempted_at = datetime('now', '-9 days')"
+            " WHERE corpus_id = ?",
+            (corpus_id,),
+        )
+        search.conn.commit()
+        assert corpus_id not in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+    def test_migration_adds_attempts_to_an_index_built_before_it(self, tmp_path: Path) -> None:
+        # The index is rebuildable in principle, but a rebuild re-pays for the
+        # whole extraction pass, so the column has to land in place.
+        legacy = tmp_path / "legacy.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.execute(
+                "CREATE TABLE extraction_state (corpus_id INTEGER PRIMARY KEY,"
+                " status TEXT NOT NULL DEFAULT 'pending', attempted_at TIMESTAMP, error TEXT)"
+            )
+            conn.execute("INSERT INTO extraction_state (corpus_id, status) VALUES (1, 'error')")
+        db = SearchDatabase(legacy)
+        db.connect()
+        columns = {r["name"] for r in db.conn.execute("PRAGMA table_info(extraction_state)")}
+        assert "attempts" in columns
+        assert (
+            db.conn.execute("SELECT attempts FROM extraction_state WHERE corpus_id = 1").fetchone()[
+                "attempts"
+            ]
+            == 0
+        )
+        db.close()

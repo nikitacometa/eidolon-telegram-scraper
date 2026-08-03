@@ -224,9 +224,23 @@ class SearchDatabase:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(SEARCH_SCHEMA_PATH.read_text())
+            self._migrate()
             self._conn.commit()
         self._conn.execute("PRAGMA busy_timeout=10000")
         logger.info("Search database connected: %s (read_only=%s)", self.db_path, read_only)
+
+    def _migrate(self) -> None:
+        """Apply column additions to an index that predates them.
+
+        The index is rebuildable in principle, but a rebuild re-pays for the
+        whole extraction pass, so an in-place migration is worth the few lines.
+        """
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(extraction_state)")}
+        if "attempts" not in columns:
+            self.conn.execute(
+                "ALTER TABLE extraction_state ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Migration: added extraction_state.attempts")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -686,7 +700,16 @@ class SearchDatabase:
     # Entity extraction
     # ------------------------------------------------------------------
 
-    def pending_extractions(self, limit: int) -> list[sqlite3.Row]:
+    def pending_extractions(
+        self, limit: int, *, retry_after_hours: int = 6, max_attempts: int = 3
+    ) -> list[sqlite3.Row]:
+        """Return messages awaiting extraction, including retryable failures.
+
+        A row that failed on a provider timeout is work, not a verdict. It is
+        picked up again once the cooldown has passed, up to ``max_attempts`` --
+        after which it stays failed, because something about that specific
+        message is breaking and retrying it forever only spends money.
+        """
         return self.conn.execute(
             """
             SELECT m.corpus_id, m.text, m.date, m.chat_id, c.title AS chat_title
@@ -694,9 +717,17 @@ class SearchDatabase:
               JOIN corpus_messages m ON m.corpus_id = s.corpus_id
               LEFT JOIN corpus_chats c ON c.chat_id = m.chat_id
              WHERE s.status = 'pending'
-             ORDER BY m.date DESC LIMIT ?
+                OR (
+                    s.status = 'error'
+                    AND s.attempts < ?
+                    AND (
+                        s.attempted_at IS NULL
+                        OR s.attempted_at <= datetime('now', ?)
+                    )
+                )
+             ORDER BY s.status = 'error', m.date DESC LIMIT ?
             """,
-            (limit,),
+            (max_attempts, f"-{retry_after_hours} hours", limit),
         ).fetchall()
 
     def record_extraction(
@@ -711,7 +742,8 @@ class SearchDatabase:
         conn = self.conn
         if error is not None:
             conn.execute(
-                "UPDATE extraction_state SET status='error', attempted_at=?, error=? WHERE corpus_id=?",
+                "UPDATE extraction_state SET status='error', attempts=attempts+1,"
+                " attempted_at=?, error=? WHERE corpus_id=?",
                 (_now(), error[:500], corpus_id),
             )
             conn.commit()
@@ -798,7 +830,8 @@ class SearchDatabase:
             stored += 1
 
         conn.execute(
-            "UPDATE extraction_state SET status=?, attempted_at=?, error=NULL WHERE corpus_id=?",
+            "UPDATE extraction_state SET status=?, attempts=attempts+1, attempted_at=?,"
+            " error=NULL WHERE corpus_id=?",
             ("extracted" if stored else "no_venue", _now(), corpus_id),
         )
         conn.execute(

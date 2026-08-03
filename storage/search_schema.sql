@@ -184,6 +184,12 @@ CREATE TABLE IF NOT EXISTS extraction_state (
     corpus_id INTEGER PRIMARY KEY REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK(status IN ('pending', 'extracted', 'no_venue', 'skipped', 'error')),
+    -- A provider timeout is not a verdict about the message. Without a retry
+    -- the row stays 'error' forever and becomes a permanent hole in the venue
+    -- index -- invisible, because an empty answer looks the same as an honest
+    -- one. The counter is what stops a message that fails deterministically
+    -- from being retried for the rest of the corpus's life.
+    attempts INTEGER NOT NULL DEFAULT 0,
     attempted_at TIMESTAMP,
     error TEXT
 );
