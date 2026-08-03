@@ -221,12 +221,49 @@ def _bounded_message_text(text: str) -> str:
     return f"{text[:MESSAGE_HEAD_CHARS]}{OMISSION_MARKER}{text[-tail_chars:]}"
 
 
+# Telegram markup the sender's client renders away. A model reading a message
+# quotes what a person sees; the stored text still carries the syntax.
+_MARKUP_LINK_RE = re.compile(r"\[([^\]]*)\]\((?:[^)]*)\)")
+_MARKUP_EMPHASIS_RE = re.compile(r"(\*\*|__|~~|\*|_|`)")
+
+
+def _rendered(text: str) -> str:
+    """Return the message as a reader sees it, with markup resolved away."""
+    without_links = _MARKUP_LINK_RE.sub(r"\1", text)
+    without_emphasis = _MARKUP_EMPHASIS_RE.sub("", without_links)
+    return " ".join(without_emphasis.split())
+
+
 def _source_excerpt(evidence: str, source: str) -> str | None:
-    """Resolve harmless quote/case drift back to the exact source substring."""
+    """Resolve harmless quote drift back to a real excerpt of the message.
+
+    The gate exists to stop a model inventing a quote, and that property is
+    preserved: the text must still occur in the message. What is relaxed is the
+    demand that it occur in the *raw* message, which the model never sees as a
+    reader would.
+
+    Measured on this corpus: 22% of correctly-classified event announcements
+    were discarded here, every one of them for markup rather than invention --
+    the model returned ``В эту субботу квиз IMIX`` against a source holding
+    ``[квиз IMIX](https://t.me/imix_danang)``, and ``31 июля мы наконец-то``
+    against ``**31 июля** мы наконец-то``. Each was a true positive thrown away
+    because a link had brackets around it.
+    """
     candidate = evidence.strip().strip("\"'“”‘’")
     if not candidate:
         return None
+
+    # Exact substring of the raw text: quote it back verbatim.
     match = re.search(re.escape(candidate), source, flags=re.IGNORECASE)
+    if match is not None:
+        return match.group(0)
+
+    # Otherwise it must appear in the rendered reading of the same message.
+    rendered_source = _rendered(source)
+    rendered_candidate = _rendered(candidate)
+    if not rendered_candidate:
+        return None
+    match = re.search(re.escape(rendered_candidate), rendered_source, flags=re.IGNORECASE)
     if match is None:
         return None
     return match.group(0)

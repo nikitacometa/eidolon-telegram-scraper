@@ -230,3 +230,58 @@ class TestLLMClassifier:
         assert decision.error_code == "provider_disabled"
         assert decision.result.relevant is True
         assert decision_verdict(decision) is Verdict.OFFER
+
+
+class TestEvidenceAgainstTelegramMarkup:
+    """The gate must stop invention without punishing the reader's reading.
+
+    Measured 2026-08-03: 22% of correctly-classified event announcements were
+    discarded here, all of them because the model quoted rendered text while the
+    stored message still carried Telegram syntax.
+    """
+
+    def test_a_quote_spanning_a_link_is_accepted(self) -> None:
+        from pipeline.llm import _source_excerpt
+
+        source = "🔥В эту субботу [квиз IMIX](https://t.me/imix_danang)! 7 раундов: логика"
+        assert _source_excerpt("В эту субботу квиз IMIX", source) is not None
+
+    def test_a_quote_spanning_bold_markers_is_accepted(self) -> None:
+        from pipeline.llm import _source_excerpt
+
+        source = "Но мы не из тех, кто сдаётся! **31 июля** мы наконец-то встречаемся"
+        assert _source_excerpt("31 июля мы наконец-то встречаемся", source) is not None
+
+    def test_an_exact_raw_substring_is_returned_verbatim(self) -> None:
+        from pipeline.llm import _source_excerpt
+
+        source = "Квиз, плиз! в Дананге. 6 августа, 20:00"
+        assert _source_excerpt("Квиз, плиз! в Дананге.", source) == "Квиз, плиз! в Дананге."
+
+    def test_an_invented_quote_is_still_rejected(self) -> None:
+        # The whole point of the gate. Relaxing markup must not relax this.
+        from pipeline.llm import _source_excerpt
+
+        source = "🔥В эту субботу [квиз IMIX](https://t.me/imix_danang)! 7 раундов"
+        assert _source_excerpt("бесплатный вход и живая музыка", source) is None
+
+    def test_text_present_only_in_the_raw_form_still_counts(self) -> None:
+        # A link target is really in the message, so quoting it is weak evidence
+        # rather than an invented one. The gate rejects invention, and judging
+        # how good a quote is belongs to the reader, not to this check.
+        from pipeline.llm import _source_excerpt
+
+        source = "Приходите на [квиз](https://t.me/imix_danang) в субботу"
+        assert _source_excerpt("t.me/imix_danang", source) == "t.me/imix_danang"
+
+    def test_words_reordered_by_the_model_are_rejected(self) -> None:
+        from pipeline.llm import _source_excerpt
+
+        source = "Концерт в пятницу вечером в баре"
+        assert _source_excerpt("в баре концерт в пятницу", source) is None
+
+    def test_empty_or_quote_only_evidence_is_rejected(self) -> None:
+        from pipeline.llm import _source_excerpt
+
+        assert _source_excerpt("", "любой текст") is None
+        assert _source_excerpt('"  "', "любой текст") is None
