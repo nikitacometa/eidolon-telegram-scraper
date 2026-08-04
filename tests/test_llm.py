@@ -179,9 +179,15 @@ class TestLLMClassifier:
 
         assert decision.status is StageStatus.DEGRADED
         assert decision.error_code == "unparsed_response"
-        assert decision.result.relevant is True
+        # Fail-open is the watcher's degraded_policy, not this field: the
+        # placeholder is never consulted, and a `1` here is indistinguishable
+        # from a real verdict once persisted to pipeline_runs.llm_relevant.
+        assert decision.result.relevant is False
         assert decision.result.confidence == 0.0
-        assert decision_verdict(decision) is Verdict.OFFER
+        # Not OFFER: the call produced no answer, so the audit row must not
+        # read as a judgement the model never made. IRRELEVANT is the
+        # conservative reading available within the pinned enum.
+        assert decision_verdict(decision) is Verdict.IRRELEVANT
 
     async def test_non_verbatim_evidence_is_rejected_as_degraded(self) -> None:
         classifier, _ = _classifier(_classification(evidence="A paraphrase that is absent"))
@@ -218,18 +224,30 @@ class TestLLMClassifier:
 
         assert decision.status is StageStatus.DEGRADED
         assert decision.error_code == error_code
-        assert decision.result.relevant is True
+        # Fail-open is the watcher's degraded_policy, not this field: the
+        # placeholder is never consulted, and a `1` here is indistinguishable
+        # from a real verdict once persisted to pipeline_runs.llm_relevant.
+        assert decision.result.relevant is False
         assert decision.result.intent is Intent.OFFER
         assert decision.result.confidence == 0.0
-        assert decision_verdict(decision) is Verdict.OFFER
+        # Not OFFER: the call produced no answer, so the audit row must not
+        # read as a judgement the model never made. IRRELEVANT is the
+        # conservative reading available within the pinned enum.
+        assert decision_verdict(decision) is Verdict.IRRELEVANT
 
     async def test_disabled_provider_is_explicitly_degraded(self) -> None:
         decision = await LLMClassifier().classify("Potential offer")
 
         assert decision.status is StageStatus.DEGRADED
         assert decision.error_code == "provider_disabled"
-        assert decision.result.relevant is True
-        assert decision_verdict(decision) is Verdict.OFFER
+        # Fail-open is the watcher's degraded_policy, not this field: the
+        # placeholder is never consulted, and a `1` here is indistinguishable
+        # from a real verdict once persisted to pipeline_runs.llm_relevant.
+        assert decision.result.relevant is False
+        # Not OFFER: the call produced no answer, so the audit row must not
+        # read as a judgement the model never made. IRRELEVANT is the
+        # conservative reading available within the pinned enum.
+        assert decision_verdict(decision) is Verdict.IRRELEVANT
 
 
 class TestEvidenceAgainstTelegramMarkup:
@@ -316,3 +334,83 @@ class TestModelCompatibility:
         schema = _classification_schema()
         assert schema["additionalProperties"] is False
         assert set(ModelClassification.model_fields) <= set(schema["properties"])
+
+
+class TestDegradedDecisionsAreNotVerdicts:
+    """A degraded row must never read as a model answer."""
+
+    def test_a_degraded_decision_does_not_claim_relevance(self) -> None:
+        # pipeline_runs.llm_relevant persists this. A hardcoded 1 there is
+        # indistinguishable from a real affirmative verdict, and was misread as
+        # one: a message whose classification never completed was reported as
+        # "the model said it was relevant".
+        from pipeline.llm import _degraded_decision
+        from pipeline.models import StageStatus
+
+        decision = _degraded_decision(model="m", started=0.0, error_code="invalid_evidence")
+        assert decision.status is StageStatus.DEGRADED
+        assert decision.result.relevant is False
+        assert decision.result.confidence == 0.0
+
+    def test_the_alert_gate_still_answers_from_policy_not_from_the_placeholder(self) -> None:
+        # The placeholder must not change who gets alerted: the watcher's
+        # degraded_policy decides, exactly as before.
+        from pipeline.llm import _degraded_decision, classification_passes
+
+        decision = _degraded_decision(model="m", started=0.0, error_code="engine_error")
+        assert classification_passes(decision, ["offer", "other"], "reject") is False
+        assert classification_passes(decision, ["offer", "other"], "accept") is True
+
+    def test_a_real_negative_verdict_is_distinguishable_from_a_degraded_one(self) -> None:
+        from pipeline.llm import _degraded_decision
+        from pipeline.models import (
+            ClassificationDecision,
+            Intent,
+            ModelClassification,
+            StageStatus,
+        )
+
+        real = ClassificationDecision(
+            result=ModelClassification(
+                relevant=False,
+                intent=Intent.OTHER,
+                confidence=0.9,
+                reason="a rental listing",
+                evidence="Сдаю квартиру",
+            ),
+            status=StageStatus.OK,
+            model="m",
+            latency_ms=1.0,
+        )
+        degraded = _degraded_decision(model="m", started=0.0, error_code="engine_error")
+        # Same `relevant` value, different status — status is the field that
+        # says whether the answer means anything.
+        assert real.result.relevant == degraded.result.relevant
+        assert real.status is not degraded.status
+
+    def test_the_verdict_gate_holds_even_if_a_degraded_result_claims_relevance(self) -> None:
+        # Defence in depth, and the reason the status check is not redundant:
+        # `status` is what says whether a result means anything, so the mapping
+        # must not depend on the placeholder happening to be negative today.
+        from pipeline.llm import Verdict, decision_verdict
+        from pipeline.models import (
+            ClassificationDecision,
+            Intent,
+            ModelClassification,
+            StageStatus,
+        )
+
+        decision = ClassificationDecision(
+            result=ModelClassification(
+                relevant=True,
+                intent=Intent.OFFER,
+                confidence=0.99,
+                reason="looks like an offer",
+                evidence="концерт в баре",
+            ),
+            status=StageStatus.DEGRADED,
+            model="m",
+            latency_ms=1.0,
+            error_code="invalid_evidence",
+        )
+        assert decision_verdict(decision) is Verdict.IRRELEVANT

@@ -277,7 +277,16 @@ class LLMClassifier:
 
 
 def decision_verdict(decision: ClassificationDecision) -> Verdict:
-    """Map a structured decision to the legacy audit enum."""
+    """Map a structured decision to the legacy audit enum.
+
+    A degraded decision maps to IRRELEVANT rather than OFFER. Neither is really
+    true — the call produced no judgement at all — but this enum is pinned for
+    storage compatibility, and of the three available values the conservative
+    one is the only defensible reading. `status` remains the field that says
+    whether a verdict means anything.
+    """
+    if decision.status is not StageStatus.OK:
+        return Verdict.IRRELEVANT
     if not decision.result.relevant:
         return Verdict.IRRELEVANT
     if decision.result.intent is Intent.SEEK:
@@ -314,9 +323,17 @@ def _degraded_decision(
     started: float,
     error_code: str,
 ) -> ClassificationDecision:
+    # `relevant=False`, not True. Nothing reads this field on a degraded
+    # decision -- classification_passes checks the status first and answers from
+    # the watcher's policy -- so the value is a placeholder either way. But it is
+    # persisted to pipeline_runs.llm_relevant, where `1` is indistinguishable
+    # from a real affirmative verdict. It has already been misread that way once:
+    # a degraded row was reported as "the model said this was relevant" when the
+    # model's actual answer was never recorded. A placeholder that reads as the
+    # negative case cannot be mistaken for a finding.
     return ClassificationDecision(
         result=ModelClassification(
-            relevant=True,
+            relevant=False,
             intent=Intent.OFFER,
             confidence=0.0,
             reason="Provider unavailable; watcher degradation policy decides.",
