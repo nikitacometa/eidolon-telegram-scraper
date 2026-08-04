@@ -39,7 +39,7 @@ from mcp.types import ServerCapabilities, TextContent, Tool, ToolsCapability
 
 from config.settings import settings
 from pipeline.recon_models import normalize_username
-from storage.search import SearchDatabase, build_fts_query
+from storage.search import SearchDatabase, build_fts_query, content_terms
 
 logger = logging.getLogger("eidolon.mcp")
 
@@ -101,7 +101,10 @@ class EidolonTools:
         limit = max(1, min(limit, MAX_LIMIT))
         if since is None and days:
             since = _iso(days)
-        terms = keywords or query.split()
+        # Explicit keywords are taken as given; a natural-language query is
+        # mined for its content words rather than split, because ORing "в" and
+        # "где" into an FTS query ranks the whole corpus above the answer.
+        terms = keywords if keywords else content_terms(query)
         match_query = build_fts_query(terms) if terms else None
         vector = await self._embed(query) if semantic else None
 

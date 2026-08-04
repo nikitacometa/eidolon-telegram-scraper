@@ -23,7 +23,7 @@ import sys
 
 from config.settings import settings
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
-from storage.search import SearchDatabase, build_fts_query
+from storage.search import SearchDatabase, build_fts_query, content_terms
 from storage.session_lock import SessionInUseError, SessionLock
 
 # Commands that spend money or write the index. A timer tick landing on top of
@@ -96,7 +96,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "search":
-            terms = args.query.split()
+            terms = content_terms(args.query)
             vector = None
             if not args.lexical_only:
                 vector = await EmbeddingIndexer(search).embed_query(args.query)

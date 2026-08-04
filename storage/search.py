@@ -152,6 +152,44 @@ def escape_fts_term(term: str) -> str:
     return '"' + term.replace('"', '""') + '"'
 
 
+# Words that carry no selectivity. A prefix match on "в" or "и" hits nearly
+# every message in a Russian corpus, so ORing them into a query does not widen
+# the net -- it drowns the terms that mattered, because BM25 then ranks on words
+# the asker never cared about.
+# Written as prose and split once at import: a hundred-element list literal is
+# what the linter would prefer and is unreadable for a word list humans edit.
+_STOPWORD_TEXT = (
+    "а и но или да же ли бы что как где когда куда чтобы если то это этот эта эти "
+    "в во на за под над при по из от до для с со у к ко о об про без через между "
+    "я ты он она оно мы вы они мне тебе нам вам им его её их себя свой своя "
+    "не ни уж вот там тут здесь тоже также ещё еще уже только просто очень "
+    "есть быть был была было были будет буду будем можно нужно надо "
+    "a an the and or but if then this that these those is are was were be been "
+    "in on at by for to from of with without about into over under "
+    "i you he she it we they me him her us them my your his its our their "
+    "not no yes very just only also too some any all"
+)
+_STOPWORDS = frozenset(_STOPWORD_TEXT.split())
+
+# Anything shorter than this is either a stopword we missed or a fragment whose
+# prefix match would sweep in most of the corpus.
+_MIN_TERM_LENGTH = 3
+
+
+def content_terms(text: str) -> list[str]:
+    """Extract the words worth searching for from a natural-language query.
+
+    Splitting a sentence on whitespace and ORing the pieces is how a question
+    like "площадка в Дананге где проводят живую музыку" becomes
+    ``"площадка"* OR "в"* OR "где"* OR ...`` -- a query whose top results are
+    ranked by how often a message says "в".
+    """
+    words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+    return [
+        word for word in words if len(word) >= _MIN_TERM_LENGTH and word.lower() not in _STOPWORDS
+    ]
+
+
 def build_fts_query(terms: Sequence[str], *, prefix: bool = True) -> str:
     """Build a safe OR-of-prefixes MATCH expression from plain terms.
 

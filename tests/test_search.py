@@ -1084,3 +1084,50 @@ class TestEmbeddingSpaceMatchesProduction:
 
         indexer = EmbeddingIndexer(search=None, client=object(), dimensions=512)  # type: ignore[arg-type]
         assert indexer._width == 512
+
+
+class TestContentTermExtraction:
+    """A question is not a keyword list."""
+
+    def test_russian_stopwords_are_dropped(self) -> None:
+        from storage.search import content_terms
+
+        assert content_terms("площадка в Дананге где проводят живую музыку и концерты") == [
+            "площадка",
+            "Дананге",
+            "проводят",
+            "живую",
+            "музыку",
+            "концерты",
+        ]
+
+    def test_english_stopwords_are_dropped(self) -> None:
+        from storage.search import content_terms
+
+        assert "the" not in content_terms("a venue in the city that hosts live music")
+        assert "live" in content_terms("a venue in the city that hosts live music")
+
+    def test_punctuation_and_digits_do_not_become_terms(self) -> None:
+        from storage.search import content_terms
+
+        assert content_terms("концерт 6 августа, 20:00!") == ["концерт", "августа"]
+
+    def test_a_query_of_only_stopwords_yields_nothing_to_search(self) -> None:
+        # The caller must then fall back to semantic search rather than run a
+        # lexical query that matches everything.
+        from storage.search import content_terms
+
+        assert content_terms("а что там и как") == []
+
+    def test_the_resulting_query_excludes_the_corpus_wide_terms(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # The failure this prevents: a one-letter preposition, prefix-matched,
+        # hits nearly every message, and BM25 then ranks on it.
+        from storage.search import build_fts_query, content_terms
+
+        _sync(search, sources)
+        naive = search.lexical_search(build_fts_query(["концерт", "в", "баре"]), limit=20)
+        focused = search.lexical_search(build_fts_query(content_terms("концерт в баре")), limit=20)
+        assert len(focused) <= len(naive)
+        assert focused, "dropping stopwords must not drop the real terms"
