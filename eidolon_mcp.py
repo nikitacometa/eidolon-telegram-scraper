@@ -307,6 +307,14 @@ class EidolonTools:
             raise PermissionError("this bridge runs read-only; backfill is not available")
         if not 1 <= days <= 3650:
             raise ValueError("days must be between 1 and 3650")
+        if not settings.backfill_enabled:
+            # The row would sit pending forever: main.py only starts
+            # BackfillWorker when this is on. Reporting success for work with no
+            # worker is the failure this whole system keeps producing.
+            raise RuntimeError(
+                "history backfill is switched off on this deployment "
+                "(BACKFILL_ENABLED=false), so a request would never be executed"
+            )
 
         with sqlite3.connect(f"file:{self._scout_db}", uri=True, timeout=15.0) as conn:
             conn.execute("PRAGMA busy_timeout=15000")
@@ -354,6 +362,11 @@ class EidolonTools:
         """Ask the daemon to join a chat. It decides when, not the caller."""
         if not self._writable:
             raise PermissionError("this bridge runs read-only; joining is not available")
+        if not settings.join_queue_enabled:
+            raise RuntimeError(
+                "the join queue is switched off on this deployment "
+                "(JOIN_QUEUE_ENABLED=false), so a request would never be executed"
+            )
         # The daemon stores queue rows under normalize_username(); anything
         # else here -- a trailing slash, a ?start= suffix, different case --
         # becomes a second row for the same chat and a second join attempt,

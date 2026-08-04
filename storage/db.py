@@ -1420,6 +1420,20 @@ class Database:
                 ) as cursor:
                     targets = [int(row[0]) for row in await cursor.fetchall()]
 
+                # Saving with a narrower set is how a watcher's scope is
+                # reduced, so the bindings it no longer covers have to go. Only
+                # this watcher's own manual rows are touched: config-origin
+                # bindings and other watchers' are not ours to remove.
+                await self.conn.execute(
+                    """
+                    DELETE FROM chat_policy_bindings
+                     WHERE watcher_name = ?
+                       AND source = 'manual'
+                       AND chat_id NOT IN (SELECT value FROM json_each(?))
+                    """,
+                    (name, json.dumps(targets)),
+                )
+
                 # `manual`, not `config`: sync_config_bindings deletes every
                 # config-origin binding it no longer sees declared in the YAML,
                 # which would silently unbind this on the next reload.

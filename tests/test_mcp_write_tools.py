@@ -38,6 +38,15 @@ CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, target_days INTE
 """
 
 
+@pytest.fixture(autouse=True)
+def workers_running(monkeypatch: Any) -> None:
+    """Most tests are about tool logic, not about whether a worker exists."""
+    import config.settings as cs
+
+    monkeypatch.setattr(cs.settings, "backfill_enabled", True)
+    monkeypatch.setattr(cs.settings, "join_queue_enabled", True)
+
+
 @pytest.fixture
 def tools(tmp_path: Path) -> EidolonTools:
     live, scout, search = tmp_path / "live.db", tmp_path / "scout.db", tmp_path / "search.db"
@@ -244,3 +253,42 @@ class TestNullArgumentHandling:
             **supplied_arguments({"query": "концерт", "limit": None, "days": None})
         )
         assert result["result_count"] == 0  # empty index, but it answered
+
+
+class TestDisabledWorkers:
+    """A request nothing will execute must fail loudly, not report success."""
+
+    async def test_backfill_is_refused_when_no_worker_runs(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        # main.py only starts BackfillWorker when the setting is on; otherwise
+        # the row sits pending forever while the caller is told history is
+        # downloading.
+        import config.settings as cs
+
+        monkeypatch.setattr(cs.settings, "backfill_enabled", False)
+        with pytest.raises(RuntimeError, match="BACKFILL_ENABLED"):
+            await tools.backfill_chat(-100)
+        with sqlite3.connect(tools._scout_db) as conn:
+            assert conn.execute("SELECT count(*) FROM backfill_targets").fetchone()[0] == 0
+
+    async def test_joining_is_refused_when_no_worker_runs(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        import config.settings as cs
+
+        monkeypatch.setattr(cs.settings, "join_queue_enabled", False)
+        with pytest.raises(RuntimeError, match="JOIN_QUEUE_ENABLED"):
+            await tools.queue_chat_join("somechat")
+        with sqlite3.connect(tools._scout_db) as conn:
+            assert conn.execute("SELECT count(*) FROM join_queue").fetchone()[0] == 0
+
+    async def test_they_work_when_the_workers_are_running(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        import config.settings as cs
+
+        monkeypatch.setattr(cs.settings, "backfill_enabled", True)
+        monkeypatch.setattr(cs.settings, "join_queue_enabled", True)
+        assert (await tools.backfill_chat(-100))["target_days"] == 730
+        assert (await tools.queue_chat_join("somechat"))["queued"] is True

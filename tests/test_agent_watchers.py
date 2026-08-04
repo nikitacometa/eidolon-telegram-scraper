@@ -596,3 +596,90 @@ class TestBinding:
             "SELECT count(*) FROM chat_policy_bindings WHERE watcher_name = 'agent-a'"
         ) as cursor:
             assert (await cursor.fetchone())[0] == 1
+
+
+class TestScopeNarrowing:
+    """Saving with a smaller set is how scope is reduced."""
+
+    @staticmethod
+    async def _observe(db: Database, chat_id: int) -> None:
+        await db.conn.execute(
+            "INSERT INTO observed_chats (chat_id, mode, title, source) "
+            "VALUES (?, 'monitor', ?, 'manual')",
+            (chat_id, f"chat {chat_id}"),
+        )
+        await db.conn.commit()
+
+    @staticmethod
+    async def _bound(db: Database, name: str) -> set[int]:
+        async with db.conn.execute(
+            "SELECT chat_id FROM chat_policy_bindings WHERE watcher_name = ?", (name,)
+        ) as cursor:
+            return {int(row[0]) for row in await cursor.fetchall()}
+
+    async def test_a_narrower_set_drops_the_chats_it_no_longer_covers(self, db: Database) -> None:
+        # Without this, "watch only this one chat now" leaves the watcher routed
+        # to everything it used to see, and the change looks applied.
+        for chat_id in (-100, -200, -300):
+            await self._observe(db, chat_id)
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        assert await self._bound(db, "agent-a") == {-100, -200, -300}
+
+        await db.save_agent_watcher(
+            name="agent-a",
+            definition_json=DEFINITION,
+            created_by="openclaw:nikita",
+            chat_ids=[-100],
+        )
+        assert await self._bound(db, "agent-a") == {-100}
+
+    async def test_a_wider_set_adds_without_disturbing_the_rest(self, db: Database) -> None:
+        for chat_id in (-100, -200):
+            await self._observe(db, chat_id)
+        await db.save_agent_watcher(
+            name="agent-a",
+            definition_json=DEFINITION,
+            created_by="openclaw:nikita",
+            chat_ids=[-100],
+        )
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        assert await self._bound(db, "agent-a") == {-100, -200}
+
+    async def test_another_watchers_bindings_are_untouched(self, db: Database) -> None:
+        for chat_id in (-100, -200):
+            await self._observe(db, chat_id)
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await db.save_agent_watcher(
+            name="agent-b", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await db.save_agent_watcher(
+            name="agent-a",
+            definition_json=DEFINITION,
+            created_by="openclaw:nikita",
+            chat_ids=[-100],
+        )
+        assert await self._bound(db, "agent-b") == {-100, -200}
+
+    async def test_config_origin_bindings_are_not_ours_to_remove(self, db: Database) -> None:
+        await self._observe(db, -100)
+        await db.conn.execute(
+            "INSERT INTO chat_policy_bindings (chat_id, watcher_name, source) "
+            "VALUES (-100, 'agent-a', 'config')"
+        )
+        await db.conn.commit()
+        await db.save_agent_watcher(
+            name="agent-a",
+            definition_json=DEFINITION,
+            created_by="openclaw:nikita",
+            chat_ids=[],
+        )
+        async with db.conn.execute(
+            "SELECT source FROM chat_policy_bindings WHERE watcher_name = 'agent-a'"
+        ) as cursor:
+            assert [row[0] for row in await cursor.fetchall()] == ["config"]

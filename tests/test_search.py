@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -640,6 +641,14 @@ class TestStatus:
 
 class TestJoinRequestNormalization:
     """The MCP bridge must key join requests exactly as the daemon does."""
+
+    @pytest.fixture(autouse=True)
+    def _worker_running(self, monkeypatch: Any) -> None:
+        # These tests are about how a reference is normalised, not about whether
+        # a join worker exists to act on it.
+        import config.settings as cs
+
+        monkeypatch.setattr(cs.settings, "join_queue_enabled", True)
 
     @pytest.mark.parametrize(
         "given",
