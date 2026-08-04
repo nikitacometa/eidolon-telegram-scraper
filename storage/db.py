@@ -1360,11 +1360,27 @@ class Database:
         )
         return [(str(r[0]), str(r[1]), str(r[2])) for r in await cursor.fetchall()]
 
-    async def save_agent_watcher(self, *, name: str, definition_json: str, created_by: str) -> None:
-        """Create or replace one agent watcher and announce the change.
+    async def save_agent_watcher(
+        self,
+        *,
+        name: str,
+        definition_json: str,
+        created_by: str,
+        chat_ids: Sequence[int] | None = None,
+    ) -> int:
+        """Create or replace one agent watcher, bind it, and announce the change.
 
-        The generation bump shares the transaction with the write: a reader that
-        saw the new counter must be able to see the row it refers to.
+        Binding belongs to saving rather than to a separate call a caller can
+        forget. A watcher with no bindings loads, seeds its semantic index, logs
+        that it went live -- and never sees a message, because routing is built
+        from bindings. It would look enabled and do nothing, which is exactly
+        the failure this feature exists to remove.
+
+        ``chat_ids`` of None means every chat currently under monitoring. The
+        generation bump shares the transaction with both writes, so a reader
+        that saw the new counter can see the watcher and its routing together.
+
+        Returns how many chats it ended up bound to.
         """
         async with self._write_lock:
             try:
@@ -1380,10 +1396,46 @@ class Database:
                     """,
                     (name, definition_json, created_by),
                 )
+
+                # json_each keeps the id list a bound parameter rather than
+                # splicing placeholders into the SQL text, and lets one query
+                # serve both the "all monitored chats" and the explicit-subset
+                # cases: a NULL filter means no restriction.
+                async with self.conn.execute(
+                    """
+                    SELECT chat_id FROM observed_chats
+                     WHERE mode = 'monitor'
+                       AND (
+                            ? IS NULL
+                            OR chat_id IN (SELECT value FROM json_each(?))
+                       )
+                    """,
+                    # Bound twice rather than as ?1: numbered placeholders with a
+                    # positional sequence are deprecated and become an error in
+                    # Python 3.14.
+                    (
+                        (filter_json := None if chat_ids is None else json.dumps(list(chat_ids))),
+                        filter_json,
+                    ),
+                ) as cursor:
+                    targets = [int(row[0]) for row in await cursor.fetchall()]
+
+                # `manual`, not `config`: sync_config_bindings deletes every
+                # config-origin binding it no longer sees declared in the YAML,
+                # which would silently unbind this on the next reload.
+                await self.conn.executemany(
+                    """
+                    INSERT INTO chat_policy_bindings (chat_id, watcher_name, source)
+                    VALUES (?, ?, 'manual')
+                    ON CONFLICT(chat_id, watcher_name) DO NOTHING
+                    """,
+                    [(chat_id, name) for chat_id in targets],
+                )
                 await self.conn.execute(
                     "UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1"
                 )
                 await self.conn.commit()
+                return len(targets)
             except BaseException:
                 await self.conn.rollback()
                 raise
@@ -1399,6 +1451,13 @@ class Database:
                 )
                 changed = cursor.rowcount > 0
                 if changed:
+                    # Drop the routing too. Leaving stale bindings would keep the
+                    # chat pointing at a policy that no longer loads, which the
+                    # reload silently filters out -- correct, but it leaves the
+                    # tables disagreeing with each other for no reason.
+                    await self.conn.execute(
+                        "DELETE FROM chat_policy_bindings WHERE watcher_name = ?", (name,)
+                    )
                     await self.conn.execute(
                         "UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1"
                     )

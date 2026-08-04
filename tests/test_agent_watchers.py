@@ -451,3 +451,99 @@ class TestDaemonReconciliation:
         assert result.added == ["agent-events"]
         assert "agent-events" in app.watchers_by_name  # type: ignore[attr-defined]
         app.embedding_filter.start.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+class TestBinding:
+    """A watcher that is loaded but bound to nothing never sees a message."""
+
+    @staticmethod
+    async def _observe(db: Database, chat_id: int, mode: str = "monitor") -> None:
+        await db.conn.execute(
+            "INSERT INTO observed_chats (chat_id, mode, title, source) VALUES (?, ?, ?, 'manual')",
+            (chat_id, mode, f"chat {chat_id}"),
+        )
+        await db.conn.commit()
+
+    async def test_saving_binds_to_every_monitored_chat_by_default(self, db: Database) -> None:
+        for chat_id in (-100, -200, -300):
+            await self._observe(db, chat_id)
+        bound = await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        assert bound == 3
+
+    async def test_chats_not_under_monitoring_are_not_bound(self, db: Database) -> None:
+        # A binding to a paused or recon chat is routing that ingestion ignores.
+        await self._observe(db, -100, "monitor")
+        await self._observe(db, -200, "paused")
+        await self._observe(db, -300, "recon")
+        assert (
+            await db.save_agent_watcher(
+                name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+            )
+            == 1
+        )
+
+    async def test_an_explicit_subset_is_honoured(self, db: Database) -> None:
+        for chat_id in (-100, -200, -300):
+            await self._observe(db, chat_id)
+        assert (
+            await db.save_agent_watcher(
+                name="agent-a",
+                definition_json=DEFINITION,
+                created_by="openclaw:nikita",
+                chat_ids=[-100, -300],
+            )
+            == 2
+        )
+
+    async def test_an_unobserved_chat_id_is_silently_not_bound(self, db: Database) -> None:
+        await self._observe(db, -100)
+        assert (
+            await db.save_agent_watcher(
+                name="agent-a",
+                definition_json=DEFINITION,
+                created_by="openclaw:nikita",
+                chat_ids=[-100, -999],
+            )
+            == 1
+        )
+
+    async def test_bindings_are_manual_so_a_config_reload_cannot_drop_them(
+        self, db: Database
+    ) -> None:
+        # sync_config_bindings deletes every `config`-origin binding it no longer
+        # sees declared in the YAML; a config-origin binding here would be
+        # unbound on the next reload without anyone asking.
+        await self._observe(db, -100)
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        async with db.conn.execute(
+            "SELECT source FROM chat_policy_bindings WHERE watcher_name = 'agent-a'"
+        ) as cursor:
+            assert [row[0] for row in await cursor.fetchall()] == ["manual"]
+
+    async def test_revoking_also_removes_the_routing(self, db: Database) -> None:
+        await self._observe(db, -100)
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await db.revoke_agent_watcher("agent-a")
+        async with db.conn.execute(
+            "SELECT count(*) FROM chat_policy_bindings WHERE watcher_name = 'agent-a'"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+
+    async def test_saving_twice_does_not_duplicate_bindings(self, db: Database) -> None:
+        await self._observe(db, -100)
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await db.save_agent_watcher(
+            name="agent-a", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        async with db.conn.execute(
+            "SELECT count(*) FROM chat_policy_bindings WHERE watcher_name = 'agent-a'"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 1
