@@ -1043,3 +1043,44 @@ class TestTransientErrorClassification:
         )
         search.conn.commit()
         assert corpus_id in {r["corpus_id"] for r in search.pending_extractions(50)}
+
+
+class TestEmbeddingSpaceMatchesProduction:
+    """A backtest run in a different vector space than production is fiction."""
+
+    def test_the_indexer_defaults_to_the_models_native_width(self) -> None:
+        # pipeline/embeddings.py (the live L2 path) passes no `dimensions`, so it
+        # gets the model's native width. The corpus index must ask for the same
+        # thing, or a proposed watcher is scored against vectors production will
+        # never compute. Measured while they differed (corpus 512, live 1536):
+        # 17.5% of near-threshold decisions flipped, and the disagreements ran
+        # one way — the narrower space predicted passes production would not make.
+        from openai import NOT_GIVEN
+
+        from pipeline.indexer import EmbeddingIndexer
+
+        indexer = EmbeddingIndexer(search=None, client=object())  # type: ignore[arg-type]
+        assert indexer._dimensions is None
+        assert indexer._width is NOT_GIVEN
+
+    def test_the_live_filter_does_not_pin_a_width_either(self) -> None:
+        # The invariant is symmetric: if either side starts pinning a width, the
+        # other has to follow in the same commit.
+        from pathlib import Path
+
+        source = Path("pipeline/embeddings.py").read_text(encoding="utf-8")
+        pinned = [
+            line
+            for line in source.splitlines()
+            if "dimensions" in line and not line.lstrip().startswith("#")
+        ]
+        assert not pinned, (
+            "pipeline/embeddings.py now pins an embedding width; "
+            f"pipeline/indexer.py must match it in the same change: {pinned}"
+        )
+
+    def test_an_explicit_width_is_still_honoured(self) -> None:
+        from pipeline.indexer import EmbeddingIndexer
+
+        indexer = EmbeddingIndexer(search=None, client=object(), dimensions=512)  # type: ignore[arg-type]
+        assert indexer._width == 512

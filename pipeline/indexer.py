@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import NOT_GIVEN, AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from config.settings import settings
@@ -89,23 +89,33 @@ class EmbeddingIndexer:
         *,
         client: AsyncOpenAI | None = None,
         model: str | None = None,
-        dimensions: int = 512,
+        dimensions: int | None = None,
         batch_size: int = 256,
         min_length: int = 1,
     ) -> None:
         self._search = search
         self._client = client or AsyncOpenAI(api_key=settings.openai_api_key)
         self._model = model or settings.embedding_model
-        # 512 rather than the model's native 1536: OpenAI's embedding models are
-        # trained so a truncated prefix stays usable, and at this corpus size the
-        # 3x saving in memory and scan time costs nothing measurable in quality.
+        # None means the model's native width, which is what
+        # pipeline/embeddings.py asks for on the live path. That match is the
+        # point, not an accident: this index is what a proposed watcher is
+        # backtested against, and a backtest run in a different vector space
+        # than production is a confident answer to a question nobody asked.
+        # Measured while they differed (corpus 512 vs live 1536): 17.5% of
+        # near-threshold decisions flipped, and the disagreements ran one way --
+        # the smaller space predicted passes production would not make.
         self._dimensions = dimensions
         self._batch_size = batch_size
         self._min_length = min_length
 
+    @property
+    def _width(self) -> Any:
+        """The SDK's omit sentinel when we want the model's native width."""
+        return self._dimensions if self._dimensions else NOT_GIVEN
+
     async def embed_query(self, text: str) -> list[float]:
         response = await self._client.embeddings.create(
-            model=self._model, input=[text], dimensions=self._dimensions
+            model=self._model, input=[text], dimensions=self._width
         )
         return list(response.data[0].embedding)
 
@@ -120,7 +130,7 @@ class EmbeddingIndexer:
             texts = [r["text"][:8000] for r in rows]
             try:
                 response = await self._client.embeddings.create(
-                    model=self._model, input=texts, dimensions=self._dimensions
+                    model=self._model, input=texts, dimensions=self._width
                 )
             except Exception:
                 logger.exception("Embedding batch failed (%d rows); stopping run", len(rows))
