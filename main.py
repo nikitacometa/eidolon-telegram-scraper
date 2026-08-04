@@ -23,6 +23,11 @@ from config.watchers import (
     WatcherConfigError,
     load_watchers,
 )
+from pipeline.agent_watchers import (
+    AgentWatcherSync,
+    ReconcileResult,
+    merge_agent_watchers,
+)
 from pipeline.backfill import BackfillWorker
 from pipeline.crawler import TelegramCrawler
 from pipeline.dispatcher import AlertDispatcher
@@ -125,6 +130,7 @@ class Eidolon:
             on_joined=self.reload_observation,
         )
         self._backfill_task: asyncio.Task[None] | None = None
+        self._agent_watcher_task: asyncio.Task[None] | None = None
         self._joiner_task: asyncio.Task[None] | None = None
         self.embedding_filter = EmbeddingFilter()
         self.llm_classifier = LLMClassifier()
@@ -142,7 +148,12 @@ class Eidolon:
 
         # Load watcher policies. Which chats they apply to comes from the
         # registry once the database is open, not from the file.
-        self.watchers = load_watchers(settings.watchers_path)
+        # The git-tracked policies, kept separate from the merged view so a
+        # reconciliation always rebuilds from the reviewed set rather than from
+        # whatever the previous merge produced.
+        self._config_watchers = load_watchers(settings.watchers_path)
+        self._agent_watchers: dict[str, Watcher] = {}
+        self.watchers = list(self._config_watchers)
         _validate_runtime_configuration(self.watchers)
         self.watchers_by_name = {watcher.name: watcher for watcher in self.watchers}
         self.watcher_fingerprints = {
@@ -174,6 +185,7 @@ class Eidolon:
                 stack.push_async_callback(self.db.close)
                 await self.scout.connect()
                 stack.push_async_callback(self.scout.close)
+                await self.reconcile_agent_watchers(apply=False)
                 await self.reload_observation()
                 purged = await self.db.purge_expired_data(settings.retention_days)
                 if purged:
@@ -244,6 +256,17 @@ class Eidolon:
                 name="join-queue",
             )
             logger.info("Join queue worker enabled")
+        if settings.agent_watchers_enabled:
+            self._agent_watcher_task = asyncio.create_task(
+                AgentWatcherSync(
+                    read_generation=self.db.agent_watcher_generation,
+                    reconcile=self.reconcile_agent_watchers,
+                    poll_seconds=settings.agent_watcher_poll_seconds,
+                ).run_forever(self._shutdown_event),
+                name="agent-watcher-sync",
+            )
+            logger.info("Agent watcher sync enabled")
+
         if settings.backfill_enabled:
             self._backfill_task = asyncio.create_task(
                 self.backfill.run_forever(self._shutdown_event),
@@ -264,12 +287,13 @@ class Eidolon:
         # Stop the archive first. It is the only task that keeps a Telegram
         # request in flight for seconds at a time, and cutting the connection
         # underneath it turns a clean pause into an ambiguous outcome.
-        for task in (self._backfill_task, self._joiner_task):
+        for task in (self._backfill_task, self._joiner_task, self._agent_watcher_task):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
         self._backfill_task = None
+        self._agent_watcher_task = None
         self._joiner_task = None
 
         # Stop ingress before draining the bounded queue. A message committed
@@ -383,6 +407,45 @@ class Eidolon:
             return None
         return entity
 
+    async def reconcile_agent_watchers(self, *, apply: bool = True) -> ReconcileResult:
+        """Fold assistant-authored watchers into the live set.
+
+        Seeding the semantic index happens here, before routing is rebuilt, and
+        that ordering is the whole point: a watcher that reaches routing without
+        its reference vectors degrades at Level 2 on every message, which the
+        default policy renders as silence. It would look enabled and never
+        alert -- the failure this feature exists to remove.
+        """
+        stored = await self.db.active_agent_watchers()
+        merged, result = merge_agent_watchers(
+            config_watchers=self._config_watchers,
+            stored=stored,
+            current=self._agent_watchers,
+        )
+
+        if not result.changed:
+            self._agent_watchers = merged
+            return result
+
+        self._agent_watchers = merged
+        self.watchers = [*self._config_watchers, *merged.values()]
+        self.watchers_by_name = {watcher.name: watcher for watcher in self.watchers}
+        self.watcher_fingerprints = {
+            watcher.name: effective_policy_fingerprint(watcher) for watcher in self.watchers
+        }
+
+        if not apply:
+            # Startup path: the caller is about to seed the semantic index and
+            # rebuild routing anyway, and doing it twice would embed every
+            # reference set a second time for nothing.
+            return result
+
+        # Seed before routing: start() is fingerprint-gated, so unchanged
+        # watchers cost nothing and a new or edited one is embedded exactly once.
+        await self.embedding_filter.start(self.watchers)
+        await self.reload_observation()
+        return result
+
     async def reload_observation(self) -> None:
         """Rebuild routing from the chat registry without restarting.
 
@@ -392,7 +455,10 @@ class Eidolon:
         processor holding the previous mapping and a newly promoted chat would
         raise ``KeyError`` on its first message.
         """
-        await self.db.sync_config_bindings(self.watchers)
+        # Config bindings are derived from the reviewed policies only: an agent
+        # watcher declares no chats, so passing the merged list here would let a
+        # future non-empty `chats` field bind itself.
+        await self.db.sync_config_bindings(self._config_watchers)
         snapshot = await self.db.observation_snapshot()
 
         self.observed_chats.clear()

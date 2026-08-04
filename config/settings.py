@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     # standing on history nobody requested.
     backfill_enabled: bool = False
     join_queue_enabled: bool = False
+    # Watchers the assistant creates reach the daemon by polling a revision
+    # counter. Off means an agent can still write one, and it will take effect
+    # at the next restart rather than never -- but the tool would be reporting
+    # success for something the user cannot observe, so keep this on wherever
+    # the write tool is exposed.
+    agent_watchers_enabled: bool = True
+    agent_watcher_poll_seconds: float = 30.0
     summary_enabled: bool = True
     summary_hour_utc: int = 13  # 20:00 ICT (UTC+7)
     # Same family, same structured-output path: terra degraded on 9 of 40

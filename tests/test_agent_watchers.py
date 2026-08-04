@@ -352,3 +352,102 @@ class TestSyncLoop:
         sync = AgentWatcherSync(read_generation=generation, reconcile=reconcile, poll_seconds=0.01)
         await asyncio.wait_for(sync.run_forever(shutdown), timeout=5)
         assert ticks["n"] >= 3
+
+
+class TestDaemonReconciliation:
+    """The behaviour the whole feature exists for: live, without a restart."""
+
+    @staticmethod
+    def _app(db: Database) -> object:
+        from unittest.mock import AsyncMock
+
+        from config.watchers import Watcher, WatcherRules
+        from main import Eidolon
+        from pipeline.filters import RuleFilter
+
+        config = Watcher(
+            name="danang-signal",
+            rules=WatcherRules(keywords=[], min_length=60),
+            llm_level=3,
+            prompt="Announcements of events a person could attend in Da Nang.",
+        )
+        app = Eidolon.__new__(Eidolon)
+        app.db = db
+        app._config_watchers = [config]
+        app._agent_watchers = {}
+        app.watchers = [config]
+        app.watchers_by_name = {config.name: config}
+        app.watcher_fingerprints = {config.name: "fp"}
+        app.chat_watchers = {}
+        app.observed_chats = {}
+        app.filters = {config.name: RuleFilter(config)}
+        app.embedding_filter = AsyncMock()
+        return app
+
+    async def test_a_new_watcher_becomes_live_without_a_restart(self, db: Database) -> None:
+        app = self._app(db)
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        result = await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        assert result.added == ["agent-events"]
+        assert "agent-events" in app.watchers_by_name  # type: ignore[attr-defined]
+
+    async def test_its_semantic_index_is_seeded_before_it_can_judge_anything(
+        self, db: Database
+    ) -> None:
+        # Without this the watcher is live and blind: every message degrades at
+        # Level 2 and the default policy renders that as silence, so it would
+        # look enabled and never alert.
+        app = self._app(db)
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        seeded = app.embedding_filter.start.await_args.args[0]  # type: ignore[attr-defined]
+        assert "agent-events" in {w.name for w in seeded}
+
+    async def test_a_revoked_watcher_stops_being_routed(self, db: Database) -> None:
+        app = self._app(db)
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        await db.revoke_agent_watcher("agent-events")
+        result = await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        assert result.removed == ["agent-events"]
+        assert "agent-events" not in app.watchers_by_name  # type: ignore[attr-defined]
+
+    async def test_an_unchanged_set_does_not_reseed(self, db: Database) -> None:
+        # Reseeding is a paid embedding call per watcher; doing it on every tick
+        # would turn a 30-second poll into a standing bill.
+        app = self._app(db)
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        calls = app.embedding_filter.start.await_count  # type: ignore[attr-defined]
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        assert app.embedding_filter.start.await_count == calls  # type: ignore[attr-defined]
+
+    async def test_the_config_watcher_survives_every_reconciliation(self, db: Database) -> None:
+        app = self._app(db)
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        await db.revoke_agent_watcher("agent-events")
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        assert "danang-signal" in app.watchers_by_name  # type: ignore[attr-defined]
+
+    async def test_the_startup_path_merges_without_reseeding(self, db: Database) -> None:
+        # At startup the caller seeds and rebuilds routing itself; doing it here
+        # too would embed every reference set twice on every boot.
+        app = self._app(db)
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        result = await app.reconcile_agent_watchers(apply=False)  # type: ignore[attr-defined]
+        assert result.added == ["agent-events"]
+        assert "agent-events" in app.watchers_by_name  # type: ignore[attr-defined]
+        app.embedding_filter.start.assert_not_awaited()  # type: ignore[attr-defined]

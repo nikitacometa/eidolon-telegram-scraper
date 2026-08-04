@@ -140,6 +140,10 @@ async def test_chat_without_policies_is_still_observed(db: Database) -> None:
 def _app_with_watchers(*watchers: Watcher) -> Eidolon:
     """Build an Eidolon shell wired like __init__ leaves it."""
     app = Eidolon.__new__(Eidolon)
+    # Config-origin policies and the merged live set start identical; an
+    # assistant-authored watcher would appear only in the latter.
+    app._config_watchers = list(watchers)
+    app._agent_watchers = {}
     app.watchers = list(watchers)
     app.watchers_by_name = {watcher.name: watcher for watcher in watchers}
     app.chat_watchers = {}
@@ -185,6 +189,7 @@ async def test_reload_mutates_the_mapping_the_processor_holds() -> None:
     app.db.observation_snapshot.return_value = {}
     scooters = _watcher("scooters", [])
     app.watchers.append(scooters)
+    app._config_watchers.append(scooters)
     app.watchers_by_name[scooters.name] = scooters
 
     await app.reload_observation()
