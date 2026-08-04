@@ -5,7 +5,11 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/eidolon-telegram
-ExecStart=%h/eidolon-telegram/.venv/bin/python index_cli.py build --limit 200
+# 1000 per tick, not 200: measured extraction throughput is about 7 messages a
+# second, so a full tick's work finishes in under three minutes of a ten-minute
+# window. At 200 the queue fell behind a history backfill by more than half a
+# day, which means the venue index answers questions about data it has not read.
+ExecStart=%h/eidolon-telegram/.venv/bin/python index_cli.py build --limit 1000
 Environment=PYTHONUNBUFFERED=1
 UMask=0077
 # Reads the two live stores, writes only the derived index. A failure here
