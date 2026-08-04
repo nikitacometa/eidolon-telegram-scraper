@@ -452,6 +452,55 @@ class TestDaemonReconciliation:
         assert "agent-events" in app.watchers_by_name  # type: ignore[attr-defined]
         app.embedding_filter.start.assert_not_awaited()  # type: ignore[attr-defined]
 
+    async def test_a_binding_only_change_still_rebuilds_routing(self, db: Database) -> None:
+        # The revision counter moves when bindings change even if no definition
+        # does. Skipping the reload then leaves routing that exists in the
+        # database and nowhere in the running process — enabled on paper, blind
+        # in fact, which is the failure this feature exists to remove.
+        from unittest.mock import AsyncMock
+
+        app = self._app(db)
+        app.reload_observation = AsyncMock()  # type: ignore[attr-defined]
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        before = app.reload_observation.await_count  # type: ignore[attr-defined]
+
+        # Same definition, new binding: nothing about the policy changed.
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        result = await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        assert not result.changed
+        assert app.reload_observation.await_count == before + 1  # type: ignore[attr-defined]
+
+    async def test_a_binding_only_change_does_not_reseed(self, db: Database) -> None:
+        # Reloading routing is cheap; reseeding is a paid embedding call per
+        # watcher and must stay gated on a real definition change.
+        from unittest.mock import AsyncMock
+
+        app = self._app(db)
+        app.reload_observation = AsyncMock()  # type: ignore[attr-defined]
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        seeds = app.embedding_filter.start.await_count  # type: ignore[attr-defined]
+        await db.save_agent_watcher(
+            name="agent-events", definition_json=DEFINITION, created_by="openclaw:nikita"
+        )
+        await app.reconcile_agent_watchers()  # type: ignore[attr-defined]
+        assert app.embedding_filter.start.await_count == seeds  # type: ignore[attr-defined]
+
+    async def test_the_startup_path_still_does_not_reload(self, db: Database) -> None:
+        from unittest.mock import AsyncMock
+
+        app = self._app(db)
+        app.reload_observation = AsyncMock()  # type: ignore[attr-defined]
+        await app.reconcile_agent_watchers(apply=False)  # type: ignore[attr-defined]
+        app.reload_observation.assert_not_awaited()  # type: ignore[attr-defined]
+
 
 class TestBinding:
     """A watcher that is loaded but bound to nothing never sees a message."""

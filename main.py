@@ -425,6 +425,15 @@ class Eidolon:
 
         if not result.changed:
             self._agent_watchers = merged
+            if apply:
+                # The revision counter moved even though no definition did, so
+                # something else about the watcher set changed -- in practice,
+                # which chats it is bound to. Routing is built from bindings, and
+                # skipping this reload leaves a watcher whose routing exists in
+                # the database and nowhere in the running process: enabled on
+                # paper, blind in fact. Reloading is cheap; seeding, below, is
+                # the expensive part and stays gated on a real definition change.
+                await self.reload_observation()
             return result
 
         self._agent_watchers = merged
