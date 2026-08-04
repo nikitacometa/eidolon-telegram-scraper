@@ -1336,3 +1336,74 @@ class Database:
         except BaseException:
             await self.conn.rollback()
             raise
+
+    # ------------------------------------------------------------------
+    # Watchers authored by the assistant
+    # ------------------------------------------------------------------
+
+    async def agent_watcher_generation(self) -> int:
+        """Return the counter that changes whenever an agent watcher does.
+
+        Read once per poll tick. Deliberately a counter rather than a timestamp:
+        two edits within the same second are indistinguishable by time, and the
+        second one would never be noticed.
+        """
+        cursor = await self.conn.execute("SELECT generation FROM agent_watchers_meta WHERE id = 1")
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def active_agent_watchers(self) -> list[tuple[str, str, str]]:
+        """Return `(name, definition_json, created_by)` for every live one."""
+        cursor = await self.conn.execute(
+            "SELECT name, definition, created_by FROM agent_watchers "
+            "WHERE status = 'active' ORDER BY name"
+        )
+        return [(str(r[0]), str(r[1]), str(r[2])) for r in await cursor.fetchall()]
+
+    async def save_agent_watcher(self, *, name: str, definition_json: str, created_by: str) -> None:
+        """Create or replace one agent watcher and announce the change.
+
+        The generation bump shares the transaction with the write: a reader that
+        saw the new counter must be able to see the row it refers to.
+        """
+        async with self._write_lock:
+            try:
+                await self.conn.execute(
+                    """
+                    INSERT INTO agent_watchers (name, definition, created_by)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        definition = excluded.definition,
+                        created_by = excluded.created_by,
+                        status = 'active',
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (name, definition_json, created_by),
+                )
+                await self.conn.execute(
+                    "UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1"
+                )
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+    async def revoke_agent_watcher(self, name: str) -> bool:
+        """Retire one agent watcher, reporting whether it existed."""
+        async with self._write_lock:
+            try:
+                cursor = await self.conn.execute(
+                    "UPDATE agent_watchers SET status = 'revoked', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE name = ? AND status = 'active'",
+                    (name,),
+                )
+                changed = cursor.rowcount > 0
+                if changed:
+                    await self.conn.execute(
+                        "UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1"
+                    )
+                await self.conn.commit()
+                return changed
+            except BaseException:
+                await self.conn.rollback()
+                raise

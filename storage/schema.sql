@@ -127,3 +127,35 @@ CREATE INDEX IF NOT EXISTS idx_alerts_watcher ON alerts(watcher_name, created_at
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_watcher
     ON pipeline_runs(watcher_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_bindings_watcher ON chat_policy_bindings(watcher_name);
+
+-- Watchers authored by the assistant rather than by a person editing YAML.
+--
+-- Deliberately a separate table rather than an overlay on the git-tracked
+-- policy file. Policy under review by a human and policy created from a chat
+-- message are different things with different trust, and merging them field by
+-- field was the complexity the original design walked away from. Here the merge
+-- is a union over disjoint name spaces: agent names carry an `agent-` prefix,
+-- a collision with a config name is refused, and config always wins.
+CREATE TABLE IF NOT EXISTS agent_watchers (
+    name TEXT PRIMARY KEY,
+    -- Watcher.model_dump_json(mode='json'), with chats forced empty: which
+    -- chats a policy watches is runtime state that lives in observed_chats.
+    definition TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'revoked')),
+    -- Who asked for it. Julia's bridge is read-only and must never be given the
+    -- tool that writes here; this column is what makes it visible if it ever is.
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- A single counter bumped in the same transaction as every write above, so the
+-- daemon can notice a change with one scalar read per tick instead of scanning
+-- the table. A timestamp would not do: two edits inside the same second are
+-- indistinguishable, and the poller would miss the second one.
+CREATE TABLE IF NOT EXISTS agent_watchers_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO agent_watchers_meta (id, generation) VALUES (1, 0);
