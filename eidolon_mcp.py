@@ -50,6 +50,16 @@ MESSAGE_TEXT_LIMIT = 400
 MAX_LIMIT = 60
 
 
+def supplied_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop keys whose value is null, so a default can apply.
+
+    Models routinely send `null` for arguments they are not using, and the tool
+    schemas accept it. Passing it through would mean "the value is None", which
+    reaches min(None, 60) and fails a call the model had every right to make.
+    """
+    return {key: value for key, value in (arguments or {}).items() if value is not None}
+
+
 def _iso(days_ago: int) -> str:
     return (datetime.now(UTC) - timedelta(days=days_ago)).isoformat(timespec="seconds")
 
@@ -57,9 +67,17 @@ def _iso(days_ago: int) -> str:
 class EidolonTools:
     """Tool implementations over the search index."""
 
-    def __init__(self, *, search_db: Path, scout_db: Path, writable: bool) -> None:
+    def __init__(
+        self,
+        *,
+        search_db: Path,
+        scout_db: Path,
+        writable: bool,
+        live_db: Path | None = None,
+    ) -> None:
         self._search_db = search_db
         self._scout_db = scout_db
+        self._live_db = live_db if live_db is not None else settings.db_path
         self._writable = writable
         self._search = SearchDatabase(search_db)
         self._search.connect(read_only=True)
@@ -231,6 +249,105 @@ class EidolonTools:
             ),
         }
 
+    async def resume_chat(self, chat_id: int, *, mode: str = "monitor") -> dict[str, Any]:
+        """Put an already-joined chat back under observation."""
+        if not self._writable:
+            raise PermissionError(
+                "this bridge runs read-only; changing observation is not available"
+            )
+        if mode not in {"monitor", "recon", "paused"}:
+            raise ValueError(f"mode must be monitor, recon or paused; got {mode!r}")
+
+        with sqlite3.connect(f"file:{self._live_db}", uri=True, timeout=15.0) as conn:
+            conn.execute("PRAGMA busy_timeout=15000")
+            title_row = conn.execute(
+                "SELECT title FROM chats WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO observed_chats (chat_id, mode, title, source)
+                VALUES (?, ?, ?, 'manual')
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    title = COALESCE(excluded.title, observed_chats.title),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, mode, title_row[0] if title_row else None),
+            )
+            watchers: list[str] = []
+            if mode == "monitor":
+                watchers = [
+                    str(r[0])
+                    for r in conn.execute("SELECT DISTINCT watcher_name FROM chat_policy_bindings")
+                ]
+                conn.executemany(
+                    "INSERT INTO chat_policy_bindings (chat_id, watcher_name, source) "
+                    "VALUES (?, ?, 'manual') ON CONFLICT(chat_id, watcher_name) DO NOTHING",
+                    [(chat_id, name) for name in watchers],
+                )
+            # Routing lives in the daemon's memory; a row nobody reloads is a
+            # change that did not happen.
+            conn.execute("UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1")
+            conn.commit()
+        return {
+            "chat_id": chat_id,
+            "mode": mode,
+            "watchers": watchers,
+            "note": (
+                "The daemon picks this up within about half a minute, without restarting. "
+                "Messages sent before now are not recovered by this — use backfill_chat for those."
+            ),
+        }
+
+    async def backfill_chat(
+        self, chat_id: int, *, days: int = 730, label: str | None = None
+    ) -> dict[str, Any]:
+        """Ask the daemon to walk a joined chat's history backwards."""
+        if not self._writable:
+            raise PermissionError("this bridge runs read-only; backfill is not available")
+        if not 1 <= days <= 3650:
+            raise ValueError("days must be between 1 and 3650")
+
+        with sqlite3.connect(f"file:{self._scout_db}", uri=True, timeout=15.0) as conn:
+            conn.execute("PRAGMA busy_timeout=15000")
+            existing = conn.execute(
+                "SELECT state, messages_stored, target_days FROM backfill_targets WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO backfill_targets (chat_id, label, target_days)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    label = COALESCE(excluded.label, backfill_targets.label),
+                    target_days = MAX(backfill_targets.target_days, excluded.target_days),
+                    state = CASE
+                        WHEN excluded.target_days > backfill_targets.target_days
+                            AND backfill_targets.state = 'complete'
+                        THEN 'pending'
+                        ELSE backfill_targets.state
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, label, days),
+            )
+            conn.commit()
+        return {
+            "chat_id": chat_id,
+            "target_days": days,
+            "previous": (
+                {"state": existing[0], "messages_stored": existing[1], "target_days": existing[2]}
+                if existing
+                else None
+            ),
+            "note": (
+                "History is walked one page of 100 messages every 8 seconds, only while the "
+                "daemon is otherwise idle — roughly 45,000 messages an hour. A large chat takes "
+                "tens of minutes; progress is a cursor, so nothing is lost to a restart. "
+                "Asking again with the same or fewer days does nothing."
+            ),
+        }
+
     async def queue_chat_join(
         self, chat_ref: str, *, label: str | None = None, target_days: int = 730
     ) -> dict[str, Any]:
@@ -293,7 +410,7 @@ READ_TOOLS = [
                     "description": "Natural-language description of what to find. Used for semantic search.",
                 },
                 "keywords": {
-                    "type": "array",
+                    "type": ["array", "null"],
                     "items": {"type": "string"},
                     "description": (
                         "Word stems for exact matching, matched as prefixes and OR-ed. "
@@ -301,12 +418,15 @@ READ_TOOLS = [
                         "Cyrillic but event posts often use English party vocabulary."
                     ),
                 },
-                "chat_ids": {"type": "array", "items": {"type": "integer"}},
-                "days": {"type": "integer", "description": "Only messages from the last N days."},
-                "since": {"type": "string", "description": "ISO date lower bound."},
-                "until": {"type": "string", "description": "ISO date upper bound."},
-                "limit": {"type": "integer", "default": 15, "maximum": 60},
-                "semantic": {"type": "boolean", "default": True},
+                "chat_ids": {"type": ["array", "null"], "items": {"type": "integer"}},
+                "days": {
+                    "type": ["integer", "null"],
+                    "description": "Only messages from the last N days.",
+                },
+                "since": {"type": ["string", "null"], "description": "ISO date lower bound."},
+                "until": {"type": ["string", "null"], "description": "ISO date upper bound."},
+                "limit": {"type": ["integer", "null"], "default": 15, "maximum": 60},
+                "semantic": {"type": ["boolean", "null"], "default": True},
             },
             "required": ["query"],
         },
@@ -323,20 +443,20 @@ READ_TOOLS = [
             "type": "object",
             "properties": {
                 "name": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Venue name; tolerant of typos and stylized spelling.",
                 },
-                "city": {"type": "string", "description": "e.g. Da Nang, Hoi An"},
+                "city": {"type": ["string", "null"], "description": "e.g. Da Nang, Hoi An"},
                 "place_type": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "bar, cafe, restaurant, rooftop, club, hotel, studio, yoga, gallery, coworking, community_space, beach_club, hostel, theatre",
                 },
                 "event_type": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "concert, live_music, dj_set, open_mic, jam, party, festival, quiz, board_games, film_screening, meetup, workshop, lecture, market, yoga, meditation, sound_healing, ecstatic_dance, retreat",
                 },
-                "min_mentions": {"type": "integer", "default": 1},
-                "limit": {"type": "integer", "default": 25, "maximum": 60},
+                "min_mentions": {"type": ["integer", "null"], "default": 1},
+                "limit": {"type": ["integer", "null"], "default": 25, "maximum": 60},
             },
         },
     ),
@@ -358,10 +478,10 @@ READ_TOOLS = [
             "type": "object",
             "properties": {
                 "chat_id": {"type": "integer"},
-                "days": {"type": "integer", "default": 7},
-                "since": {"type": "string"},
-                "until": {"type": "string"},
-                "limit": {"type": "integer", "default": 40, "maximum": 60},
+                "days": {"type": ["integer", "null"], "default": 7},
+                "since": {"type": ["string", "null"]},
+                "until": {"type": ["string", "null"]},
+                "limit": {"type": ["integer", "null"], "default": 40, "maximum": 60},
             },
             "required": ["chat_id"],
         },
@@ -386,15 +506,61 @@ READ_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "min_mentions": {"type": "integer", "default": 2},
-                "limit": {"type": "integer", "default": 25, "maximum": 60},
-                "include_known": {"type": "boolean", "default": False},
+                "min_mentions": {"type": ["integer", "null"], "default": 2},
+                "limit": {"type": ["integer", "null"], "default": 25, "maximum": 60},
+                "include_known": {"type": ["boolean", "null"], "default": False},
             },
         },
     ),
 ]
 
 WRITE_TOOLS = [
+    Tool(
+        name="resume_chat",
+        description=(
+            "Put a chat the account is ALREADY in back under live monitoring, or pause it. "
+            "Use when list_chats shows a chat as 'history-only' but you want new messages "
+            "watched again. Takes effect within about half a minute. Does not fetch old "
+            "messages — pair it with backfill_chat for those."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "integer", "description": "From list_chats."},
+                "mode": {
+                    "type": ["string", "null"],
+                    "enum": ["monitor", "recon", "paused", None],
+                    "description": (
+                        "monitor runs the full pipeline and can alert; recon stores messages "
+                        "with no alerts and no LLM cost; paused stops both. Defaults to monitor."
+                    ),
+                },
+            },
+            "required": ["chat_id"],
+        },
+    ),
+    Tool(
+        name="backfill_chat",
+        description=(
+            "Walk an already-joined chat's history backwards and store it. Use to fill a gap "
+            "for a chat that has been joined longer than it has been monitored. Runs in the "
+            "background at roughly 45,000 messages an hour, only while the daemon is idle, so "
+            "a big chat takes tens of minutes. Safe to call twice; asking for the same or "
+            "fewer days does nothing."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "integer", "description": "From list_chats."},
+                "days": {
+                    "type": ["integer", "null"],
+                    "description": "How far back to reach, in days. Defaults to 730.",
+                },
+                "label": {"type": ["string", "null"]},
+            },
+            "required": ["chat_id"],
+        },
+    ),
     Tool(
         name="queue_chat_join",
         description=(
@@ -410,9 +576,12 @@ WRITE_TOOLS = [
                     "type": "string",
                     "description": "Public username or t.me link, e.g. danangevents or https://t.me/danangevents",
                 },
-                "label": {"type": "string", "description": "Human-readable name for the queue."},
+                "label": {
+                    "type": ["string", "null"],
+                    "description": "Human-readable name for the queue.",
+                },
                 "target_days": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "default": 730,
                     "description": "How far back to download history.",
                 },
@@ -438,7 +607,7 @@ def build_server(tools: EidolonTools, *, writable: bool) -> Server:
         handler = getattr(tools, name, None)
         if handler is None or name not in {t.name for t in catalog}:
             raise ValueError(f"unknown tool: {name}")
-        args = dict(arguments or {})
+        args = supplied_arguments(arguments)
         positional: list[Any] = []
         for key in ("query", "chat_id", "chat_ref"):
             if key in args:
@@ -454,6 +623,7 @@ async def serve(profile: str) -> None:
     tools = EidolonTools(
         search_db=settings.search_db_path,
         scout_db=settings.scout_db_path,
+        live_db=settings.db_path,
         writable=writable,
     )
     server = build_server(tools, writable=writable)

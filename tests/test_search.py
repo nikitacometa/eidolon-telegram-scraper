@@ -703,8 +703,12 @@ class TestJoinRequestNormalization:
         from eidolon_mcp import READ_TOOLS, WRITE_TOOLS
 
         read_names = {t.name for t in READ_TOOLS}
-        assert "queue_chat_join" not in read_names
-        assert {t.name for t in WRITE_TOOLS} == {"queue_chat_join"}
+        assert not {"queue_chat_join", "resume_chat", "backfill_chat"} & read_names
+        assert {t.name for t in WRITE_TOOLS} == {
+            "queue_chat_join",
+            "resume_chat",
+            "backfill_chat",
+        }
 
 
 class HardStop(BaseException):

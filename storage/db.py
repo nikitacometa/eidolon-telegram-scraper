@@ -1466,3 +1466,69 @@ class Database:
             except BaseException:
                 await self.conn.rollback()
                 raise
+
+    async def resume_chat(
+        self,
+        *,
+        chat_id: int,
+        mode: ObservationMode = ObservationMode.MONITOR,
+        watcher_names: Sequence[str] | None = None,
+        title: str | None = None,
+    ) -> dict[str, object]:
+        """Put a chat back under observation and route it to policies.
+
+        Joining a chat already does this; this is for the chats that were joined
+        before the registry existed, or that were paused and are wanted back.
+        Without it such a chat is a member of the group whose messages Telegram
+        delivers and the daemon discards -- which is how two chats went quiet
+        for a week with nothing in the log to say so.
+
+        The revision counter is bumped for the same reason a watcher write bumps
+        it: routing lives in the daemon's memory, and a row nobody reloads is a
+        change that did not happen.
+        """
+        async with self._write_lock:
+            try:
+                await self.conn.execute(
+                    """
+                    INSERT INTO observed_chats (chat_id, mode, title, source)
+                    VALUES (?, ?, ?, 'manual')
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        mode = excluded.mode,
+                        title = COALESCE(excluded.title, observed_chats.title),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (chat_id, mode.value, title),
+                )
+
+                if watcher_names is None:
+                    # Default to whatever the rest of the monitored chats are
+                    # watched by, so a resumed chat behaves like its neighbours
+                    # instead of silently watching nothing.
+                    async with self.conn.execute(
+                        "SELECT DISTINCT watcher_name FROM chat_policy_bindings"
+                    ) as cursor:
+                        names = [str(row[0]) for row in await cursor.fetchall()]
+                else:
+                    names = list(watcher_names)
+
+                if mode is ObservationMode.MONITOR and names:
+                    await self.conn.executemany(
+                        """
+                        INSERT INTO chat_policy_bindings (chat_id, watcher_name, source)
+                        VALUES (?, ?, 'manual')
+                        ON CONFLICT(chat_id, watcher_name) DO NOTHING
+                        """,
+                        [(chat_id, name) for name in names],
+                    )
+                else:
+                    names = []
+
+                await self.conn.execute(
+                    "UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1"
+                )
+                await self.conn.commit()
+                return {"chat_id": chat_id, "mode": mode.value, "watchers": names}
+            except BaseException:
+                await self.conn.rollback()
+                raise

@@ -1,0 +1,246 @@
+"""The bridge's write tools: requests to the daemon, never actions on Telegram."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from eidolon_mcp import READ_TOOLS, WRITE_TOOLS, EidolonTools
+from storage.search import SearchDatabase
+
+LIVE_SCHEMA = """
+CREATE TABLE chats (chat_id INTEGER PRIMARY KEY, title TEXT);
+CREATE TABLE observed_chats (
+    chat_id INTEGER PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'monitor', title TEXT,
+    source TEXT NOT NULL DEFAULT 'config', job_id TEXT,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE chat_policy_bindings (
+    chat_id INTEGER NOT NULL, watcher_name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'config', job_id TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, watcher_name));
+CREATE TABLE agent_watchers_meta (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL DEFAULT 0);
+INSERT INTO agent_watchers_meta (id, generation) VALUES (1, 0);
+"""
+
+SCOUT_SCHEMA = """
+CREATE TABLE backfill_targets (
+    chat_id INTEGER PRIMARY KEY, label TEXT, target_days INTEGER NOT NULL DEFAULT 730,
+    oldest_message_id INTEGER, oldest_message_date TIMESTAMP,
+    messages_stored INTEGER NOT NULL DEFAULT 0, pages_done INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending', last_error TEXT, not_before TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, target_days INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
+"""
+
+
+@pytest.fixture
+def tools(tmp_path: Path) -> EidolonTools:
+    live, scout, search = tmp_path / "live.db", tmp_path / "scout.db", tmp_path / "search.db"
+    with sqlite3.connect(live) as conn:
+        conn.executescript(LIVE_SCHEMA)
+        conn.execute("INSERT INTO chats VALUES (-100, 'Близкие на Пангане')")
+        conn.execute(
+            "INSERT INTO observed_chats VALUES (-200, 'monitor', 'Дананг', 'config', NULL, NULL, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO chat_policy_bindings VALUES (-200, 'danang-signal', 'config', NULL, NULL)"
+        )
+    with sqlite3.connect(scout) as conn:
+        conn.executescript(SCOUT_SCHEMA)
+    SearchDatabase(search).connect()
+    return EidolonTools(search_db=search, scout_db=scout, live_db=live, writable=True)
+
+
+def _generation(tools: EidolonTools) -> int:
+    with sqlite3.connect(tools._live_db) as conn:
+        return int(conn.execute("SELECT generation FROM agent_watchers_meta").fetchone()[0])
+
+
+class TestResumeChat:
+    async def test_an_unobserved_chat_starts_being_monitored(self, tools: EidolonTools) -> None:
+        # The gap this closes: a chat the account is a member of, whose messages
+        # Telegram delivers and the daemon discards, with nothing in the log.
+        result = await tools.resume_chat(-100)
+        assert result["mode"] == "monitor"
+        with sqlite3.connect(tools._live_db) as conn:
+            row = conn.execute(
+                "SELECT mode, title FROM observed_chats WHERE chat_id=-100"
+            ).fetchone()
+        assert row == ("monitor", "Близкие на Пангане")
+
+    async def test_it_is_bound_to_the_same_watchers_as_its_neighbours(
+        self, tools: EidolonTools
+    ) -> None:
+        # A resumed chat bound to nothing is observed and still silent.
+        result = await tools.resume_chat(-100)
+        assert result["watchers"] == ["danang-signal"]
+        with sqlite3.connect(tools._live_db) as conn:
+            bound = conn.execute(
+                "SELECT watcher_name FROM chat_policy_bindings WHERE chat_id=-100"
+            ).fetchall()
+        assert bound == [("danang-signal",)]
+
+    async def test_the_daemon_is_told_to_reload(self, tools: EidolonTools) -> None:
+        # Routing lives in the daemon's memory; a row nobody reloads is a change
+        # that did not happen.
+        before = _generation(tools)
+        await tools.resume_chat(-100)
+        assert _generation(tools) > before
+
+    async def test_pausing_does_not_bind_anything(self, tools: EidolonTools) -> None:
+        result = await tools.resume_chat(-100, mode="paused")
+        assert result["watchers"] == []
+        with sqlite3.connect(tools._live_db) as conn:
+            assert (
+                conn.execute(
+                    "SELECT count(*) FROM chat_policy_bindings WHERE chat_id=-100"
+                ).fetchone()[0]
+                == 0
+            )
+
+    async def test_an_unknown_mode_is_refused(self, tools: EidolonTools) -> None:
+        with pytest.raises(ValueError, match="mode must be"):
+            await tools.resume_chat(-100, mode="watch-really-hard")
+
+    async def test_a_readonly_bridge_refuses(self, tmp_path: Path, tools: EidolonTools) -> None:
+        readonly = EidolonTools(
+            search_db=tools._search_db,
+            scout_db=tools._scout_db,
+            live_db=tools._live_db,
+            writable=False,
+        )
+        with pytest.raises(PermissionError):
+            await readonly.resume_chat(-100)
+
+
+class TestBackfillChat:
+    async def test_a_target_is_created(self, tools: EidolonTools) -> None:
+        result = await tools.backfill_chat(-100, days=365)
+        assert result["target_days"] == 365
+        assert result["previous"] is None
+        with sqlite3.connect(tools._scout_db) as conn:
+            row = conn.execute(
+                "SELECT target_days, state FROM backfill_targets WHERE chat_id=-100"
+            ).fetchone()
+        assert row == (365, "pending")
+
+    async def test_asking_again_for_less_does_nothing(self, tools: EidolonTools) -> None:
+        # Otherwise a second ask restarts a finished walk and re-spends the
+        # account's action budget on history already stored.
+        await tools.backfill_chat(-100, days=730)
+        with sqlite3.connect(tools._scout_db) as conn:
+            conn.execute("UPDATE backfill_targets SET state='complete' WHERE chat_id=-100")
+        await tools.backfill_chat(-100, days=90)
+        with sqlite3.connect(tools._scout_db) as conn:
+            row = conn.execute(
+                "SELECT target_days, state FROM backfill_targets WHERE chat_id=-100"
+            ).fetchone()
+        assert row == (730, "complete")
+
+    async def test_asking_for_more_reopens_a_finished_walk(self, tools: EidolonTools) -> None:
+        await tools.backfill_chat(-100, days=90)
+        with sqlite3.connect(tools._scout_db) as conn:
+            conn.execute("UPDATE backfill_targets SET state='complete' WHERE chat_id=-100")
+        await tools.backfill_chat(-100, days=730)
+        with sqlite3.connect(tools._scout_db) as conn:
+            row = conn.execute(
+                "SELECT target_days, state FROM backfill_targets WHERE chat_id=-100"
+            ).fetchone()
+        assert row == (730, "pending")
+
+    @pytest.mark.parametrize("days", [0, -1, 4000])
+    async def test_an_absurd_window_is_refused(self, tools: EidolonTools, days: int) -> None:
+        with pytest.raises(ValueError, match="days must be"):
+            await tools.backfill_chat(-100, days=days)
+
+    async def test_a_readonly_bridge_refuses(self, tools: EidolonTools) -> None:
+        readonly = EidolonTools(
+            search_db=tools._search_db,
+            scout_db=tools._scout_db,
+            live_db=tools._live_db,
+            writable=False,
+        )
+        with pytest.raises(PermissionError):
+            await readonly.backfill_chat(-100)
+
+
+class TestToolExposure:
+    def test_the_write_tools_are_not_in_the_read_only_catalogue(self) -> None:
+        # Julia's bridge registers READ_TOOLS only; a write tool leaking there
+        # would spend Nikita's Telegram action budget from her instance.
+        read_names = {tool.name for tool in READ_TOOLS}
+        assert "resume_chat" not in read_names
+        assert "backfill_chat" not in read_names
+
+    def test_every_write_tool_is_accounted_for(self) -> None:
+        assert {tool.name for tool in WRITE_TOOLS} == {
+            "queue_chat_join",
+            "resume_chat",
+            "backfill_chat",
+        }
+
+    @pytest.mark.parametrize("tool", WRITE_TOOLS + READ_TOOLS, ids=lambda t: t.name)
+    def test_optional_arguments_accept_null(self, tool: Any) -> None:
+        # A gpt-5.6 agent routinely passes null for arguments it is not using.
+        # An optional field typed as a bare scalar rejects that and wastes a turn
+        # on a validation error the model cannot read its way out of.
+        schema = tool.inputSchema
+        required = set(schema.get("required", []))
+        for name, spec in schema.get("properties", {}).items():
+            if name in required:
+                continue
+            declared = spec.get("type")
+            if declared is None:
+                continue
+            allowed = declared if isinstance(declared, list) else [declared]
+            assert "null" in allowed, f"{tool.name}.{name} is optional but rejects null"
+
+
+class TestNullArgumentHandling:
+    """The schemas accept null; the dispatch must make it mean 'not supplied'."""
+
+    def test_nulls_are_dropped(self) -> None:
+        from eidolon_mcp import supplied_arguments
+
+        assert supplied_arguments({"chat_id": -100, "days": None, "label": None}) == {
+            "chat_id": -100
+        }
+
+    def test_falsy_values_that_are_not_null_survive(self) -> None:
+        # 0 and "" are answers, not absences; dropping them would silently
+        # override a caller who meant them.
+        from eidolon_mcp import supplied_arguments
+
+        assert supplied_arguments({"limit": 0, "name": "", "semantic": False}) == {
+            "limit": 0,
+            "name": "",
+            "semantic": False,
+        }
+
+    def test_no_arguments_at_all_is_an_empty_mapping(self) -> None:
+        from eidolon_mcp import supplied_arguments
+
+        assert supplied_arguments(None) == {}
+
+    async def test_a_null_optional_reaches_the_handler_as_a_default(
+        self, tools: EidolonTools
+    ) -> None:
+        from eidolon_mcp import supplied_arguments
+
+        result = await tools.backfill_chat(
+            **supplied_arguments({"chat_id": -100, "days": None, "label": None})
+        )
+        assert result["target_days"] == 730
+
+    async def test_a_null_limit_does_not_break_a_search(self, tools: EidolonTools) -> None:
+        from eidolon_mcp import supplied_arguments
+
+        result = await tools.search_messages(
+            **supplied_arguments({"query": "концерт", "limit": None, "days": None})
+        )
+        assert result["result_count"] == 0  # empty index, but it answered
