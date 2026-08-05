@@ -71,10 +71,16 @@ form `--- message <id> ---`. They are unrelated to each other: a venue named in
 one says nothing about any other.
 
 Return one entry per message id you were given, in the order given, with
-message_id copied exactly. A message that names no venue still gets an entry,
-with an empty places list. Never merge two messages into one entry, never
+message_id copied exactly. Never merge two messages into one entry, never
 invent an id you were not given, and never attribute a venue to a message whose
 text does not name it.
+
+An entry is a slot, not a quota. Most of these messages name no venue at all,
+and for those the entry's places list must be empty. Filling a slot because it
+exists is the single worst thing you can do here: it puts a place into a
+permanent index on the strength of a message that never named one. When a
+message does not name a physical venue, return the entry with zero places and
+move on.
 """
 
 
