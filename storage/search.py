@@ -352,6 +352,41 @@ class SearchDatabase:
             )
             logger.info("Migration: added extraction_state.attempts")
 
+        # 'duplicate' joined the status set when crosspost dedup landed. A CHECK
+        # constraint cannot be altered in place, so the table is rebuilt -- the
+        # rows are cheap to move and re-paying for the extraction they record is
+        # not.
+        ddl = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='extraction_state'"
+        ).fetchone()
+        if ddl and "'duplicate'" not in ddl["sql"]:
+            self.conn.executescript(
+                """
+                PRAGMA foreign_keys=off;
+                BEGIN;
+                ALTER TABLE extraction_state RENAME TO extraction_state_old;
+                CREATE TABLE extraction_state (
+                    corpus_id INTEGER PRIMARY KEY
+                        REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'extracted', 'no_venue', 'skipped',
+                                         'error', 'duplicate')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    attempted_at TIMESTAMP,
+                    error TEXT
+                );
+                INSERT INTO extraction_state (corpus_id, status, attempts, attempted_at, error)
+                    SELECT corpus_id, status, attempts, attempted_at, error
+                      FROM extraction_state_old;
+                DROP TABLE extraction_state_old;
+                CREATE INDEX IF NOT EXISTS idx_extraction_pending
+                    ON extraction_state(status, corpus_id);
+                COMMIT;
+                PRAGMA foreign_keys=on;
+                """
+            )
+            logger.info("Migration: extraction_state now accepts 'duplicate'")
+
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
@@ -593,6 +628,74 @@ class SearchDatabase:
              WHERE corpus_id NOT IN (SELECT corpus_id FROM extraction_state)
             """
         )
+        self._mark_crosspost_duplicates()
+
+    def _mark_crosspost_duplicates(self) -> None:
+        """Send one message per identical text to the model, not all of them.
+
+        A quarter of this corpus is the same announcement posted into several
+        chats. Identical text yields an identical answer, so paying for each
+        copy buys nothing -- measured at 4,808 of 34,018 settled calls, 14%.
+        The copies are settled from the original by ``propagate_duplicates``
+        once it returns, which keeps every crosspost's own place_mentions row
+        and leaves the venue index byte-identical to what per-message
+        extraction produced.
+        """
+        self.conn.execute(
+            """
+            UPDATE extraction_state SET status = 'duplicate'
+             WHERE status = 'pending'
+               AND corpus_id NOT IN (
+                   SELECT min(m.corpus_id) FROM corpus_messages m
+                     JOIN extraction_state e USING(corpus_id)
+                    WHERE e.status IN ('pending', 'extracted', 'no_venue')
+                    GROUP BY m.content_hash
+               )
+            """
+        )
+
+    def propagate_duplicates(self) -> int:
+        """Settle crossposts from the copy that was actually extracted.
+
+        Runs after extraction rather than inside it: the original may still be
+        pending when a duplicate is first seen, and a duplicate whose original
+        later fails must stay unsettled rather than inherit an error as an
+        answer.
+        """
+        conn = self.conn
+        twins = conn.execute(
+            """
+            SELECT d.corpus_id AS dup_id, src.corpus_id AS src_id, e.status AS status
+              FROM extraction_state d
+              JOIN corpus_messages m ON m.corpus_id = d.corpus_id
+              JOIN corpus_messages src ON src.content_hash = m.content_hash
+              JOIN extraction_state e ON e.corpus_id = src.corpus_id
+             WHERE d.status = 'duplicate'
+               AND e.status IN ('extracted', 'no_venue')
+             GROUP BY d.corpus_id
+            """
+        ).fetchall()
+        settled = 0
+        for row in twins:
+            conn.execute(
+                """
+                INSERT INTO place_mentions (place_id, corpus_id, event_types, evidence_quote,
+                                            confidence, extracted_by)
+                SELECT place_id, ?, event_types, evidence_quote, confidence, extracted_by
+                  FROM place_mentions WHERE corpus_id = ?
+                ON CONFLICT(place_id, corpus_id) DO NOTHING
+                """,
+                (row["dup_id"], row["src_id"]),
+            )
+            conn.execute(
+                "UPDATE extraction_state SET status = ?, attempted_at = ? WHERE corpus_id = ?",
+                (row["status"], _now(), row["dup_id"]),
+            )
+            settled += 1
+        if settled:
+            self._refresh_place_counts()
+            conn.commit()
+        return settled
 
     def _resolve_sender_names(self) -> int:
         """Give a name to archived messages whose sender is named elsewhere.
@@ -676,6 +779,43 @@ class SearchDatabase:
             if len(rows) < batch_size:
                 break
         return written
+
+    def _refresh_place_counts(self) -> None:
+        """Recount mentions and re-derive the seen-dates for every place."""
+        self.conn.execute(
+            """
+            UPDATE places SET
+                mention_count = (SELECT count(*) FROM place_mentions pm
+                                  WHERE pm.place_id = places.place_id),
+                first_seen_at = (SELECT min(m.date) FROM place_mentions pm
+                                   JOIN corpus_messages m USING(corpus_id)
+                                  WHERE pm.place_id = places.place_id),
+                last_seen_at  = (SELECT max(m.date) FROM place_mentions pm
+                                   JOIN corpus_messages m USING(corpus_id)
+                                  WHERE pm.place_id = places.place_id)
+            """
+        )
+
+    def record_extraction_cost(
+        self,
+        *,
+        model: str,
+        calls: int,
+        messages: int,
+        input_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Store what one extraction run actually spent."""
+        self.conn.execute(
+            """
+            INSERT INTO extraction_cost (model, calls, messages, input_tokens,
+                                         cached_input_tokens, output_tokens)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (model, calls, messages, input_tokens, cached_input_tokens, output_tokens),
+        )
+        self.conn.commit()
 
     def contacts_for_places(
         self,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from openai import NOT_GIVEN, AsyncOpenAI
@@ -144,6 +145,31 @@ class EmbeddingIndexer:
         return total
 
 
+@dataclass
+class TokenUsage:
+    """What a run actually spent, as reported by the provider.
+
+    Every response carries these counts and they were being discarded, which
+    left prompt length as the only basis for any claim about the bill. A number
+    derived from counting characters is a guess; this is the receipt.
+    """
+
+    calls: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+
+    def add(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        self.calls += 1
+        self.input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+        self.output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+        details = getattr(usage, "prompt_tokens_details", None)
+        self.cached_input_tokens += int(getattr(details, "cached_tokens", 0) or 0)
+
+
 class PlaceExtractor:
     """Fills ``places``/``place_mentions`` from messages queued for extraction."""
 
@@ -161,6 +187,7 @@ class PlaceExtractor:
         self._model = model or settings.extraction_model
         self._concurrency = concurrency
         self._chunk_size = chunk_size
+        self._usage = TokenUsage()
 
     async def run(self, *, limit: int = 500) -> dict[str, int]:
         """Extract venues from up to ``limit`` queued messages.
@@ -206,7 +233,31 @@ class PlaceExtractor:
                 venues,
                 errors,
             )
-        return {"processed": processed, "venues": venues, "errors": errors}
+        if self._usage.calls:
+            self._search.record_extraction_cost(
+                model=self._model,
+                calls=self._usage.calls,
+                messages=processed,
+                input_tokens=self._usage.input_tokens,
+                cached_input_tokens=self._usage.cached_input_tokens,
+                output_tokens=self._usage.output_tokens,
+            )
+            logger.info(
+                "Extraction spend: %d calls, %d input tokens (%d from cache), %d output",
+                self._usage.calls,
+                self._usage.input_tokens,
+                self._usage.cached_input_tokens,
+                self._usage.output_tokens,
+            )
+        return {
+            "processed": processed,
+            "venues": venues,
+            "errors": errors,
+            "calls": self._usage.calls,
+            "input_tokens": self._usage.input_tokens,
+            "cached_input_tokens": self._usage.cached_input_tokens,
+            "output_tokens": self._usage.output_tokens,
+        }
 
     async def _extract(self, row: Any) -> tuple[int, list[dict[str, Any]], str | None]:
         text = (row["text"] or "")[:MAX_EXTRACT_CHARS]
@@ -233,6 +284,7 @@ class PlaceExtractor:
         except Exception as exc:
             return row["corpus_id"], [], f"{type(exc).__name__}: {exc}"
 
+        self._usage.add(response)
         parsed = response.choices[0].message.parsed
         if parsed is None:
             # A refusal or a truncated response. Both are real outcomes worth
@@ -279,5 +331,9 @@ async def build_index(
         report["embedded"] = await EmbeddingIndexer(search).run()
     if do_extract:
         report["extraction"] = await PlaceExtractor(search).run(limit=extract_limit)
+        # Crossposts settle from whichever copy was actually sent, so this runs
+        # after extraction rather than inside it: the original may still have
+        # been pending when the copy was queued.
+        report["duplicates_settled"] = search.propagate_duplicates()
     report["status"] = search.status()
     return report

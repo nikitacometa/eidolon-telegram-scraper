@@ -93,14 +93,14 @@ def sources(tmp_path: Path) -> tuple[Path, Path]:
                 (
                     -200,
                     10,
-                    "Концерт в баре Corner Music Bar в пятницу вечером, акустический лайв и каверы",
+                    "Концерт в баре Corner Music Bar в эту пятницу вечером, акустический лайв, каверы любимых песен и тёплая компания",
                     "2026-07-01T10:00:00+00:00",
                     "h1",
                 ),
                 (
                     -200,
                     11,
-                    "Концерт в баре Corner Music Bar в пятницу вечером, акустический лайв и каверы",
+                    "Концерт в баре Corner Music Bar в эту пятницу вечером, акустический лайв, каверы любимых песен и тёплая компания",
                     "2026-07-01T10:05:00+00:00",
                     "h1",
                 ),
@@ -1438,3 +1438,106 @@ class TestSenderNameResolutionScales:
             )
         }
         assert "idx_corpus_sender" in indexes
+
+
+class TestCrosspostDedup:
+    """The same announcement in five chats is one paid call, not five."""
+
+    def _crosspost(self, search: SearchDatabase, chats: list[int], text: str) -> list[int]:
+        ids = []
+        for chat in chats:
+            cur = search.conn.execute(
+                """
+                INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, text, date,
+                                             content_hash)
+                VALUES ('scout', ?, 1, ?, '2026-07-01T10:00:00+00:00', ?)
+                """,
+                (chat, text, content_digest(text)),
+            )
+            ids.append(int(cur.lastrowid or 0))
+        search.conn.commit()
+        return ids
+
+    def test_only_one_copy_is_queued_for_the_model(self, search: SearchDatabase) -> None:
+        text = "Концерт в баре Corner Music Bar в эту пятницу вечером, акустический лайв, каверы любимых песен и тёплая компания"
+        self._crosspost(search, [-100, -200, -300], text)
+
+        search._seed_extraction_state()
+        search._mark_crosspost_duplicates()
+
+        counts = dict(
+            search.conn.execute(
+                "SELECT status, count(*) FROM extraction_state GROUP BY status"
+            ).fetchall()
+        )
+        assert counts.get("pending") == 1
+        assert counts.get("duplicate") == 2
+
+    def test_every_crosspost_still_gets_its_own_mention(self, search: SearchDatabase) -> None:
+        # The saving must be invisible in the result: dropping the copies'
+        # place_mentions would quietly change every venue's mention count.
+        text = "Открытый микрофон в Sound Cafe в эту субботу, приходите петь, читать стихи и играть на своих инструментах"
+        ids = self._crosspost(search, [-100, -200, -300], text)
+        search._seed_extraction_state()
+        search._mark_crosspost_duplicates()
+        paid = search.conn.execute(
+            "SELECT corpus_id FROM extraction_state WHERE status='pending'"
+        ).fetchone()["corpus_id"]
+
+        search.record_extraction(
+            paid,
+            [
+                {
+                    "name": "Sound Cafe",
+                    "place_type": "cafe",
+                    "city_area": "Da Nang",
+                    "event_types": ["open_mic"],
+                    "evidence": "Открытый микрофон в Sound Cafe",
+                    "confidence": 0.9,
+                }
+            ],
+            model="test",
+        )
+        settled = search.propagate_duplicates()
+
+        assert settled == 2
+        mentions = search.conn.execute(
+            "SELECT corpus_id FROM place_mentions ORDER BY corpus_id"
+        ).fetchall()
+        assert [m["corpus_id"] for m in mentions] == sorted(ids)
+        place = search.conn.execute("SELECT mention_count FROM places").fetchone()
+        assert place["mention_count"] == 3
+        assert not search.conn.execute(
+            "SELECT 1 FROM extraction_state WHERE status='duplicate'"
+        ).fetchall()
+
+    def test_a_duplicate_waits_while_its_original_is_unsettled(
+        self, search: SearchDatabase
+    ) -> None:
+        # Inheriting an error as if it were an answer would bake a provider
+        # outage into the venue index permanently.
+        text = "Джем сессия в Crossroad Bar в этот четверг вечером, приносите свои инструменты, вход свободный для всех"
+        self._crosspost(search, [-100, -200], text)
+        search._seed_extraction_state()
+        search._mark_crosspost_duplicates()
+        paid = search.conn.execute(
+            "SELECT corpus_id FROM extraction_state WHERE status='pending'"
+        ).fetchone()["corpus_id"]
+        search.record_extraction(paid, [], model="test", error="APITimeoutError: timed out")
+
+        assert search.propagate_duplicates() == 0
+        assert search.conn.execute(
+            "SELECT count(*) FROM extraction_state WHERE status='duplicate'"
+        ).fetchone()[0] == 1
+
+    def test_distinct_texts_are_never_collapsed(self, search: SearchDatabase) -> None:
+        self._crosspost(search, [-100], "Концерт в Sound Cafe в эту пятницу вечером, живая музыка, каверы и приятная публика, начало в семь")
+        self._crosspost(search, [-200], "Экстатик дэнс в Green Flow в эту субботу на закате, живая перкуссия и вокал, площадка прямо у реки")
+
+        search._seed_extraction_state()
+        search._mark_crosspost_duplicates()
+
+        pending = search.conn.execute(
+            "SELECT count(*) FROM extraction_state WHERE status='pending'"
+        ).fetchone()[0]
+        assert pending == 2

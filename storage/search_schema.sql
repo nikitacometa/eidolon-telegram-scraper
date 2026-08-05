@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS chat_references (
 CREATE TABLE IF NOT EXISTS extraction_state (
     corpus_id INTEGER PRIMARY KEY REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(status IN ('pending', 'extracted', 'no_venue', 'skipped', 'error')),
+        CHECK(status IN ('pending', 'extracted', 'no_venue', 'skipped', 'error', 'duplicate')),
     -- A provider timeout is not a verdict about the message. Without a retry
     -- the row stays 'error' forever and becomes a permanent hole in the venue
     -- index -- invisible, because an empty answer looks the same as an honest
@@ -236,3 +236,19 @@ CREATE TABLE IF NOT EXISTS message_contacts (
 
 CREATE INDEX IF NOT EXISTS idx_message_contacts_value ON message_contacts(kind, value);
 CREATE INDEX IF NOT EXISTS idx_message_contacts_corpus ON message_contacts(corpus_id);
+
+-- What each extraction pass actually cost. The token counts come back in every
+-- API response and were being thrown away, so every statement about this
+-- system's bill was an estimate derived from prompt length. One row per run.
+CREATE TABLE IF NOT EXISTS extraction_cost (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0,
+    messages INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    -- Read back from cache at a tenth of the input rate. Zero until the stable
+    -- prefix crosses the provider's minimum, which is worth being able to see.
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
