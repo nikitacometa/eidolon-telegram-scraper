@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-056**
+- Next available ID: **E-060**
 
 ---
 
@@ -25,6 +25,10 @@
 | E-053 | Stop reading a short history page as the end of a chat | done | high | `len(raw) < 100` ended the walk mid-chat; only an empty page proves the bottom. Re-ran the three suspect targets — Telegram returned empty pages, so nothing was recoverable below their stop points, but the truncation class is closed and `complete` vs `exhausted` now means what it says |
 | E-054 | Mine contact handles out of message text | done | high | `message_contacts` + `extract_contacts()`: 8,328 rows, 2,810 distinct — 1,484 Telegram handles, 984 map links, 211 phones. Attached to venues through `place_mentions`, surfaced by `search_places` as `contacts` and `posted_by` |
 | E-055 | Merge duplicate places | todo | high | Measured 2026-08-05: 152 rows in 71 exact-token-set collisions and 600 containment pairs. `AUM` alone is split across 5 rows (`AUM`, `АУМ`, `AUM centre`, `AUM Sound Healing Center`, `AUM Sound Center`), so one venue ranks as five. Auto-merge is unsafe as-is — `Indriya Retreat Phangan` and `Indriya Retreat` are different places, and `Студия` is a generic word extracted as a name |
+| E-056 | Cut extraction spend without touching quality | done | high | Measured: the whole bill is the extractor, and it is burst-driven — 19,887 calls on one backfill day (~$5) against 3-4/hour at rest. Landed: token accounting (`extraction_cost`), crosspost dedup (14.1% of calls were on text already extracted), and packing 20 messages per request (233 input tokens/message against 980, measured in production). Held-out check on 120 labelled messages: pack 1 and pack 20 are indistinguishable — 0 invented venues, 100% of empty messages still empty in both |
+| E-057 | Stop extracting venues from the chat header | done | critical | The `Chat:` line of the prompt was being read as content: 24 mentions had `Chat: …` as their evidence, 23 of them a phantom `Nu Arrows` created by a join label I wrote by hand. On the 60 newest messages marked no_venue this fabricated a venue in 26 under the batch prompt and 7 under the single-message prompt; both are 0 now. The polluted labels are cleaned and the prompt states the header is metadata |
+| E-058 | Confirm prompt caching engages on the next backfill | todo | medium | The fixed prefix reached ~1,340 tokens once the batch instruction landed, crossing the 1,024-token minimum, so reads should bill at 0.1×. `extraction_cost.cached_input_tokens` was 0 on the only run since (a cache write, and the backlog drained before a second). Verify on the next chat join rather than assuming |
+| E-059 | Decide whether a vector pre-filter is worth its recall cost | todo | medium | A logistic probe over the existing corpus embeddings cuts 55% of calls at 98% recall (measured 2026-08-05), but on a RANDOM split — crossposted announcements leak between train and test, so the number is optimistic. Re-measure with a split by chat and by time before shipping. Not needed to reach the cost target |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
 
