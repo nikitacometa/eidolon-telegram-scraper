@@ -1428,7 +1428,6 @@ class TestSenderNameResolutionScales:
         assert filled == 20_000
         assert elapsed < 10, f"took {elapsed:.1f}s — the fill is scanning per row"
 
-
     def test_the_sender_index_exists(self, search: SearchDatabase) -> None:
         # Dropping it does not break a query, it makes the name fill silently
         # never finish, which is indistinguishable from having nothing to fill.
