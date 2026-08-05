@@ -205,9 +205,13 @@ class TelegramCrawler:
             messages=tuple(messages),
             links=tuple(links),
             next_offset_id=oldest,
-            # A short page means Telegram has nothing older to give; crossing
-            # the lookback window means we no longer want what it has.
-            exhausted=len(raw) < HISTORY_PAGE_SIZE or crossed_cutoff,
+            # Only an empty page proves Telegram has nothing older. A SHORT
+            # page does not: getHistory returns fewer than `limit` in the
+            # middle of a chat whose id range is sparse with deletions, and
+            # reading that as the end truncated one chat at message 4879 of
+            # 6939 while marking it complete. Crossing the lookback window is
+            # the other ending: there is more, we no longer want it.
+            exhausted=not raw or crossed_cutoff,
         )
 
 

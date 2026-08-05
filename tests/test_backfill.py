@@ -70,6 +70,30 @@ class FakeHistory:
         )
 
 
+class ShortPageThenMore(FakeHistory):
+    """A chat that hands back one undersized page while more history remains.
+
+    Models the sparse-id-range case: the requested window covers a stretch
+    where most ids were deleted, so Telegram fills the page with what exists
+    rather than reaching further back for the rest.
+    """
+
+    def __init__(self, *, total: int, short_at_offset: int, short_size: int) -> None:
+        super().__init__(total=total)
+        self.short_at_offset = short_at_offset
+        self.short_size = short_size
+
+    async def __call__(self, request: object) -> object:
+        assert isinstance(request, GetHistoryRequest)
+        original = self.page_size
+        if request.offset_id == self.short_at_offset:
+            self.page_size = self.short_size
+        try:
+            return await super().__call__(request)
+        finally:
+            self.page_size = original
+
+
 def _worker(
     scout: ScoutDatabase,
     client: object,
@@ -154,18 +178,41 @@ async def test_pages_advance_the_cursor(scout: ScoutDatabase) -> None:
     assert client.calls == [0, 151]
 
 
-async def test_target_completes_when_history_runs_out(scout: ScoutDatabase) -> None:
-    """A short page means there is nothing older to ask for."""
+async def test_target_is_exhausted_when_history_runs_out(scout: ScoutDatabase) -> None:
+    """Only an empty page ends the walk, and it ends it as exhausted."""
     client = FakeHistory(total=30)
     worker = _worker(scout, client)
     await scout.add_backfill_target(chat_id=CHAT, target_days=730)
 
     assert await worker.run_once()
+    # The first page was short but not empty, so it settles nothing.
+    assert await scout.next_backfill_target() is not None
+    assert await worker.run_once()
 
     assert await scout.next_backfill_target() is None
     targets = await scout.backfill_targets()
-    assert targets[0].state is BackfillState.COMPLETE
+    assert targets[0].state is BackfillState.EXHAUSTED
     assert targets[0].messages_stored == 30
+
+
+async def test_a_short_page_mid_history_does_not_end_the_walk(scout: ScoutDatabase) -> None:
+    """Telegram returns short pages mid-chat; reading one as the end truncates.
+
+    Observed in production: `Дананг Объявления` stopped at message 4879 of
+    6939 and was recorded complete, because a page came back with 66 of the
+    100 requested and that was taken for the bottom of the chat.
+    """
+    client = ShortPageThenMore(total=250, short_at_offset=151, short_size=40)
+    worker = _worker(scout, client)
+    await scout.add_backfill_target(chat_id=CHAT, target_days=730)
+
+    for _ in range(10):
+        if not await worker.run_once():
+            break
+
+    targets = await scout.backfill_targets()
+    assert targets[0].state is BackfillState.EXHAUSTED
+    assert targets[0].messages_stored == 250, "the walk stopped at the short page"
 
 
 async def test_least_advanced_target_goes_first(scout: ScoutDatabase) -> None:
