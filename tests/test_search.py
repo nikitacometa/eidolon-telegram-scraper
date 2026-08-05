@@ -1327,3 +1327,51 @@ class TestAuthorsForPlaces:
 
         assert len(authors) == 1
         assert authors[0]["posts"] == 2
+
+
+class TestSenderNames:
+    """History pages arrive without names; the live stream has them."""
+
+    def test_an_archived_message_takes_the_name_its_sender_has_elsewhere(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        with sqlite3.connect(sources[0]) as conn:
+            conn.execute(
+                "INSERT INTO messages (telegram_msg_id, chat_id, sender_id, sender_name, text, date)"
+                " VALUES (99, -100, 4242, 'Аня Организатор',"
+                " 'Открытый микрофон в субботу, приходите петь, вход свободный, начало в семь', ?)",
+                ("2026-08-03T10:00:00+00:00",),
+            )
+        with sqlite3.connect(sources[1]) as conn:
+            conn.execute(
+                "INSERT INTO scout_messages (chat_id, telegram_msg_id, sender_id, sender_name,"
+                " text, date, content_hash) VALUES (-200, 77, 4242, NULL,"
+                " 'Концерт в пятницу, акустика, приходите послушать живую музыку', ?, 'hx')",
+                ("2026-07-01T10:00:00+00:00",),
+            )
+
+        _sync(search, sources)
+
+        archived = search.conn.execute(
+            "SELECT sender_name FROM corpus_messages WHERE chat_id = -200 AND telegram_msg_id = 77"
+        ).fetchone()
+        assert archived["sender_name"] == "Аня Организатор"
+
+    def test_a_sender_named_nowhere_stays_anonymous(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        # Inventing a name would be worse than admitting we do not have one.
+        with sqlite3.connect(sources[1]) as conn:
+            conn.execute(
+                "INSERT INTO scout_messages (chat_id, telegram_msg_id, sender_id, sender_name,"
+                " text, date, content_hash) VALUES (-200, 78, 999, NULL,"
+                " 'Джем сессия в баре в четверг вечером, приносите инструменты', ?, 'hy')",
+                ("2026-07-02T10:00:00+00:00",),
+            )
+
+        _sync(search, sources)
+
+        row = search.conn.execute(
+            "SELECT sender_name FROM corpus_messages WHERE chat_id = -200 AND telegram_msg_id = 78"
+        ).fetchone()
+        assert row["sender_name"] is None

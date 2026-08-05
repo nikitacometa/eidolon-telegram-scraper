@@ -428,6 +428,7 @@ class SearchDatabase:
             }
             self._refresh_chat_metadata()
             self._seed_extraction_state()
+            stats["named"] = self._resolve_sender_names()
             stats["contacts"] = self._extract_contacts()
             conn.commit()
         finally:
@@ -592,6 +593,38 @@ class SearchDatabase:
              WHERE corpus_id NOT IN (SELECT corpus_id FROM extraction_state)
             """
         )
+
+    def _resolve_sender_names(self) -> int:
+        """Give a name to archived messages whose sender is named elsewhere.
+
+        History pages used to arrive without their senders' names, so most of
+        the archive is anonymous while the same people are named in the live
+        stream. One id seen with a name anywhere names every one of that
+        person's messages, which is what makes "who keeps announcing events
+        here" answerable over two years instead of over last week.
+
+        The crawler now records the name at capture time, so this shrinks to
+        nothing for anything fetched from here on.
+        """
+        cursor = self.conn.execute(
+            """
+            UPDATE corpus_messages AS target
+               SET sender_name = (
+                   SELECT source.sender_name FROM corpus_messages AS source
+                    WHERE source.sender_id = target.sender_id
+                      AND source.sender_name IS NOT NULL
+                    ORDER BY source.date DESC LIMIT 1
+               )
+             WHERE target.sender_name IS NULL
+               AND target.sender_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM corpus_messages AS source
+                    WHERE source.sender_id = target.sender_id
+                      AND source.sender_name IS NOT NULL
+               )
+            """
+        )
+        return cursor.rowcount if cursor.rowcount > 0 else 0
 
     def _extract_contacts(self, *, batch_size: int = 20000) -> int:
         """Mine contact handles out of every message not yet scanned.

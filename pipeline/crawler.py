@@ -166,6 +166,11 @@ class TelegramCrawler:
         messages: list[ScoutMessage] = []
         links: list[ChatLink] = []
         seen_links: set[str] = set()
+        # A history page carries its senders in a side list, not on the
+        # messages. Dropping it made every backfilled message anonymous, so
+        # "who keeps announcing events here" was answerable over the few
+        # thousand live messages and not over the sixty thousand archived ones.
+        senders = _sender_names(response)
 
         for item in raw:
             message_id = getattr(item, "id", None)
@@ -180,13 +185,15 @@ class TelegramCrawler:
             forward = getattr(item, "fwd_from", None)
             forward_peer = getattr(forward, "from_id", None)
 
+            sender_id = _peer_user_id(getattr(item, "from_id", None))
             messages.append(
                 ScoutMessage(
                     chat_id=chat_id,
                     telegram_msg_id=int(message_id),
                     date=str(getattr(item, "date", "")),
                     text=text,
-                    sender_id=_peer_user_id(getattr(item, "from_id", None)),
+                    sender_id=sender_id,
+                    sender_name=senders.get(sender_id),
                     entities=[],
                     forward_chat_id=_peer_channel_id(forward_peer),
                     forward_message_id=_optional_int(getattr(forward, "channel_post", None)),
@@ -213,6 +220,20 @@ class TelegramCrawler:
             # the other ending: there is more, we no longer want it.
             exhausted=not raw or crossed_cutoff,
         )
+
+
+def _sender_names(response: object) -> dict[int, str]:
+    """Map user id to a display name from the page's side list of users."""
+    names: dict[int, str] = {}
+    for user in getattr(response, "users", ()) or ():
+        user_id = _optional_int(getattr(user, "id", None))
+        if user_id is None:
+            continue
+        parts = [getattr(user, "first_name", None), getattr(user, "last_name", None)]
+        label = " ".join(part for part in parts if part) or getattr(user, "username", None)
+        if label:
+            names[user_id] = label
+    return names
 
 
 def _optional_int(value: object) -> int | None:

@@ -330,3 +330,33 @@ async def test_worker_stops_promptly_on_shutdown(scout: ScoutDatabase) -> None:
     await asyncio.wait_for(task, timeout=2.0)
 
     assert task.done()
+
+
+class NamedHistory(FakeHistory):
+    """A history page that carries its senders the way Telegram does."""
+
+    async def __call__(self, request: object) -> object:
+        page = await super().__call__(request)
+        for index, message in enumerate(page.messages):
+            message.from_id = SimpleNamespace(user_id=500 + (index % 2))
+        page.users = [
+            SimpleNamespace(id=500, first_name="Аня", last_name="Организатор", username="anya"),
+            SimpleNamespace(id=501, first_name=None, last_name=None, username="quiet_one"),
+        ]
+        return page
+
+
+async def test_backfilled_messages_carry_their_senders_name(scout: ScoutDatabase) -> None:
+    """Names ride in the page's side list, not on the messages themselves."""
+    worker = _worker(scout, NamedHistory(total=4))
+    await scout.add_backfill_target(chat_id=CHAT, target_days=730)
+
+    await worker.run_once()
+
+    rows = await scout.conn.execute_fetchall(
+        "SELECT sender_id, sender_name FROM scout_messages ORDER BY telegram_msg_id"
+    )
+    names = {row[0]: row[1] for row in rows}
+    assert names[500] == "Аня Организатор"
+    # No first or last name: the username is the only thing left to show.
+    assert names[501] == "quiet_one"
