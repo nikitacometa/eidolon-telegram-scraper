@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-053**
+- Next available ID: **E-056**
 
 ---
 
@@ -19,9 +19,12 @@
 | E-018 | Live test: summary digest at 20:00 ICT | todo | medium | Verify daily summary arrives tonight |
 | E-048 | Searchable corpus over both message stores | done | critical | `eidolon_search.db`: union of `messages` + `scout_messages`, FTS5 (unicode61 + prefix) and 512-dim embeddings, crosspost rollup. 21,533 messages, refreshed by `eidolon-index.timer` every 10 min |
 | E-049 | Fix the zero-alert cascade | done | critical | Measured: L1 dropped 56% of real event announcements and L2 rejected the rest against bare-keyword references. Now L1 is a negative-only gate and L2 has 25 sentence examples at threshold 0.34 — 90.6% end-to-end recall on a held-out set of 64 real announcements, ~16 L3 calls/day |
-| E-050 | Rebind the Phangan chats or retire them | todo | high | Telethon still receives updates for `Близкие на Пангане` (2776 msgs) and `Подслушано Панган`; neither is in `observed_chats`, so ingest has silently dropped them since the 2026-07-29 restart |
+| E-050 | Rebind the Phangan chats or retire them | done | high | Both rebound via `resume_chat` and backfilled to the 730-day horizon (43,695 + 6,373 messages). Live ingest confirmed 2026-08-05 by arrival, not by config: 11 messages in 24h |
 | E-051 | Run discovery for the first time | todo | high | `telegram_actions` has only `join` and `history_page` — zero `hashtag_search`, `recommendations` or `contacts_search` ever. All 14 joins came from a hand-written seed list, and the queue has been empty since 2026-08-02 |
 | E-052 | Fix `ReconRunner` history storage | todo | high | Pre-existing on main: `test_a_topic_becomes_joined_chats_with_history` and `test_links_in_history_become_next_wave_candidates` fail — the runner joins but stores 0 messages, so snowball never seeds the next wave. `BackfillWorker` is unaffected |
+| E-053 | Stop reading a short history page as the end of a chat | done | high | `len(raw) < 100` ended the walk mid-chat; only an empty page proves the bottom. Re-ran the three suspect targets — Telegram returned empty pages, so nothing was recoverable below their stop points, but the truncation class is closed and `complete` vs `exhausted` now means what it says |
+| E-054 | Mine contact handles out of message text | done | high | `message_contacts` + `extract_contacts()`: 8,328 rows, 2,810 distinct — 1,484 Telegram handles, 984 map links, 211 phones. Attached to venues through `place_mentions`, surfaced by `search_places` as `contacts` and `posted_by` |
+| E-055 | Merge duplicate places | todo | high | Measured 2026-08-05: 152 rows in 71 exact-token-set collisions and 600 containment pairs. `AUM` alone is split across 5 rows (`AUM`, `АУМ`, `AUM centre`, `AUM Sound Healing Center`, `AUM Sound Center`), so one venue ranks as five. Auto-merge is unsafe as-is — `Indriya Retreat Phangan` and `Indriya Retreat` are different places, and `Студия` is a generic word extracted as a name |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
 
