@@ -759,7 +759,7 @@ class TestChunkedExtraction:
         from pipeline.indexer import PlaceExtractor
 
         self._queue(search, 12)
-        extractor = PlaceExtractor(search, client=object(), chunk_size=4, concurrency=2)
+        extractor = PlaceExtractor(search, client=object(), chunk_size=4, concurrency=2, pack_size=1)
 
         async def fake(row: object) -> tuple[int, list[dict[str, object]], str | None]:
             return (
@@ -813,12 +813,12 @@ class TestChunkedExtraction:
             seen.append(row["corpus_id"])  # type: ignore[index]
             return (row["corpus_id"], [], None)  # type: ignore[index]
 
-        first = PlaceExtractor(search, client=object(), chunk_size=3)
+        first = PlaceExtractor(search, client=object(), chunk_size=3, pack_size=1)
         first._extract = fake  # type: ignore[method-assign]
         await first.run(limit=6)
         assert len(seen) == 6
 
-        second = PlaceExtractor(search, client=object(), chunk_size=3)
+        second = PlaceExtractor(search, client=object(), chunk_size=3, pack_size=1)
         second._extract = fake  # type: ignore[method-assign]
         assert (await second.run(limit=6))["processed"] == 0
         assert len(seen) == 6  # no message paid for twice

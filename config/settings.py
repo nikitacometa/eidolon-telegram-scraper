@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     # tens of thousands of messages where "no venue" is the common correct
     # answer. It gets its own field so the two are not forced to share a model.
     extraction_model: str = "gpt-5.6-luna"
+    # Messages per extraction request. Measured on this corpus: a one-message
+    # request is 980 input tokens of which 869 are the system prompt and the
+    # schema, so the fixed part was being paid 19,887 times on a backfill day.
+    # Packing amortises it. Above ~20 the saving flattens, because what remains
+    # is per-message text and per-message output, and the attribution risk keeps
+    # growing. Set to 1 to restore one-message-per-call.
+    extraction_pack_size: int = 20
     # The 5.6 family reasons before answering, so the old budget no longer
     # describes the same call. Measure p95 before tightening this again.
     llm_timeout_seconds: int = 45

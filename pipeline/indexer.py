@@ -62,6 +62,21 @@ Return an empty list when the message names no venue. Most messages name none;
 an empty list is the correct and expected answer, not a failure.
 """
 
+# Appended when several messages travel in one request. Kept separate so the
+# single-message prompt above stays byte-identical to the one every existing
+# extraction was produced with.
+BATCH_PROMPT = """
+You will be given several messages at once, each introduced by a line of the
+form `--- message <id> ---`. They are unrelated to each other: a venue named in
+one says nothing about any other.
+
+Return one entry per message id you were given, in the order given, with
+message_id copied exactly. A message that names no venue still gets an entry,
+with an empty places list. Never merge two messages into one entry, never
+invent an id you were not given, and never attribute a venue to a message whose
+text does not name it.
+"""
+
 
 class ExtractedPlace(BaseModel):
     """One venue named in a message."""
@@ -79,6 +94,19 @@ class ExtractionResult(BaseModel):
     """Every venue named in one message."""
 
     places: list[ExtractedPlace] = Field(default_factory=list)
+
+
+class MessageExtraction(BaseModel):
+    """One message's venues, tagged with the id it was given."""
+
+    message_id: int
+    places: list[ExtractedPlace] = Field(default_factory=list)
+
+
+class BatchExtractionResult(BaseModel):
+    """Venues for a whole pack of messages, one entry per input id."""
+
+    results: list[MessageExtraction] = Field(default_factory=list)
 
 
 class EmbeddingIndexer:
@@ -181,12 +209,20 @@ class PlaceExtractor:
         model: str | None = None,
         concurrency: int = 8,
         chunk_size: int = 100,
+        pack_size: int | None = None,
     ) -> None:
         self._search = search
         self._client = client or AsyncOpenAI(api_key=settings.openai_api_key)
         self._model = model or settings.extraction_model
         self._concurrency = concurrency
         self._chunk_size = chunk_size
+        # How many messages ride in one request. 87% of a single-message
+        # request was the system prompt and the schema, paid again for every
+        # message; packing amortises that fixed part across the pack. The
+        # ceiling is not the context window but attribution: the model has to
+        # keep N answers matched to N ids, and a pack that comes back short is
+        # retried whole.
+        self._pack_size = max(1, pack_size or settings.extraction_pack_size)
         self._usage = TokenUsage()
 
     async def run(self, *, limit: int = 500) -> dict[str, int]:
@@ -201,30 +237,42 @@ class PlaceExtractor:
         """
         semaphore = asyncio.Semaphore(self._concurrency)
 
-        async def one(row: Any) -> tuple[int, list[dict[str, Any]], str | None]:
+        async def one(pack: list[Any]) -> list[tuple[int, list[dict[str, Any]], str | None]]:
             async with semaphore:
-                return await self._extract(row)
+                return await self._extract_pack(pack)
 
         processed = venues = errors = 0
         while processed < limit:
             rows = self._search.pending_extractions(min(self._chunk_size, limit - processed))
             if not rows:
                 break
-            results = await asyncio.gather(*(one(r) for r in rows), return_exceptions=True)
-            for row, result in zip(rows, results, strict=True):
-                if isinstance(result, BaseException):
-                    logger.warning("Extraction crashed for %s: %s", row["corpus_id"], result)
-                    self._search.record_extraction(
-                        row["corpus_id"], [], model=self._model, error=str(result)
-                    )
-                    errors += 1
+            packs = [
+                rows[i : i + self._pack_size] for i in range(0, len(rows), self._pack_size)
+            ]
+            packed = await asyncio.gather(*(one(p) for p in packs), return_exceptions=True)
+            for pack, outcome in zip(packs, packed, strict=True):
+                if isinstance(outcome, BaseException):
+                    # One request carried the whole pack, so its failure is the
+                    # whole pack's. Recording it per row keeps the existing
+                    # attempt ceiling and retry cooldown in charge of what
+                    # happens next.
+                    logger.warning("Extraction crashed for a pack of %d: %s", len(pack), outcome)
+                    for row in pack:
+                        self._search.record_extraction(
+                            row["corpus_id"], [], model=self._model, error=str(outcome)
+                        )
+                    errors += len(pack)
                     continue
-                corpus_id, places, error = result
-                if error:
-                    errors += 1
-                    self._search.record_extraction(corpus_id, [], model=self._model, error=error)
-                else:
-                    venues += self._search.record_extraction(corpus_id, places, model=self._model)
+                for corpus_id, places, error in outcome:
+                    if error:
+                        errors += 1
+                        self._search.record_extraction(
+                            corpus_id, [], model=self._model, error=error
+                        )
+                    else:
+                        venues += self._search.record_extraction(
+                            corpus_id, places, model=self._model
+                        )
             processed += len(rows)
             logger.info(
                 "Extraction: %d/%d messages, %d venue mentions, %d errors",
@@ -258,6 +306,72 @@ class PlaceExtractor:
             "cached_input_tokens": self._usage.cached_input_tokens,
             "output_tokens": self._usage.output_tokens,
         }
+
+    async def _extract_pack(
+        self, pack: list[Any]
+    ) -> list[tuple[int, list[dict[str, Any]], str | None]]:
+        """Extract a whole pack in one request, or fall back to one call each.
+
+        A pack that comes back missing ids is not partially trusted: the ids it
+        did return are kept, and the rest are re-asked individually. Anything
+        else either loses messages silently or throws away answers that were
+        already paid for.
+        """
+        if len(pack) == 1:
+            return [await self._extract(pack[0])]
+
+        blocks = []
+        for row in pack:
+            text = (row["text"] or "")[:MAX_EXTRACT_CHARS]
+            blocks.append(
+                f"--- message {row['corpus_id']} ---\n"
+                f"Chat: {row['chat_title'] or row['chat_id']}\n"
+                f"Date: {row['date']}\n"
+                f"{text}"
+            )
+        try:
+            response = await self._client.chat.completions.parse(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT + BATCH_PROMPT},
+                    {"role": "user", "content": "\n\n".join(blocks)},
+                ],
+                response_format=BatchExtractionResult,
+                timeout=settings.llm_timeout_seconds * 4,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            return [(row["corpus_id"], [], error) for row in pack]
+
+        self._usage.add(response)
+        parsed = response.choices[0].message.parsed
+        if parsed is None:
+            refusal = getattr(response.choices[0].message, "refusal", None)
+            error = f"unparsed response: {refusal or 'no content'}"
+            return [(row["corpus_id"], [], error) for row in pack]
+
+        asked = {int(row["corpus_id"]) for row in pack}
+        # An id the model invented is dropped rather than recorded: it belongs
+        # to no message in this pack and would attach venues to whatever row
+        # happens to carry that corpus_id.
+        answered = {
+            entry.message_id: [p.model_dump() for p in entry.places]
+            for entry in parsed.results
+            if entry.message_id in asked
+        }
+        out: list[tuple[int, list[dict[str, Any]], str | None]] = [
+            (corpus_id, places, None) for corpus_id, places in answered.items()
+        ]
+        missing = [row for row in pack if int(row["corpus_id"]) not in answered]
+        if missing:
+            logger.warning(
+                "Pack of %d came back with %d ids; re-asking %d individually",
+                len(pack),
+                len(answered),
+                len(missing),
+            )
+            out.extend(await asyncio.gather(*(self._extract(row) for row in missing)))
+        return out
 
     async def _extract(self, row: Any) -> tuple[int, list[dict[str, Any]], str | None]:
         text = (row["text"] or "")[:MAX_EXTRACT_CHARS]
