@@ -697,16 +697,40 @@ class SearchDatabase:
         if not place_ids:
             return {}
         marks = ",".join("?" * len(place_ids))
+        # The link has to come from ONE message. Aggregating chat_id and
+        # telegram_msg_id independently pairs the largest chat id with the
+        # largest message id, which for an author who posted in two chats is a
+        # link to a message that does not exist -- and 93 of this corpus's
+        # author/place pairs span more than one chat.
         rows = self.conn.execute(
             f"""
-            SELECT pm.place_id, m.sender_id, m.sender_name,
-                   count(*) AS posts, max(m.date) AS last_post,
-                   max(m.chat_id) AS chat_id, max(m.telegram_msg_id) AS telegram_msg_id
-              FROM place_mentions pm
-              JOIN corpus_messages m ON m.corpus_id = pm.corpus_id
-             WHERE pm.place_id IN ({marks}) AND m.sender_name IS NOT NULL
-             GROUP BY pm.place_id, m.sender_id
-             ORDER BY pm.place_id, posts DESC, last_post DESC
+            WITH mentioned AS (
+                SELECT pm.place_id, m.sender_id, m.sender_name, m.date,
+                       m.chat_id, m.telegram_msg_id,
+                       -- Identity for grouping: the numeric id when there is
+                       -- one, the name otherwise. SQLite groups all NULLs
+                       -- together, which would merge every senderless channel
+                       -- post into a single invented author.
+                       COALESCE('id:' || m.sender_id, 'name:' || m.sender_name) AS who,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY pm.place_id,
+                                        COALESCE('id:' || m.sender_id, 'name:' || m.sender_name)
+                           ORDER BY m.date DESC, m.corpus_id DESC
+                       ) AS recency
+                  FROM place_mentions pm
+                  JOIN corpus_messages m ON m.corpus_id = pm.corpus_id
+                 WHERE pm.place_id IN ({marks}) AND m.sender_name IS NOT NULL
+            )
+            SELECT place_id, who,
+                   count(*) AS posts,
+                   max(date) AS last_post,
+                   max(CASE WHEN recency = 1 THEN sender_id END) AS sender_id,
+                   max(CASE WHEN recency = 1 THEN sender_name END) AS sender_name,
+                   max(CASE WHEN recency = 1 THEN chat_id END) AS chat_id,
+                   max(CASE WHEN recency = 1 THEN telegram_msg_id END) AS telegram_msg_id
+              FROM mentioned
+             GROUP BY place_id, who
+             ORDER BY place_id, posts DESC, last_post DESC
             """,  # noqa: S608 -- `marks` is generated placeholders, values are bound
             list(place_ids),
         ).fetchall()

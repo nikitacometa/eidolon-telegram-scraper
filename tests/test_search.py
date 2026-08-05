@@ -1252,3 +1252,78 @@ class TestContactsInTheIndex:
         )
         search.conn.commit()
         assert search.search_places(include_contacts=False)[0]["contacts"] == []
+
+
+class TestAuthorsForPlaces:
+    """The poster is often the only route to an organiser who published no handle."""
+
+    def _place_with_messages(
+        self, search: SearchDatabase, messages: list[tuple[int, int, int | None, str, str]]
+    ) -> int:
+        search.conn.execute(
+            "INSERT INTO places (canonical, name, mention_count) VALUES ('venue', 'Venue', 1)"
+        )
+        place_id = search.conn.execute("SELECT place_id FROM places").fetchone()["place_id"]
+        for chat_id, msg_id, sender_id, sender_name, date in messages:
+            cursor = search.conn.execute(
+                """
+                INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, sender_id,
+                                             sender_name, text, date, content_hash)
+                VALUES ('live', ?, ?, ?, ?, 'announcement text', ?, ?)
+                """,
+                (chat_id, msg_id, sender_id, sender_name, date, f"h{chat_id}{msg_id}"),
+            )
+            search.conn.execute(
+                "INSERT INTO place_mentions (place_id, corpus_id, evidence_quote, extracted_by)"
+                " VALUES (?, ?, 'quote', 'test')",
+                (place_id, cursor.lastrowid),
+            )
+        search.conn.commit()
+        return place_id
+
+    def test_the_link_points_at_one_real_message(self, search: SearchDatabase) -> None:
+        # One author crossposting to two chats: taking max(chat_id) and
+        # max(telegram_msg_id) separately builds a link to a message that
+        # never existed.
+        place_id = self._place_with_messages(
+            search,
+            [
+                (-100, 900, 7, "organiser", "2026-07-01T10:00:00+00:00"),
+                (-200, 5, 7, "organiser", "2026-07-05T10:00:00+00:00"),
+            ],
+        )
+
+        author = search.authors_for_places([place_id])[place_id][0]
+
+        assert author["last_message_link"] == message_link(-200, 5)
+
+    def test_senderless_posters_are_not_merged_into_one_author(
+        self, search: SearchDatabase
+    ) -> None:
+        # Channel posts carry a name but no sender id. Grouping on the id alone
+        # collapses them all into a single invented author.
+        place_id = self._place_with_messages(
+            search,
+            [
+                (-100, 1, None, "Danang Events", "2026-07-01T10:00:00+00:00"),
+                (-100, 2, None, "Mantra Yoga", "2026-07-02T10:00:00+00:00"),
+            ],
+        )
+
+        names = {a["name"] for a in search.authors_for_places([place_id])[place_id]}
+
+        assert names == {"Danang Events", "Mantra Yoga"}
+
+    def test_the_same_person_across_chats_is_one_author(self, search: SearchDatabase) -> None:
+        place_id = self._place_with_messages(
+            search,
+            [
+                (-100, 1, 7, "organiser", "2026-07-01T10:00:00+00:00"),
+                (-200, 2, 7, "organiser", "2026-07-02T10:00:00+00:00"),
+            ],
+        )
+
+        authors = search.authors_for_places([place_id])[place_id]
+
+        assert len(authors) == 1
+        assert authors[0]["posts"] == 2
