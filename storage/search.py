@@ -53,6 +53,50 @@ _URLISH_RE = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+/")
 # Handles that are people or bots we do not want in a chat-candidate list.
 _REF_STOPWORDS = frozenset({"joinchat", "share", "addstickers", "proxy", "socks"})
 
+# --- Contact handles -------------------------------------------------------
+# One pattern per channel people actually publish. Instagram and Facebook are
+# taken only from a full link: "@someone" in an Instagram sentence is
+# indistinguishable from a Telegram handle, and guessing wrong hands the reader
+# a contact that does not exist.
+_CONTACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "instagram",
+        re.compile(r"(?:https?://)?(?:www\.)?instagram\.com/(?P<v>[A-Za-z0-9._]{2,30})", re.I),
+    ),
+    (
+        "whatsapp",
+        re.compile(r"(?:https?://)?(?:chat\.whatsapp\.com|wa\.me)/(?P<v>[\w+-]{5,40})", re.I),
+    ),
+    ("zalo", re.compile(r"(?:https?://)?zalo\.me/(?P<v>[\w+-]{5,40})", re.I)),
+    (
+        "facebook",
+        re.compile(
+            r"(?:https?://)?(?:www\.|m\.)?(?:facebook\.com|fb\.me|m\.me)/(?P<v>[A-Za-z0-9._-]{3,40})",
+            re.I,
+        ),
+    ),
+    (
+        "maps",
+        re.compile(
+            r"(?:https?://)?(?:maps\.app\.goo\.gl/[\w-]+"
+            r"|goo\.gl/maps/[\w-]+"
+            r"|(?:www\.)?google\.[a-z.]{2,6}/maps/[^\s)>\]]+)",
+            re.I,
+        ),
+    ),
+)
+
+# Phone numbers, and only the two shapes that are unambiguous here: an
+# international number written with its plus, and a Vietnamese mobile in local
+# form. Anything looser matches prices -- this corpus is full of "500.000",
+# "1 500 000 VND" and apartment sizes -- and a wrong phone number is worse than
+# no phone number, because the reader cannot tell it is wrong until they dial.
+# Measured over the 65k-message corpus: these two shapes yield 211 distinct
+# numbers and no price. A trailing currency guard was tried alongside them and
+# fired zero times, so the shape of the pattern is what does the work here.
+_PHONE_INTL_RE = re.compile(r"(?<![\w+])\+(?P<v>\d[\d\s().-]{7,17}\d)(?![\w])")
+_PHONE_VN_RE = re.compile(r"(?<![\w+])0(?P<v>[35789]\d[\d\s.-]{6,10}\d)(?![\w])")
+
 
 def content_digest(text: str | None) -> str | None:
     """Return the crosspost-dedup digest for a message body.
@@ -384,6 +428,7 @@ class SearchDatabase:
             }
             self._refresh_chat_metadata()
             self._seed_extraction_state()
+            stats["contacts"] = self._extract_contacts()
             conn.commit()
         finally:
             conn.execute("DETACH DATABASE live")
@@ -547,6 +592,138 @@ class SearchDatabase:
              WHERE corpus_id NOT IN (SELECT corpus_id FROM extraction_state)
             """
         )
+
+    def _extract_contacts(self, *, batch_size: int = 20000) -> int:
+        """Mine contact handles out of every message not yet scanned.
+
+        The cursor is the highest corpus_id already scanned, kept in the same
+        table as the ingest cursors. A message's text never changes after
+        insert, so a scanned row can never gain a contact later and rescanning
+        would only re-derive what is already stored.
+        """
+        conn = self.conn
+        row = conn.execute("SELECT last_id FROM sync_state WHERE source = 'contacts'").fetchone()
+        cursor_id = int(row["last_id"]) if row else 0
+        written = 0
+        while True:
+            rows = conn.execute(
+                """
+                SELECT corpus_id, text FROM corpus_messages
+                 WHERE corpus_id > ? ORDER BY corpus_id LIMIT ?
+                """,
+                (cursor_id, batch_size),
+            ).fetchall()
+            if not rows:
+                break
+            payload = [
+                (r["corpus_id"], kind, value, display)
+                for r in rows
+                for kind, value, display in extract_contacts(r["text"])
+            ]
+            if payload:
+                conn.executemany(
+                    """
+                    INSERT INTO message_contacts (corpus_id, kind, value, display)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(corpus_id, kind, value) DO NOTHING
+                    """,
+                    payload,
+                )
+                written += len(payload)
+            cursor_id = int(rows[-1]["corpus_id"])
+            self._save_cursor("contacts", cursor_id, written, 0)
+            conn.commit()
+            if len(rows) < batch_size:
+                break
+        return written
+
+    def contacts_for_places(
+        self,
+        place_ids: Sequence[int],
+        *,
+        limit_per_place: int = 8,
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Contacts published in the messages that mention each place.
+
+        Ranked by how many distinct messages carry them: a handle repeated
+        across five announcements is the venue's own, a handle appearing once
+        is whoever happened to comment that day.
+        """
+        if not place_ids:
+            return {}
+        marks = ",".join("?" * len(place_ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT pm.place_id, mc.kind, mc.value,
+                   count(DISTINCT mc.corpus_id) AS seen,
+                   max(m.date) AS last_seen,
+                   min(mc.display) AS display
+              FROM place_mentions pm
+              JOIN message_contacts mc ON mc.corpus_id = pm.corpus_id
+              JOIN corpus_messages m ON m.corpus_id = mc.corpus_id
+             WHERE pm.place_id IN ({marks})
+             GROUP BY pm.place_id, mc.kind, mc.value
+             ORDER BY pm.place_id, seen DESC, last_seen DESC
+            """,  # noqa: S608 -- `marks` is generated placeholders, values are bound
+            list(place_ids),
+        ).fetchall()
+        out: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            bucket = out.setdefault(row["place_id"], [])
+            if len(bucket) < limit_per_place:
+                bucket.append(
+                    {
+                        "kind": row["kind"],
+                        "value": row["value"],
+                        "display": row["display"],
+                        "seen_in_messages": row["seen"],
+                        "last_seen": row["last_seen"],
+                    }
+                )
+        return out
+
+    def authors_for_places(
+        self,
+        place_ids: Sequence[int],
+        *,
+        limit_per_place: int = 6,
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Who posted the messages that mention each place.
+
+        The poster is a contact the message body never states: whoever keeps
+        announcing a venue's events is reachable through the chat itself, and
+        that is often the only route to an organiser who published no handle.
+        """
+        if not place_ids:
+            return {}
+        marks = ",".join("?" * len(place_ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT pm.place_id, m.sender_id, m.sender_name,
+                   count(*) AS posts, max(m.date) AS last_post,
+                   max(m.chat_id) AS chat_id, max(m.telegram_msg_id) AS telegram_msg_id
+              FROM place_mentions pm
+              JOIN corpus_messages m ON m.corpus_id = pm.corpus_id
+             WHERE pm.place_id IN ({marks}) AND m.sender_name IS NOT NULL
+             GROUP BY pm.place_id, m.sender_id
+             ORDER BY pm.place_id, posts DESC, last_post DESC
+            """,  # noqa: S608 -- `marks` is generated placeholders, values are bound
+            list(place_ids),
+        ).fetchall()
+        out: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            bucket = out.setdefault(row["place_id"], [])
+            if len(bucket) < limit_per_place:
+                bucket.append(
+                    {
+                        "name": row["sender_name"],
+                        "sender_id": row["sender_id"],
+                        "posts": row["posts"],
+                        "last_post": row["last_post"],
+                        "last_message_link": message_link(row["chat_id"], row["telegram_msg_id"]),
+                    }
+                )
+        return out
 
     # ------------------------------------------------------------------
     # Lexical lane
@@ -937,6 +1114,7 @@ class SearchDatabase:
         event_types: Sequence[str] | None = None,
         min_mentions: int = 1,
         limit: int = 40,
+        include_contacts: bool = True,
     ) -> list[dict[str, Any]]:
         """Query the extracted venue index."""
         sql = [
@@ -969,8 +1147,13 @@ class SearchDatabase:
         sql.append(" ORDER BY p.mention_count DESC, p.last_seen_at DESC LIMIT ?")
         params.append(limit)
 
+        rows = self.conn.execute("".join(sql), params).fetchall()
+        place_ids = [row["place_id"] for row in rows]
+        contacts = self.contacts_for_places(place_ids) if include_contacts else {}
+        authors = self.authors_for_places(place_ids) if include_contacts else {}
+
         out = []
-        for row in self.conn.execute("".join(sql), params).fetchall():
+        for row in rows:
             evidence = self.conn.execute(
                 """
                 SELECT pm.evidence_quote, pm.event_types, pm.confidence, m.date, m.chat_id,
@@ -991,6 +1174,8 @@ class SearchDatabase:
                     "mentions": row["mention_count"],
                     "first_seen": row["first_seen_at"],
                     "last_seen": row["last_seen_at"],
+                    "contacts": contacts.get(row["place_id"], []),
+                    "posted_by": authors.get(row["place_id"], []),
                     "evidence": [
                         {
                             "quote": e["evidence_quote"],
@@ -1237,6 +1422,48 @@ def _rollup_duplicates(ranked: Sequence[CorpusRow], limit: int) -> list[CorpusRo
         elif item.chat_id != head.chat_id and item.chat_id not in head.duplicate_chat_ids:
             head.duplicate_chat_ids.append(item.chat_id)
     return out
+
+
+def extract_contacts(text: str) -> list[tuple[str, str, str]]:
+    """Find every reachable handle in one message as ``(kind, value, display)``.
+
+    ``value`` is the comparable form -- lowercased handle, digits-only phone --
+    so the same organiser written as ``@aum_danang`` and ``t.me/AUM_danang``
+    collapses to one contact instead of ranking as two.
+    """
+    found: dict[tuple[str, str], str] = {}
+
+    def add(kind: str, value: str, display: str) -> None:
+        found.setdefault((kind, value), display)
+
+    for match in _TME_RE.finditer(text):
+        body = match.group("body")
+        if body.lower().startswith("joinchat/") or body.startswith("+"):
+            add("telegram", body.lower(), f"t.me/{body}")
+        elif body.lower() not in _REF_STOPWORDS:
+            add("telegram", body.lower(), f"@{body}")
+    for match in _AT_HANDLE_RE.finditer(text):
+        name = match.group("name")
+        if name.lower() not in _REF_STOPWORDS:
+            add("telegram", name.lower(), f"@{name}")
+
+    for kind, pattern in _CONTACT_PATTERNS:
+        for match in pattern.finditer(text):
+            raw = match.group("v") if "v" in pattern.groupindex else match.group(0)
+            add(kind, raw.lower().rstrip("/"), match.group(0))
+
+    for pattern, local in ((_PHONE_INTL_RE, False), (_PHONE_VN_RE, True)):
+        for match in pattern.finditer(text):
+            digits = re.sub(r"\D", "", match.group(0))
+            # A local Vietnamese number is the same phone as its +84 form, so
+            # both have to normalize to one value or the venue's owner shows up
+            # twice with two spellings of the same number.
+            if local:
+                digits = "84" + digits[1:]
+            if not 9 <= len(digits) <= 15:
+                continue
+            add("phone", "+" + digits, match.group(0).strip())
+    return [(kind, value, display) for (kind, value), display in found.items()]
 
 
 def _extract_refs(text: str) -> Iterator[tuple[str, str]]:

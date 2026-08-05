@@ -159,6 +159,7 @@ class EidolonTools:
         event_type: str | None = None,
         min_mentions: int = 1,
         limit: int = 25,
+        include_contacts: bool = True,
     ) -> dict[str, Any]:
         limit = max(1, min(limit, MAX_LIMIT))
         rows = self._search.search_places(
@@ -168,6 +169,7 @@ class EidolonTools:
             event_types=[event_type] if event_type else None,
             min_mentions=min_mentions,
             limit=limit,
+            include_contacts=include_contacts,
         )
         status = self._search.status()
         return {
@@ -450,7 +452,10 @@ READ_TOOLS = [
             "Search venues and physical places extracted from the message corpus — bars, "
             "cafes, rooftops, studios, community spaces — with what happens at each and a "
             "verbatim quote as evidence. Use this, not search_messages, when the question "
-            "is about WHERE something could happen or where events are held."
+            "is about WHERE something could happen or where events are held. Each place "
+            "carries `contacts` (handles, phones, Instagram, map links published in the "
+            "messages that name it) and `posted_by` (who announces it, ranked by how often) "
+            "— so 'find a venue and how to reach them' is one call, not two."
         ),
         inputSchema={
             "type": "object",
@@ -470,6 +475,11 @@ READ_TOOLS = [
                 },
                 "min_mentions": {"type": ["integer", "null"], "default": 1},
                 "limit": {"type": ["integer", "null"], "default": 25, "maximum": 60},
+                "include_contacts": {
+                    "type": ["boolean", "null"],
+                    "default": True,
+                    "description": "Set false only when scanning many places and contacts are not needed.",
+                },
             },
         },
     ),

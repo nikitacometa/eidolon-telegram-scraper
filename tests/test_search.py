@@ -15,6 +15,7 @@ from storage.search import (
     build_fts_query,
     content_digest,
     escape_fts_term,
+    extract_contacts,
     fold_ascii,
     message_link,
 )
@@ -179,7 +180,8 @@ class TestSync:
         self, search: SearchDatabase, sources: tuple[Path, Path]
     ) -> None:
         report = _sync(search, sources)
-        assert report == {"live": 2, "scout": 4}
+        assert report["live"] == 2
+        assert report["scout"] == 4
         assert search.status()["messages_indexed"] == 6
 
     def test_empty_messages_are_not_indexed(
@@ -193,7 +195,8 @@ class TestSync:
         self, search: SearchDatabase, sources: tuple[Path, Path]
     ) -> None:
         _sync(search, sources)
-        assert _sync(search, sources) == {"live": 0, "scout": 0}
+        second = _sync(search, sources)
+        assert (second["live"], second["scout"], second["contacts"]) == (0, 0, 0)
 
     def test_new_rows_are_picked_up_incrementally(
         self, search: SearchDatabase, sources: tuple[Path, Path]
@@ -636,7 +639,7 @@ class TestStatus:
         assert status["messages_indexed"] == 6
         assert status["embedding_backlog"] == 6
         assert status["extraction_backlog"] > 0
-        assert {s["source"] for s in status["sync"]} == {"live", "scout"}
+        assert {"live", "scout"} <= {s["source"] for s in status["sync"]}
 
 
 class TestJoinRequestNormalization:
@@ -1144,3 +1147,108 @@ class TestContentTermExtraction:
         focused = search.lexical_search(build_fts_query(content_terms("концерт в баре")), limit=20)
         assert len(focused) <= len(naive)
         assert focused, "dropping stopwords must not drop the real terms"
+
+
+class TestContactExtraction:
+    """Contacts are lexical, so the risk is precision, not recall."""
+
+    def test_telegram_handles_collapse_across_spellings(self) -> None:
+        found = extract_contacts("пишите @AUM_danang или https://t.me/aum_danang")
+        telegram = [c for c in found if c[0] == "telegram"]
+        assert len(telegram) == 1, "the same handle in two spellings is one contact"
+        assert telegram[0][1] == "aum_danang"
+
+    def test_vietnamese_local_and_international_are_one_number(self) -> None:
+        local = extract_contacts("звоните 0905 123 456")
+        intl = extract_contacts("call +84 905 123 456")
+        assert [c[1] for c in local] == ["+84905123456"]
+        assert [c[1] for c in intl] == ["+84905123456"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "аренда 500.000 VND в сутки",
+            "квартира 1 500 000 vnd в месяц",
+            "площадь 120 m2 рядом с пляжем",
+            "цена 12 000 000đ",
+            # Long enough to clear every length bound, so only the leading-zero
+            # mobile prefix separates it from a phone number.
+            "продаю дом за 1 200 000 000 донгов",
+            "оборот 4 500 000 000 vnd за год",
+        ],
+    )
+    def test_prices_and_measurements_are_not_phone_numbers(self, text: str) -> None:
+        # This corpus is mostly rental ads. A price read as a phone number is
+        # worse than no number: the reader only finds out by dialling it.
+        assert [c for c in extract_contacts(text) if c[0] == "phone"] == []
+
+    def test_social_links_are_taken_only_from_a_full_url(self) -> None:
+        found = {
+            kind: value
+            for kind, value, _ in extract_contacts(
+                "наш инстаграм instagram.com/aum.danang, whatsapp wa.me/84905123456, "
+                "карта https://maps.app.goo.gl/abc123XY"
+            )
+        }
+        assert found["instagram"] == "aum.danang"
+        assert found["whatsapp"] == "84905123456"
+        assert found["maps"].endswith("abc123xy")
+
+    def test_a_bare_handle_is_not_claimed_for_instagram(self) -> None:
+        # "@someone" in a sentence about Instagram is indistinguishable from a
+        # Telegram handle; guessing hands the reader a contact that does not exist.
+        kinds = {kind for kind, _, _ in extract_contacts("наш инстаграм @aum_danang")}
+        assert kinds == {"telegram"}
+
+
+class TestContactsInTheIndex:
+    def test_sync_mines_contacts_out_of_message_text(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        stats = _sync(search, sources)
+        assert stats["contacts"] >= 1
+        rows = search.conn.execute(
+            "SELECT kind, value FROM message_contacts ORDER BY value"
+        ).fetchall()
+        assert ("telegram", "danangevents") in [(r["kind"], r["value"]) for r in rows]
+
+    def test_rescanning_does_not_duplicate_contacts(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        before = search.conn.execute("SELECT count(*) FROM message_contacts").fetchone()[0]
+        _sync(search, sources)
+        after = search.conn.execute("SELECT count(*) FROM message_contacts").fetchone()[0]
+        assert after == before
+
+    def test_places_carry_the_contacts_of_the_messages_that_name_them(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        corpus_id = search.conn.execute(
+            "SELECT corpus_id FROM corpus_messages WHERE text LIKE '%danangevents%'"
+        ).fetchone()["corpus_id"]
+        search.conn.execute(
+            "INSERT INTO places (canonical, name, mention_count) VALUES ('venue', 'Venue', 1)"
+        )
+        place_id = search.conn.execute("SELECT place_id FROM places").fetchone()["place_id"]
+        search.conn.execute(
+            "INSERT INTO place_mentions (place_id, corpus_id, evidence_quote, extracted_by)"
+            " VALUES (?, ?, 'quote', 'test')",
+            (place_id, corpus_id),
+        )
+        search.conn.commit()
+
+        results = search.search_places(name_query=None)
+
+        assert [c["value"] for c in results[0]["contacts"]] == ["danangevents"]
+
+    def test_contacts_can_be_left_out(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        search.conn.execute(
+            "INSERT INTO places (canonical, name, mention_count) VALUES ('venue', 'Venue', 1)"
+        )
+        search.conn.commit()
+        assert search.search_places(include_contacts=False)[0]["contacts"] == []

@@ -210,3 +210,25 @@ CREATE TABLE IF NOT EXISTS sync_state (
     ticks INTEGER NOT NULL DEFAULT 0,
     last_run_at TIMESTAMP
 );
+
+-- Contact handles mined out of message text. Deterministic, not extracted by a
+-- model: a handle is a lexical pattern, and paying a model to find one would
+-- buy nothing but a chance to hallucinate it. Kept per-message rather than per
+-- place so the same rows answer both "how do I reach whoever runs this venue"
+-- (join through place_mentions) and "who is this person" (join through sender).
+CREATE TABLE IF NOT EXISTS message_contacts (
+    contact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    corpus_id INTEGER NOT NULL REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL
+        CHECK(kind IN ('telegram', 'phone', 'instagram', 'whatsapp', 'zalo', 'facebook', 'maps')),
+    -- Comparable form: handles lowercased and stripped of their sigil, phone
+    -- numbers reduced to digits. Two spellings of one contact must collapse,
+    -- otherwise a venue's organiser is counted three times and ranked as three.
+    value TEXT NOT NULL,
+    -- How it actually appeared, for quoting back at the reader.
+    display TEXT NOT NULL,
+    UNIQUE(corpus_id, kind, value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_contacts_value ON message_contacts(kind, value);
+CREATE INDEX IF NOT EXISTS idx_message_contacts_corpus ON message_contacts(corpus_id);
