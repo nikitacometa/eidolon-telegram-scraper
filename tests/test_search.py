@@ -1375,3 +1375,67 @@ class TestSenderNames:
             "SELECT sender_name FROM corpus_messages WHERE chat_id = -200 AND telegram_msg_id = 78"
         ).fetchone()
         assert row["sender_name"] is None
+
+
+class TestSenderNameResolutionScales:
+    def test_the_fill_does_not_scan_the_table_once_per_row(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        """Without an index on sender_id the fill is quadratic and never lands.
+
+        Measured on the 65k-row production corpus: unindexed, the fill did not
+        finish inside the indexer's window and read from the outside as "it
+        recovered nothing". The index is the fix; this guards that the fill
+        stays bounded, and `test_the_sender_index_exists` guards the index.
+        """
+        import time
+
+        _sync(search, sources)
+        rows = [
+            (
+                -900,
+                index,
+                1000 + (index % 200),
+                None,
+                f"сообщение {index} про концерт в баре с живой музыкой",
+                "2026-07-01T10:00:00+00:00",
+                f"bulk{index}",
+            )
+            for index in range(20_000)
+        ]
+        search.conn.executemany(
+            """
+            INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, sender_id,
+                                         sender_name, text, date, content_hash)
+            VALUES ('scout', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        search.conn.executemany(
+            """
+            INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, sender_id,
+                                         sender_name, text, date, content_hash)
+            VALUES ('live', -901, ?, ?, ?, 'живое сообщение', '2026-08-01T10:00:00+00:00', ?)
+            """,
+            [(i, 1000 + i, f"Автор {i}", f"named{i}") for i in range(200)],
+        )
+        search.conn.commit()
+
+        started = time.monotonic()
+        filled = search._resolve_sender_names()
+        elapsed = time.monotonic() - started
+
+        assert filled == 20_000
+        assert elapsed < 10, f"took {elapsed:.1f}s — the fill is scanning per row"
+
+
+    def test_the_sender_index_exists(self, search: SearchDatabase) -> None:
+        # Dropping it does not break a query, it makes the name fill silently
+        # never finish, which is indistinguishable from having nothing to fill.
+        indexes = {
+            row["name"]
+            for row in search.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'corpus_messages'"
+            )
+        }
+        assert "idx_corpus_sender" in indexes

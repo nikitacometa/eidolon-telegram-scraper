@@ -605,26 +605,33 @@ class SearchDatabase:
 
         The crawler now records the name at capture time, so this shrinks to
         nothing for anything fetched from here on.
+
+        The map is built once and applied per sender. Expressed instead as a
+        correlated subquery -- one lookup into this same table per row -- it is
+        quadratic over sixty-five thousand rows and does not finish inside the
+        indexer's window, which reads from the outside as "recovered nothing".
         """
-        cursor = self.conn.execute(
+        conn = self.conn
+        names = conn.execute(
             """
-            UPDATE corpus_messages AS target
-               SET sender_name = (
-                   SELECT source.sender_name FROM corpus_messages AS source
-                    WHERE source.sender_id = target.sender_id
-                      AND source.sender_name IS NOT NULL
-                    ORDER BY source.date DESC LIMIT 1
-               )
-             WHERE target.sender_name IS NULL
-               AND target.sender_id IS NOT NULL
-               AND EXISTS (
-                   SELECT 1 FROM corpus_messages AS source
-                    WHERE source.sender_id = target.sender_id
-                      AND source.sender_name IS NOT NULL
-               )
+            SELECT sender_id, sender_name FROM corpus_messages
+             WHERE sender_name IS NOT NULL AND sender_id IS NOT NULL
+             GROUP BY sender_id
             """
-        )
-        return cursor.rowcount if cursor.rowcount > 0 else 0
+        ).fetchall()
+        if not names:
+            return 0
+        updated = 0
+        for row in names:
+            cursor = conn.execute(
+                """
+                UPDATE corpus_messages SET sender_name = ?
+                 WHERE sender_id = ? AND sender_name IS NULL
+                """,
+                (row["sender_name"], row["sender_id"]),
+            )
+            updated += max(cursor.rowcount, 0)
+        return updated
 
     def _extract_contacts(self, *, batch_size: int = 20000) -> int:
         """Mine contact handles out of every message not yet scanned.

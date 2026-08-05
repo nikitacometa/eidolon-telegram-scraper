@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS corpus_messages (
 CREATE INDEX IF NOT EXISTS idx_corpus_chat_date ON corpus_messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_corpus_date ON corpus_messages(date);
 CREATE INDEX IF NOT EXISTS idx_corpus_hash ON corpus_messages(content_hash);
+-- Backfilled messages arrive without their sender's name and get one from any
+-- other message by the same id; without this the fill scans the whole table
+-- once per sender.
+CREATE INDEX IF NOT EXISTS idx_corpus_sender ON corpus_messages(sender_id);
 
 -- Chat-level metadata, denormalized so a search result can name its chat
 -- without attaching either source database.
