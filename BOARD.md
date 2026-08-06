@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-060**
+- Next available ID: **E-061**
 
 ---
 
@@ -29,6 +29,7 @@
 | E-057 | Stop extracting venues from the chat header | done | critical | The `Chat:` line of the prompt was being read as content: 24 mentions had `Chat: …` as their evidence, 23 of them a phantom `Nu Arrows` created by a join label I wrote by hand. On the 60 newest messages marked no_venue this fabricated a venue in 26 under the batch prompt and 7 under the single-message prompt; both are 0 now. The polluted labels are cleaned and the prompt states the header is metadata |
 | E-058 | Confirm prompt caching engages on the next backfill | todo | medium | The fixed prefix reached ~1,340 tokens once the batch instruction landed, crossing the 1,024-token minimum, so reads should bill at 0.1×. `extraction_cost.cached_input_tokens` was 0 on the only run since (a cache write, and the backlog drained before a second). Verify on the next chat join rather than assuming |
 | E-059 | Decide whether a vector pre-filter is worth its recall cost | todo | medium | A logistic probe over the existing corpus embeddings cuts 55% of calls at 98% recall (measured 2026-08-05), but on a RANDOM split — crossposted announcements leak between train and test, so the number is optimistic. Re-measure with a split by chat and by time before shipping. Not needed to reach the cost target |
+| E-060 | Monitor the PROEXPAT community chat | todo | medium | `-1002902498444` reached the corpus by recon sampling only: 394 messages, nothing after 2026-07-25, and it carries the one standing answer to "where are Russian books in Da Nang" — the community is assembling a lending library and takes donations. Not in `observed_chats`, so its next announcement is invisible. Join it or accept that this source is frozen |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
 
