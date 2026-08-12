@@ -58,3 +58,5 @@ evals/results/
 # The retrieval eval runs against a frozen fixture; CI passes it explicitly and nothing
 # regenerates it, so it must be in the repo despite the *.db rule above.
 !evals/data/place-retrieval-fixture-v1.db
+*.db-shm
+*.db-wal
