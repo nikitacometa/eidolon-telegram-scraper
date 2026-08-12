@@ -33,6 +33,7 @@ eidolon-auth = "auth:main"
 eidolon-chats = "list_chats:main"
 eidolon-eval = "evals.runner:main"
 eidolon-calibrate = "evals.calibrate:main"
+eidolon-place-eval = "evals.place_retrieval:main"
 
 [dependency-groups]
 dev = [

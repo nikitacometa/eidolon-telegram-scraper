@@ -18,6 +18,7 @@ from telethon.tl.functions.messages import GetHistoryRequest
 
 from pipeline.discovery import ChatLink, extract_chat_links
 from pipeline.governor import ActionResult, ActionStatus, TelegramActionGovernor
+from pipeline.ingestion import format_sender_identity
 from pipeline.recon_models import (
     ActionKind,
     ChatMembership,
@@ -186,6 +187,7 @@ class TelegramCrawler:
             forward_peer = getattr(forward, "from_id", None)
 
             sender_id = _peer_user_id(getattr(item, "from_id", None))
+            sender_name = senders.get(sender_id) if sender_id is not None else None
             messages.append(
                 ScoutMessage(
                     chat_id=chat_id,
@@ -193,7 +195,7 @@ class TelegramCrawler:
                     date=str(getattr(item, "date", "")),
                     text=text,
                     sender_id=sender_id,
-                    sender_name=senders.get(sender_id),
+                    sender_name=sender_name,
                     entities=[],
                     forward_chat_id=_peer_channel_id(forward_peer),
                     forward_message_id=_optional_int(getattr(forward, "channel_post", None)),
@@ -223,14 +225,13 @@ class TelegramCrawler:
 
 
 def _sender_names(response: object) -> dict[int, str]:
-    """Map user id to a display name from the page's side list of users."""
+    """Map user id to a handle-first identity from the page's side list."""
     names: dict[int, str] = {}
     for user in getattr(response, "users", ()) or ():
         user_id = _optional_int(getattr(user, "id", None))
         if user_id is None:
             continue
-        parts = [getattr(user, "first_name", None), getattr(user, "last_name", None)]
-        label = " ".join(part for part in parts if part) or getattr(user, "username", None)
+        label = format_sender_identity(user)
         if label:
             names[user_id] = label
     return names

@@ -17,6 +17,7 @@ from storage.search import (
     escape_fts_term,
     extract_contacts,
     fold_ascii,
+    is_extraction_candidate,
     message_link,
 )
 
@@ -475,6 +476,46 @@ class TestPlaces:
         assert found[0]["name"] == "Sound Cafe"
         assert found[0]["evidence"][0]["quote"] == "Открытый микрофон в Sound Cafe"
 
+    def test_contact_identified_person_uses_contact_canonical_and_open_descriptor(
+        self, search: SearchDatabase
+    ) -> None:
+        text = "Барбер Дананг, пишите в личку @someone: мужские стрижки и борода"
+        cursor = search.conn.execute(
+            """
+            INSERT INTO corpus_messages (
+                source, chat_id, telegram_msg_id, text, date, content_hash
+            ) VALUES ('scout', -500, 1, ?, '2026-08-01T10:00:00+00:00', ?)
+            """,
+            (text, content_digest(text)),
+        )
+        corpus_id = int(cursor.lastrowid or 0)
+        search._seed_extraction_state()
+
+        stored = search.record_extraction(
+            corpus_id,
+            [
+                {
+                    "name": "@someone",
+                    "aliases": [],
+                    "entity_kind": "person",
+                    "access_modes": ["unknown"],
+                    "descriptor": "барбер",
+                    "descriptor_language": "ru",
+                    "offerings": ["мужские стрижки", "оформление бороды"],
+                    "city_area": "Da Nang",
+                    "evidence": "Барбер Дананг, пишите в личку @someone",
+                    "confidence": 0.96,
+                }
+            ],
+            model="test",
+        )
+
+        assert stored == 1
+        found = search.search_places(query="барбер", expanded_fts=True)
+        assert found[0]["entity_kind"] == "person"
+        assert found[0]["entity_key"] == "person|person:contact:telegram:someone"
+        assert found[0]["descriptor"] == "барбер"
+
     def test_a_stylized_name_is_found_by_its_plain_spelling(
         self, search: SearchDatabase, sources: tuple[Path, Path]
     ) -> None:
@@ -566,6 +607,179 @@ class TestPlaces:
         names = {p["name"] for p in search.search_places(event_types=["concert"])}
         assert names == {"Music Bar"}
 
+    def test_shadow_fts_adds_descriptor_search_without_switching_default_reader(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        search.record_extraction(
+            self._corpus_id(search),
+            [
+                {
+                    "name": "Автовокзал Мё Динь",
+                    "aliases": [],
+                    "entity_kind": "place",
+                    "access_modes": ["visit"],
+                    "descriptor": "автовокзал",
+                    "descriptor_language": "ru",
+                    "offerings": ["междугородние автобусы"],
+                    "city_area": "unknown",
+                    "evidence": "Автовокзал Мё Динь — междугородние автобусы",
+                    "confidence": 0.98,
+                }
+            ],
+            model="test",
+        )
+
+        assert search.search_places(query="автовокзал") == []
+        assert search.search_places(name_query="Автовокзал Ме Динь")
+        expanded = search.search_places(query="автовокзал", expanded_fts=True)
+        assert expanded[0]["entity_key"] == "place|автовокзал ме динь"
+        assert search.status()["place_fts_next_rows"] == search.status()["places"]
+
+    def test_semantic_descriptor_lane_drops_the_nearest_below_cutoff(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        search.record_extraction(
+            self._corpus_id(search),
+            [
+                {
+                    "name": "Lotus Dental",
+                    "aliases": [],
+                    "entity_kind": "place",
+                    "access_modes": ["visit"],
+                    "descriptor": "dentist",
+                    "descriptor_language": "en",
+                    "offerings": ["dental care"],
+                    "city_area": "Da Nang",
+                    "evidence": "Lotus Dental provides dental care",
+                    "confidence": 0.95,
+                }
+            ],
+            model="test",
+        )
+        descriptor_id = search.conn.execute(
+            "SELECT descriptor_id FROM descriptors WHERE normalized='dentist'"
+        ).fetchone()[0]
+        search.store_descriptor_embeddings([(descriptor_id, [1.0, 0.0])], model="fixture")
+
+        assert (
+            search.search_places(
+                query="proctologist",
+                expanded_fts=True,
+                semantic_enabled=True,
+                query_vector=[0.0, 1.0],
+                embedding_model="fixture",
+                semantic_cutoff=0.55,
+            )
+            == []
+        )
+        assert search.search_places(
+            query="dental specialist",
+            expanded_fts=True,
+            semantic_enabled=True,
+            query_vector=[1.0, 0.0],
+            embedding_model="fixture",
+            semantic_cutoff=0.55,
+        )
+
+    def test_failed_versioned_replacement_preserves_the_active_snapshot(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        corpus_id = self._corpus_id(search)
+        search.record_extraction(
+            corpus_id,
+            [
+                {
+                    "name": "Sound Cafe",
+                    "place_type": "cafe",
+                    "city_area": "Da Nang",
+                    "event_types": ["open_mic"],
+                    "evidence": "Sound Cafe",
+                    "confidence": 0.9,
+                }
+            ],
+            model="places-v2",
+            prompt_version="places-v2",
+        )
+
+        search.record_extraction(
+            corpus_id,
+            [],
+            model="entities-v4",
+            prompt_version="entities-v4",
+            error="APITimeoutError: timed out",
+        )
+
+        assert search.search_places(name_query="Sound Cafe")
+        state = search.conn.execute(
+            "SELECT status, active_prompt_version FROM extraction_state WHERE corpus_id=?",
+            (corpus_id,),
+        ).fetchone()
+        assert tuple(state) == ("extracted", "places-v2")
+
+    def test_successful_versioned_replacement_removes_old_orphan_atomically(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+        corpus_id = self._corpus_id(search)
+        search.record_extraction(
+            corpus_id,
+            [
+                {
+                    "name": "Old Cafe",
+                    "place_type": "cafe",
+                    "city_area": "Da Nang",
+                    "event_types": [],
+                    "evidence": "Old Cafe",
+                    "confidence": 0.9,
+                }
+            ],
+            model="places-v2",
+            prompt_version="places-v2",
+        )
+
+        search.record_extraction(
+            corpus_id,
+            [
+                {
+                    "name": "New Terminal",
+                    "aliases": [],
+                    "entity_kind": "place",
+                    "access_modes": ["visit"],
+                    "descriptor": "bus terminal",
+                    "descriptor_language": "en",
+                    "offerings": ["bus tickets"],
+                    "city_area": "Da Nang",
+                    "evidence": "New Terminal sells bus tickets",
+                    "confidence": 0.95,
+                }
+            ],
+            model="entities-v4",
+        )
+
+        assert search.search_places(name_query="Old Cafe") == []
+        assert search.search_places(name_query="New Terminal")
+        state = search.conn.execute(
+            "SELECT active_prompt_version FROM extraction_state WHERE corpus_id=?",
+            (corpus_id,),
+        ).fetchone()[0]
+        assert state == "entities-v4"
+
+    def test_prompt_bump_creates_exactly_one_job_per_message(
+        self, search: SearchDatabase, sources: tuple[Path, Path]
+    ) -> None:
+        _sync(search, sources)
+
+        search._seed_extraction_state()
+        search._seed_extraction_state()
+
+        jobs = search.conn.execute(
+            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v4'"
+        ).fetchone()[0]
+        assert jobs == search.status()["messages_indexed"]
+
     def test_a_message_with_no_venue_is_closed_out_not_retried(
         self, search: SearchDatabase, sources: tuple[Path, Path]
     ) -> None:
@@ -584,20 +798,112 @@ class TestPlaces:
         corpus_id = self._corpus_id(search)
         search.record_extraction(corpus_id, [], model="m", error="RateLimitError: slow down")
         row = search.conn.execute(
-            "SELECT status, error FROM extraction_state WHERE corpus_id = ?", (corpus_id,)
+            "SELECT status, error FROM extraction_jobs WHERE corpus_id = ? "
+            "AND prompt_version='entities-v4'",
+            (corpus_id,),
         ).fetchone()
         assert row["status"] == "error"
         assert "RateLimit" in row["error"]
+        active = search.conn.execute(
+            "SELECT status FROM extraction_state WHERE corpus_id = ?", (corpus_id,)
+        ).fetchone()
+        assert active["status"] == "pending"
 
-    def test_short_messages_are_skipped_not_queued(
+    def test_short_messages_use_the_category_neutral_gate(
         self, search: SearchDatabase, sources: tuple[Path, Path]
     ) -> None:
         _sync(search, sources)
         skipped = search.conn.execute(
             "SELECT count(*) FROM extraction_state WHERE status = 'skipped'"
         ).fetchone()[0]
-        assert skipped > 0
-        assert all(len(r["text"]) >= 80 for r in search.pending_extractions(50))
+        assert skipped == 0
+        queued = search.conn.execute(
+            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v4'"
+        ).fetchone()[0]
+        assert queued == search.status()["messages_indexed"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Lotus Dental clinic, запись к стоматологу",
+            "MacLab Da Nang: ремонт MacBook",
+            "Rose Beauty Salon: стрижки и маникюр",
+        ],
+    )
+    def test_short_medical_and_service_places_bypass_the_length_gate(
+        self, search: SearchDatabase, text: str
+    ) -> None:
+        assert len(text) < 80
+        cur = search.conn.execute(
+            """
+            INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, text, date,
+                                         content_hash)
+            VALUES ('scout', -500, 1, ?, '2026-08-01T10:00:00+00:00', ?)
+            """,
+            (text, content_digest(text)),
+        )
+        corpus_id = int(cur.lastrowid or 0)
+        search.conn.execute(
+            "INSERT INTO extraction_state (corpus_id, status) VALUES (?, 'skipped')",
+            (corpus_id,),
+        )
+
+        search._seed_extraction_state()
+
+        status = search.conn.execute(
+            "SELECT status FROM extraction_state WHERE corpus_id = ?", (corpus_id,)
+        ).fetchone()["status"]
+        assert status == "pending"
+
+    def test_short_self_promo_with_contact_reaches_current_job(
+        self, search: SearchDatabase
+    ) -> None:
+        text = "Барбер Дананг, пишите в личку @someone"
+        assert len(text) < 80
+        cursor = search.conn.execute(
+            """
+            INSERT INTO corpus_messages (
+                source, chat_id, telegram_msg_id, text, date, content_hash
+            ) VALUES ('scout', -501, 1, ?, '2026-08-01T10:00:00+00:00', ?)
+            """,
+            (text, content_digest(text)),
+        )
+        corpus_id = int(cursor.lastrowid or 0)
+
+        search._seed_extraction_state()
+
+        job = search.conn.execute(
+            "SELECT status FROM extraction_jobs WHERE corpus_id=? AND prompt_version='entities-v4'",
+            (corpus_id,),
+        ).fetchone()
+        assert job["status"] == "pending"
+        assert corpus_id in {row["corpus_id"] for row in search.pending_extractions(20)}
+
+    @pytest.mark.parametrize(
+        ("corpus_id", "text"),
+        [
+            pytest.param(
+                111763,
+                "Очень хороший остеопат @osteonavt",
+                id="corpus-111763-short-handle-recommendation",
+            ),
+            pytest.param(
+                124011,
+                "@unraatdaria Даша - очень хороший остеопат",
+                id="corpus-124011-short-named-recommendation",
+            ),
+            pytest.param(
+                3596,
+                "Я в citi dental делала, второй год полет нормальный.",
+                id="corpus-3596-short-organization-recommendation",
+            ),
+        ],
+    )
+    def test_measured_short_golden_messages_reach_extraction(
+        self, corpus_id: int, text: str
+    ) -> None:
+        assert len(text) < 80, f"corpus_id {corpus_id} no longer exercises the old gate"
+        assert is_extraction_candidate(text)
 
 
 class TestChatReferences:
@@ -759,7 +1065,9 @@ class TestChunkedExtraction:
         from pipeline.indexer import PlaceExtractor
 
         self._queue(search, 12)
-        extractor = PlaceExtractor(search, client=object(), chunk_size=4, concurrency=2, pack_size=1)
+        extractor = PlaceExtractor(
+            search, client=object(), chunk_size=4, concurrency=2, pack_size=1
+        )
 
         async def fake(row: object) -> tuple[int, list[dict[str, object]], str | None]:
             return (
@@ -782,7 +1090,7 @@ class TestChunkedExtraction:
         real_pending = search.pending_extractions
         fetches = {"n": 0}
 
-        def dying_pending(limit: int) -> list[sqlite3.Row]:
+        def dying_pending(limit: int, **_kwargs: object) -> list[sqlite3.Row]:
             fetches["n"] += 1
             if fetches["n"] > 1:
                 raise HardStop("process died between chunks")
@@ -919,7 +1227,8 @@ class TestExtractionRetry:
         search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
         stale = (datetime.now(UTC) - timedelta(days=2)).isoformat(timespec="seconds")
         search.conn.execute(
-            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?", (stale, corpus_id)
+            "UPDATE extraction_jobs SET attempted_at = ? WHERE corpus_id = ?",
+            (stale, corpus_id),
         )
         search.conn.commit()
         assert corpus_id in {r["corpus_id"] for r in search.pending_extractions(50)}
@@ -936,7 +1245,7 @@ class TestExtractionRetry:
         search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
         seven_hours_ago = (datetime.now(UTC) - timedelta(hours=7)).isoformat(timespec="seconds")
         search.conn.execute(
-            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?",
+            "UPDATE extraction_jobs SET attempted_at = ? WHERE corpus_id = ?",
             (seven_hours_ago, corpus_id),
         )
         search.conn.commit()
@@ -994,6 +1303,84 @@ class TestExtractionRetry:
             ]
             == 0
         )
+        db.close()
+
+    def test_open_taxonomy_migration_feature_detects_and_backfills_legacy_rows(
+        self, tmp_path: Path
+    ) -> None:
+        legacy = tmp_path / "places-v2.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE corpus_messages (
+                    corpus_id INTEGER PRIMARY KEY, source TEXT NOT NULL, chat_id INTEGER NOT NULL,
+                    telegram_msg_id INTEGER NOT NULL, chat_title TEXT, sender_id INTEGER,
+                    sender_name TEXT, text TEXT NOT NULL, date TIMESTAMP NOT NULL,
+                    content_hash TEXT NOT NULL, indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, telegram_msg_id)
+                );
+                CREATE TABLE places (
+                    place_id INTEGER PRIMARY KEY, canonical TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL, aliases TEXT NOT NULL DEFAULT '[]', city_area TEXT,
+                    place_type TEXT, first_seen_at TIMESTAMP, last_seen_at TIMESTAMP,
+                    mention_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE place_mentions (
+                    mention_id INTEGER PRIMARY KEY, place_id INTEGER NOT NULL,
+                    corpus_id INTEGER NOT NULL, event_types TEXT NOT NULL DEFAULT '[]',
+                    evidence_quote TEXT NOT NULL, confidence REAL, extracted_by TEXT NOT NULL,
+                    extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(place_id, corpus_id)
+                );
+                CREATE TABLE extraction_state (
+                    corpus_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','extracted','no_venue','skipped','error','duplicate')),
+                    attempts INTEGER NOT NULL DEFAULT 0, attempted_at TIMESTAMP, error TEXT
+                );
+                CREATE VIRTUAL TABLE place_fts USING fts5(
+                    name, aliases, content='places', content_rowid='place_id', tokenize='trigram'
+                );
+                CREATE TRIGGER place_fts_ai AFTER INSERT ON places BEGIN
+                    INSERT INTO place_fts(rowid, name, aliases)
+                    VALUES (new.place_id, new.name, new.aliases);
+                END;
+                CREATE TRIGGER place_fts_ad AFTER DELETE ON places BEGIN
+                    INSERT INTO place_fts(place_fts, rowid, name, aliases)
+                    VALUES ('delete', old.place_id, old.name, old.aliases);
+                END;
+                CREATE TRIGGER place_fts_au AFTER UPDATE ON places BEGIN
+                    INSERT INTO place_fts(place_fts, rowid, name, aliases)
+                    VALUES ('delete', old.place_id, old.name, old.aliases);
+                    INSERT INTO place_fts(rowid, name, aliases)
+                    VALUES (new.place_id, new.name, new.aliases);
+                END;
+                INSERT INTO corpus_messages VALUES (
+                    1, 'scout', -1, 1, NULL, NULL, NULL, 'Sound Cafe concert',
+                    '2026-08-01', 'h1', CURRENT_TIMESTAMP
+                );
+                INSERT INTO places (
+                    place_id, canonical, name, city_area, place_type, mention_count
+                ) VALUES (1, 'sound cafe', 'Sound Cafe', 'Da Nang', 'cafe', 1);
+                INSERT INTO place_mentions (
+                    place_id, corpus_id, event_types, evidence_quote, confidence, extracted_by
+                ) VALUES (1, 1, '["concert"]', 'Sound Cafe concert', 0.9, 'places-v2');
+                INSERT INTO extraction_state (corpus_id, status) VALUES (1, 'extracted');
+                """
+            )
+
+        db = SearchDatabase(legacy)
+        db.connect()
+        place = db.conn.execute(
+            "SELECT entity_kind, access_modes, descriptor_text, offering_text FROM places"
+        ).fetchone()
+        assert tuple(place) == ("place", '["visit"]', "cafe", "concert")
+        assert db.status()["place_fts_next_rows"] == 1
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        jobs = db.conn.execute(
+            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v4'"
+        ).fetchone()[0]
+        assert jobs == 1
         db.close()
 
 
@@ -1055,7 +1442,8 @@ class TestTransientErrorClassification:
         search.record_extraction(corpus_id, [], model="m", error="APITimeoutError: timed out")
         stale = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
         search.conn.execute(
-            "UPDATE extraction_state SET attempted_at = ? WHERE corpus_id = ?", (stale, corpus_id)
+            "UPDATE extraction_jobs SET attempted_at = ? WHERE corpus_id = ?",
+            (stale, corpus_id),
         )
         search.conn.commit()
         assert corpus_id in {r["corpus_id"] for r in search.pending_extractions(50)}
@@ -1376,6 +1764,37 @@ class TestSenderNames:
         ).fetchone()
         assert row["sender_name"] is None
 
+    def test_a_handle_upgrades_an_older_display_only_identity(self, search: SearchDatabase) -> None:
+        rows = [
+            (-100, 1, 4242, "Иван", "Первое сообщение", "old-author"),
+            (
+                -100,
+                2,
+                4242,
+                "@barber_danang (Иван)",
+                "Я барбер, стригу мужчин в Дананге",
+                "handled-author",
+            ),
+        ]
+        search.conn.executemany(
+            """
+            INSERT INTO corpus_messages (
+                source, chat_id, telegram_msg_id, sender_id, sender_name, text, date,
+                content_hash
+            ) VALUES ('scout', ?, ?, ?, ?, ?, '2026-08-01T10:00:00+00:00', ?)
+            """,
+            rows,
+        )
+
+        assert search._resolve_sender_names() == 1
+        names = {
+            row["sender_name"]
+            for row in search.conn.execute(
+                "SELECT sender_name FROM corpus_messages WHERE sender_id = 4242"
+            )
+        }
+        assert names == {"@barber_danang (Иван)"}
+
 
 class TestSenderNameResolutionScales:
     def test_the_fill_does_not_scan_the_table_once_per_row(
@@ -1443,16 +1862,30 @@ class TestSenderNameResolutionScales:
 class TestCrosspostDedup:
     """The same announcement in five chats is one paid call, not five."""
 
-    def _crosspost(self, search: SearchDatabase, chats: list[int], text: str) -> list[int]:
+    def _crosspost(
+        self,
+        search: SearchDatabase,
+        chats: list[int],
+        text: str,
+        *,
+        sender_ids: list[int] | None = None,
+    ) -> list[int]:
+        if sender_ids is not None:
+            assert len(sender_ids) == len(chats)
         ids = []
-        for chat in chats:
+        for index, chat in enumerate(chats):
             cur = search.conn.execute(
                 """
-                INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, text, date,
-                                             content_hash)
-                VALUES ('scout', ?, 1, ?, '2026-07-01T10:00:00+00:00', ?)
+                INSERT INTO corpus_messages (
+                    source, chat_id, telegram_msg_id, sender_id, text, date, content_hash
+                ) VALUES ('scout', ?, 1, ?, ?, '2026-07-01T10:00:00+00:00', ?)
                 """,
-                (chat, text, content_digest(text)),
+                (
+                    chat,
+                    sender_ids[index] if sender_ids is not None else None,
+                    text,
+                    content_digest(text),
+                ),
             )
             ids.append(int(cur.lastrowid or 0))
         search.conn.commit()
@@ -1472,6 +1905,22 @@ class TestCrosspostDedup:
         )
         assert counts.get("pending") == 1
         assert counts.get("duplicate") == 2
+
+    def test_identical_self_promo_from_different_authors_is_not_deduplicated(
+        self, search: SearchDatabase
+    ) -> None:
+        text = "Я барбер, стригу мужчин в Дананге"
+        self._crosspost(search, [-100, -200], text, sender_ids=[700, 701])
+
+        search._seed_extraction_state()
+        search._mark_crosspost_duplicates()
+
+        counts = dict(
+            search.conn.execute(
+                "SELECT status, count(*) FROM extraction_state GROUP BY status"
+            ).fetchall()
+        )
+        assert counts == {"pending": 2}
 
     def test_every_crosspost_still_gets_its_own_mention(self, search: SearchDatabase) -> None:
         # The saving must be invisible in the result: dropping the copies'
@@ -1526,13 +1975,24 @@ class TestCrosspostDedup:
         search.record_extraction(paid, [], model="test", error="APITimeoutError: timed out")
 
         assert search.propagate_duplicates() == 0
-        assert search.conn.execute(
-            "SELECT count(*) FROM extraction_state WHERE status='duplicate'"
-        ).fetchone()[0] == 1
+        assert (
+            search.conn.execute(
+                "SELECT count(*) FROM extraction_state WHERE status='duplicate'"
+            ).fetchone()[0]
+            == 1
+        )
 
     def test_distinct_texts_are_never_collapsed(self, search: SearchDatabase) -> None:
-        self._crosspost(search, [-100], "Концерт в Sound Cafe в эту пятницу вечером, живая музыка, каверы и приятная публика, начало в семь")
-        self._crosspost(search, [-200], "Экстатик дэнс в Green Flow в эту субботу на закате, живая перкуссия и вокал, площадка прямо у реки")
+        self._crosspost(
+            search,
+            [-100],
+            "Концерт в Sound Cafe в эту пятницу вечером, живая музыка, каверы и приятная публика, начало в семь",
+        )
+        self._crosspost(
+            search,
+            [-200],
+            "Экстатик дэнс в Green Flow в эту субботу на закате, живая перкуссия и вокал, площадка прямо у реки",
+        )
 
         search._seed_extraction_state()
         search._mark_crosspost_duplicates()

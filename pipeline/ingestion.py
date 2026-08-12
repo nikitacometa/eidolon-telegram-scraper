@@ -11,7 +11,6 @@ from typing import Protocol
 from telethon.tl.types import (
     Channel,
     Chat,
-    User,
 )
 
 from storage.db import Database
@@ -111,13 +110,23 @@ async def ingest_message(
 
 
 def _get_sender_name(sender: object | None) -> str:
-    """Extract a display name from a Telethon sender entity."""
+    """Prefer a reachable Telegram handle while retaining the display name."""
     if sender is None:
         return "Unknown"
-    if isinstance(sender, User):
-        parts = [sender.first_name or "", sender.last_name or ""]
-        return " ".join(p for p in parts if p) or "Unknown"
-    return getattr(sender, "title", None) or getattr(sender, "username", None) or "Unknown"
+    return format_sender_identity(sender) or "Unknown"
+
+
+def format_sender_identity(sender: object) -> str | None:
+    """Return ``@handle (Display Name)`` when Telegram exposes both."""
+    parts = [getattr(sender, "first_name", None), getattr(sender, "last_name", None)]
+    display_name = " ".join(str(part).strip() for part in parts if part)
+    if not display_name:
+        display_name = str(getattr(sender, "title", None) or "").strip()
+    username = str(getattr(sender, "username", None) or "").strip().lstrip("@")
+    if username:
+        handle = f"@{username}"
+        return f"{handle} ({display_name})" if display_name else handle
+    return display_name or None
 
 
 def _get_chat_title(chat: object | None) -> str:

@@ -357,6 +357,6 @@ async def test_backfilled_messages_carry_their_senders_name(scout: ScoutDatabase
         "SELECT sender_id, sender_name FROM scout_messages ORDER BY telegram_msg_id"
     )
     names = {row[0]: row[1] for row in rows}
-    assert names[500] == "Аня Организатор"
+    assert names[500] == "@anya (Аня Организатор)"
     # No first or last name: the username is the only thing left to show.
-    assert names[501] == "quiet_one"
+    assert names[501] == "@quiet_one"

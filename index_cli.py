@@ -23,7 +23,12 @@ import sys
 
 from config.settings import settings
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
-from storage.search import SearchDatabase, build_fts_query, content_terms
+from storage.search import (
+    REEXTRACTABLE_STATUSES,
+    SearchDatabase,
+    build_fts_query,
+    content_terms,
+)
 from storage.session_lock import SessionInUseError, SessionLock
 
 # Commands that spend money or write the index. A timer tick landing on top of
@@ -80,7 +85,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "extract":
-            report = await PlaceExtractor(search).run(limit=args.limit)
+            report = await PlaceExtractor(search).run(limit=args.limit, statuses=args.statuses)
             print(json.dumps(report, indent=2))
             return 0
 
@@ -113,11 +118,15 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.command == "places":
             places = search.search_places(
                 name_query=args.name,
+                query=args.query,
                 city_area=args.city,
                 place_type=args.type,
                 event_types=[args.event] if args.event else None,
+                entity_kind=args.entity_kind,
+                access_mode=args.access_mode,
                 min_mentions=args.min_mentions,
                 limit=args.limit,
+                expanded_fts=args.expanded_fts,
             )
             print(json.dumps(places, indent=2, ensure_ascii=False))
             return 0
@@ -143,8 +152,15 @@ def main() -> int:
     sub.add_parser("sync", help="copy new messages from both stores")
     sub.add_parser("embed", help="embed messages that have no vector yet")
 
-    p_extract = sub.add_parser("extract", help="run the venue extraction pass")
+    p_extract = sub.add_parser("extract", help="run versioned entities-v4 extraction jobs")
     p_extract.add_argument("--limit", type=int, default=500)
+    p_extract.add_argument(
+        "--status",
+        dest="statuses",
+        action="append",
+        choices=sorted(REEXTRACTABLE_STATUSES),
+        help="re-extract a settled status (repeatable; bounded by --limit)",
+    )
 
     p_build = sub.add_parser("build", help="sync, embed and extract in one pass")
     p_build.add_argument("--limit", type=int, default=500)
@@ -157,11 +173,21 @@ def main() -> int:
     p_search.add_argument("--limit", type=int, default=20)
     p_search.add_argument("--lexical-only", action="store_true")
 
-    p_places = sub.add_parser("places", help="query the extracted venue index")
+    p_places = sub.add_parser("places", help="query the extracted entity index")
     p_places.add_argument("--name")
+    p_places.add_argument("--query")
     p_places.add_argument("--city")
     p_places.add_argument("--type")
     p_places.add_argument("--event")
+    p_places.add_argument("--entity-kind", choices=("place", "person", "organization"))
+    p_places.add_argument(
+        "--access-mode", choices=("visit", "house_call", "delivery", "remote", "unknown")
+    )
+    p_places.add_argument(
+        "--expanded-fts",
+        action="store_true",
+        help="read the shadow descriptor/offering index without changing production flags",
+    )
     p_places.add_argument("--min-mentions", type=int, default=1)
     p_places.add_argument("--limit", type=int, default=40)
 

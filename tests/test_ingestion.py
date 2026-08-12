@@ -86,6 +86,14 @@ async def test_ingestion_enqueues_expected_watcher_jobs(db: Database) -> None:
     }
 
 
+async def test_ingestion_prefers_sender_handle_when_available(db: Database) -> None:
+    message_id = await ingest_message(_telegram_event(), db)
+
+    assert message_id is not None
+    cursor = await db.conn.execute("SELECT sender_name FROM messages WHERE id = ?", (message_id,))
+    assert (await cursor.fetchone())[0] == "@alice"
+
+
 async def test_metadata_lookup_failure_does_not_drop_update(db: Database) -> None:
     event = _telegram_event()
     event.get_sender.side_effect = RuntimeError("telegram lookup failed")

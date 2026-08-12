@@ -152,29 +152,50 @@ class EidolonTools:
 
     async def search_places(
         self,
+        query: str | None = None,
         *,
         name: str | None = None,
         city: str | None = None,
         place_type: str | None = None,
         event_type: str | None = None,
+        entity_kind: str | None = None,
+        access_mode: str | None = None,
         min_mentions: int = 1,
         limit: int = 25,
         include_contacts: bool = True,
+        semantic: bool = True,
     ) -> dict[str, Any]:
         limit = max(1, min(limit, MAX_LIMIT))
+        query = query.strip() if query and query.strip() else None
+        name = name.strip() if name and name.strip() else None
+        semantic_requested = bool(query and semantic and settings.place_semantic_enabled)
+        vector = await self._embed(query) if query and semantic_requested else None
         rows = self._search.search_places(
             name_query=name,
+            query=query,
             city_area=city,
             place_type=place_type,
             event_types=[event_type] if event_type else None,
+            entity_kind=entity_kind,
+            access_mode=access_mode,
             min_mentions=min_mentions,
             limit=limit,
             include_contacts=include_contacts,
+            expanded_fts=settings.place_expanded_fts_enabled,
+            semantic_enabled=semantic_requested,
+            query_vector=vector,
+            embedding_model=settings.embedding_model,
+            semantic_cutoff=settings.place_semantic_cutoff,
         )
         status = self._search.status()
+        lanes = sorted({lane for row in rows for lane in row["matched_via"]})
         return {
             "result_count": len(rows),
             "places": rows,
+            "lanes_used": lanes,
+            "semantic_available": vector is not None,
+            "descriptor_embedding_backlog": status["descriptor_embedding_backlog"],
+            "active_prompt_version": status["active_prompt_version"],
             "index_coverage": {
                 "places_known": status["places"],
                 "messages_awaiting_extraction": status["extraction_backlog"],
@@ -449,20 +470,22 @@ READ_TOOLS = [
     Tool(
         name="search_places",
         description=(
-            "Search venues and physical places extracted from the message corpus — bars, "
-            "cafes, rooftops, studios, community spaces — with what happens at each and a "
-            "verbatim quote as evidence. Use this, not search_messages, when the question "
-            "is about WHERE something could happen or where events are held. Each place "
+            "Search named places, people, organizations, and local service providers with "
+            "verbatim source evidence. `name` constrains a brand/person identity; `query` "
+            "is an open category, offering, service, or activity. Each entity "
             "carries `contacts` (handles, phones, Instagram, map links published in the "
-            "messages that name it) and `posted_by` (who announces it, ranked by how often) "
-            "— so 'find a venue and how to reach them' is one call, not two."
+            "messages that name it) and `posted_by` (who announces it, ranked by how often)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
+                "query": {
+                    "type": ["string", "null"],
+                    "description": "Open category, offering, service, or activity query.",
+                },
                 "name": {
                     "type": ["string", "null"],
-                    "description": "Venue name; tolerant of typos and stylized spelling.",
+                    "description": "Brand or person name; tolerant of stylized spelling.",
                 },
                 "city": {"type": ["string", "null"], "description": "e.g. Da Nang, Hoi An"},
                 "place_type": {
@@ -473,12 +496,25 @@ READ_TOOLS = [
                     "type": ["string", "null"],
                     "description": "concert, live_music, dj_set, open_mic, jam, party, festival, quiz, board_games, film_screening, meetup, workshop, lecture, market, yoga, meditation, sound_healing, ecstatic_dance, retreat",
                 },
+                "entity_kind": {
+                    "type": ["string", "null"],
+                    "enum": ["place", "person", "organization", None],
+                },
+                "access_mode": {
+                    "type": ["string", "null"],
+                    "enum": ["visit", "house_call", "delivery", "remote", "unknown", None],
+                },
                 "min_mentions": {"type": ["integer", "null"], "default": 1},
                 "limit": {"type": ["integer", "null"], "default": 25, "maximum": 60},
                 "include_contacts": {
                     "type": ["boolean", "null"],
                     "default": True,
                     "description": "Set false only when scanning many places and contacts are not needed.",
+                },
+                "semantic": {
+                    "type": ["boolean", "null"],
+                    "default": True,
+                    "description": "Allow the descriptor semantic lane when deployment enables it.",
                 },
             },
         },

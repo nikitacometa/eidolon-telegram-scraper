@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     # is per-message text and per-message output, and the attribution risk keeps
     # growing. Set to 1 to restore one-message-per-call.
     extraction_pack_size: int = 20
+    # The expanded FTS reader is deployed dark. The shadow index is built and
+    # kept current, but production name search stays on ``place_fts`` until the
+    # live name-compatibility gate passes.
+    place_expanded_fts_enabled: bool = False
+    # Descriptor vectors are additive, but query-time embedding spends money
+    # and the cosine cutoff is not calibrated yet. A caller cannot bypass this
+    # deployment gate with an MCP argument.
+    place_semantic_enabled: bool = False
+    place_semantic_cutoff: float = Field(default=0.55, ge=-1.0, le=1.0)
     # The 5.6 family reasons before answering, so the old budget no longer
     # describes the same call. Measure p95 before tightening this again.
     llm_timeout_seconds: int = 45

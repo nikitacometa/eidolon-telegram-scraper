@@ -121,11 +121,61 @@ CREATE TABLE IF NOT EXISTS places (
     first_seen_at TIMESTAMP,
     last_seen_at TIMESTAMP,
     mention_count INTEGER NOT NULL DEFAULT 0,
+    -- Structural facets stay intentionally small. Subject categories live in
+    -- descriptor/open offering text and never require a schema change.
+    entity_kind TEXT NOT NULL DEFAULT 'place'
+        CHECK(entity_kind IN ('place', 'person', 'organization')),
+    access_modes TEXT NOT NULL DEFAULT '["visit"]' CHECK(json_valid(access_modes)),
+    primary_descriptor TEXT,
+    descriptor_text TEXT NOT NULL DEFAULT '',
+    offering_text TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_places_city ON places(city_area);
 CREATE INDEX IF NOT EXISTS idx_places_type ON places(place_type);
+CREATE TABLE IF NOT EXISTS descriptors (
+    descriptor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    normalized TEXT NOT NULL UNIQUE,
+    display_text TEXT NOT NULL,
+    language TEXT,
+    mention_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TIMESTAMP,
+    last_seen_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS place_descriptors (
+    place_id INTEGER NOT NULL REFERENCES places(place_id) ON DELETE CASCADE,
+    descriptor_id INTEGER NOT NULL REFERENCES descriptors(descriptor_id) ON DELETE CASCADE,
+    mention_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TIMESTAMP,
+    last_seen_at TIMESTAMP,
+    PRIMARY KEY (place_id, descriptor_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_place_descriptors_descriptor
+    ON place_descriptors(descriptor_id, place_id);
+
+CREATE TABLE IF NOT EXISTS descriptor_embeddings (
+    descriptor_id INTEGER NOT NULL REFERENCES descriptors(descriptor_id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'ready', 'error')),
+    dim INTEGER,
+    vec BLOB,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    attempted_at TIMESTAMP,
+    error TEXT,
+    embedded_at TIMESTAMP,
+    PRIMARY KEY (descriptor_id, model),
+    CHECK((status = 'ready' AND dim IS NOT NULL AND vec IS NOT NULL)
+        OR (status <> 'ready' AND vec IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_descriptor_embeddings_work
+    ON descriptor_embeddings(model, status, descriptor_id);
 
 CREATE TABLE IF NOT EXISTS place_mentions (
     mention_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,6 +187,12 @@ CREATE TABLE IF NOT EXISTS place_mentions (
     evidence_quote TEXT NOT NULL,
     confidence REAL,
     extracted_by TEXT NOT NULL,
+    descriptor_id INTEGER REFERENCES descriptors(descriptor_id),
+    descriptor_raw TEXT,
+    offerings_raw TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(offerings_raw)),
+    entity_kind_raw TEXT,
+    access_modes_raw TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(access_modes_raw)),
+    extractor_version TEXT NOT NULL DEFAULT 'places-v2',
     extracted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(place_id, corpus_id)
 );
@@ -195,10 +251,30 @@ CREATE TABLE IF NOT EXISTS extraction_state (
     -- from being retried for the rest of the corpus's life.
     attempts INTEGER NOT NULL DEFAULT 0,
     attempted_at TIMESTAMP,
-    error TEXT
+    error TEXT,
+    active_prompt_version TEXT NOT NULL DEFAULT 'places-v2'
 );
 
 CREATE INDEX IF NOT EXISTS idx_extraction_pending ON extraction_state(status, corpus_id);
+
+-- A prompt version is a durable unit of work. Failed replacement jobs leave
+-- the previous active extraction untouched and can be retried without
+-- creating another row or erasing paid output.
+CREATE TABLE IF NOT EXISTS extraction_jobs (
+    corpus_id INTEGER NOT NULL REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
+    prompt_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'running', 'succeeded', 'error')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    not_before TIMESTAMP,
+    attempted_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error TEXT,
+    PRIMARY KEY (corpus_id, prompt_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_jobs_work
+    ON extraction_jobs(prompt_version, status, not_before, corpus_id);
 
 -- Incremental cursors, one row per source stream.
 CREATE TABLE IF NOT EXISTS sync_state (
