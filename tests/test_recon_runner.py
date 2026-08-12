@@ -1,7 +1,7 @@
 """End-to-end tests for pipeline/recon.py against a fake Telegram."""
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,11 +70,17 @@ def _channel(channel_id: int, username: str, title: str, participants: int = 500
     )
 
 
+# Recon filters history against a sliding lookback window computed from now(), so a fixture
+# pinned to an absolute date silently expires once that date falls out of the window.
+# One value per run keeps the fixture deterministic within a run while staying inside it.
+FRESH_MESSAGE_DATE = datetime.now(UTC) - timedelta(days=1)
+
+
 def _message(message_id: int, text: str, chat_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         id=message_id,
         message=text,
-        date=datetime(2026, 7, 1, tzinfo=UTC),
+        date=FRESH_MESSAGE_DATE,
         entities=None,
         from_id=SimpleNamespace(user_id=1000 + message_id),
         fwd_from=None,
@@ -134,7 +140,12 @@ class FakeTelegram:
         if isinstance(request, GetHistoryRequest):
             self.history_calls += 1
             name = str(getattr(request.peer, "username", request.peer))
-            return SimpleNamespace(messages=self.history.get(name, []))
+            messages = self.history.get(name, [])
+            # Real Telegram pages backwards from offset_id. Without this the fake replays the
+            # same page forever, so "history ran out" can never be observed.
+            if request.offset_id:
+                messages = [message for message in messages if message.id < request.offset_id]
+            return SimpleNamespace(messages=messages)
         raise AssertionError(f"unexpected request: {type(request).__name__}")
 
 
