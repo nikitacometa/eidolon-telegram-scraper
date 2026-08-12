@@ -27,6 +27,7 @@ class TelegramMessage(Protocol):
     date: object
     sender_id: int | None
     fwd_from: object | None
+    reply_to: object | None
 
     def to_dict(self) -> dict[str, object]: ...
 
@@ -95,6 +96,7 @@ async def ingest_message(
         text=msg.text,
         date=msg.date.isoformat() if isinstance(msg.date, datetime) else str(msg.date),
         raw_json=raw_json,
+        reply_to_message_id=reply_to_message_id(msg),
         watcher_names=watcher_names,
         watcher_fingerprints=watcher_fingerprints,
     )
@@ -107,6 +109,13 @@ async def ingest_message(
         )
 
     return row_id
+
+
+def reply_to_message_id(message: object) -> int | None:
+    """Extract Telethon's nested reply target without treating the header as an integer."""
+    reply_header = getattr(message, "reply_to", None)
+    value = getattr(reply_header, "reply_to_msg_id", None)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _get_sender_name(sender: object | None) -> str:

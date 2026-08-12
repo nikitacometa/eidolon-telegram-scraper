@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS scout_messages (
     entities_json TEXT,
     forward_chat_id INTEGER,
     forward_message_id INTEGER,
+    reply_to_message_id INTEGER,
     content_hash TEXT,
     source TEXT NOT NULL DEFAULT 'live' CHECK(source IN ('live', 'backfill')),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

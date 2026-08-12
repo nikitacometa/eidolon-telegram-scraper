@@ -18,7 +18,7 @@ from telethon.tl.functions.messages import GetHistoryRequest
 
 from pipeline.discovery import ChatLink, extract_chat_links
 from pipeline.governor import ActionResult, ActionStatus, TelegramActionGovernor
-from pipeline.ingestion import format_sender_identity
+from pipeline.ingestion import format_sender_identity, reply_to_message_id
 from pipeline.recon_models import (
     ActionKind,
     ChatMembership,
@@ -199,6 +199,7 @@ class TelegramCrawler:
                     entities=[],
                     forward_chat_id=_peer_channel_id(forward_peer),
                     forward_message_id=_optional_int(getattr(forward, "channel_post", None)),
+                    reply_to_message_id=reply_to_message_id(item),
                     source="backfill",
                 )
             )

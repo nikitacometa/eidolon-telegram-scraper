@@ -137,6 +137,9 @@ async def test_connect_migrates_legacy_alerts_without_losing_sent_state(
             "llm_prompt_version",
             "llm_latency_ms",
         } <= columns
+        cursor = await migrated.conn.execute("PRAGMA table_info(messages)")
+        message_columns = {row[1] for row in await cursor.fetchall()}
+        assert {"reply_to_message_id", "reply_backfill_checked"} <= message_columns
     finally:
         await migrated.close()
 

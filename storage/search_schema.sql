@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS corpus_messages (
     source TEXT NOT NULL CHECK(source IN ('live', 'scout')),
     chat_id INTEGER NOT NULL,
     telegram_msg_id INTEGER NOT NULL,
+    reply_to_message_id INTEGER,
     chat_title TEXT,
     sender_id INTEGER,
     sender_name TEXT,

@@ -100,6 +100,17 @@ class ScoutDatabase:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._conn.executescript(SCOUT_SCHEMA_PATH.read_text())
+        columns = {
+            row[1]
+            for row in await (
+                await self._conn.execute("PRAGMA table_info(scout_messages)")
+            ).fetchall()
+        }
+        if "reply_to_message_id" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE scout_messages ADD COLUMN reply_to_message_id INTEGER"
+            )
+            logger.info("Migration: added scout_messages.reply_to_message_id")
         await self._conn.commit()
         logger.info("Scout database connected: %s", self.db_path)
 
@@ -1070,9 +1081,10 @@ class ScoutDatabase:
                 """
                 INSERT INTO scout_messages (
                     chat_id, telegram_msg_id, sender_id, sender_name, text, date,
-                    entities_json, forward_chat_id, forward_message_id, content_hash, source
+                    entities_json, forward_chat_id, forward_message_id, reply_to_message_id,
+                    content_hash, source
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
                 RETURNING telegram_msg_id
                 """,
@@ -1088,11 +1100,26 @@ class ScoutDatabase:
                     else None,
                     message.forward_chat_id,
                     message.forward_message_id,
+                    message.reply_to_message_id,
                     content_hash,
                     message.source,
                 ),
             )
             stored = await cursor.fetchone()
+            if stored is None and message.reply_to_message_id is not None:
+                await self.conn.execute(
+                    """
+                    UPDATE scout_messages
+                       SET reply_to_message_id = ?
+                     WHERE chat_id = ? AND telegram_msg_id = ?
+                       AND reply_to_message_id IS NULL
+                    """,
+                    (
+                        message.reply_to_message_id,
+                        message.chat_id,
+                        message.telegram_msg_id,
+                    ),
+                )
             await self.conn.commit()
         return stored is not None
 
@@ -1122,9 +1149,9 @@ class ScoutDatabase:
                         INSERT INTO scout_messages (
                             chat_id, telegram_msg_id, sender_id, sender_name, text, date,
                             entities_json, forward_chat_id, forward_message_id,
-                            content_hash, source
+                            reply_to_message_id, content_hash, source
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
                         RETURNING telegram_msg_id
                         """,
@@ -1140,12 +1167,28 @@ class ScoutDatabase:
                             else None,
                             message.forward_chat_id,
                             message.forward_message_id,
+                            message.reply_to_message_id,
                             content_hash,
                             message.source,
                         ),
                     )
-                    if await cursor.fetchone() is not None:
+                    inserted = await cursor.fetchone()
+                    if inserted is not None:
                         stored += 1
+                    elif message.reply_to_message_id is not None:
+                        await self.conn.execute(
+                            """
+                            UPDATE scout_messages
+                               SET reply_to_message_id = ?
+                             WHERE chat_id = ? AND telegram_msg_id = ?
+                               AND reply_to_message_id IS NULL
+                            """,
+                            (
+                                message.reply_to_message_id,
+                                message.chat_id,
+                                message.telegram_msg_id,
+                            ),
+                        )
                 await self.conn.commit()
             except BaseException:
                 await self.conn.rollback()

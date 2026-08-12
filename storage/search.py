@@ -379,6 +379,7 @@ class CorpusRow:
     date: str
     content_hash: str
     source: str
+    reply_to_message_id: int | None
     score: float = 0.0
     lanes: list[str] = field(default_factory=list)
     duplicate_chat_ids: list[int] = field(default_factory=list)
@@ -392,6 +393,7 @@ class CorpusRow:
             "chat_id": self.chat_id,
             "chat_title": self.chat_title,
             "message_link": message_link(self.chat_id, self.telegram_msg_id),
+            "reply_to_message_id": self.reply_to_message_id,
             "sender": self.sender_name,
             "date": self.date,
             "text": body,
@@ -541,6 +543,14 @@ class SearchDatabase:
             "active_prompt_version",
             "TEXT NOT NULL DEFAULT 'places-v2'",
         )
+        self._add_column("corpus_messages", "reply_to_message_id", "INTEGER")
+        # Answers are grouped by chat and parent id; the table's existing
+        # UNIQUE(chat_id, telegram_msg_id) index serves the parent side.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_corpus_reply "
+            "ON corpus_messages(chat_id, reply_to_message_id) "
+            "WHERE reply_to_message_id IS NOT NULL"
+        )
 
         # Legacy facets are compatibility projections only. They provide useful
         # lexical coverage before v3 backfill without pretending an English enum
@@ -661,16 +671,54 @@ class SearchDatabase:
         conn.execute("ATTACH DATABASE ? AS live", (f"file:{live_db}?mode=ro",))
         conn.execute("ATTACH DATABASE ? AS scout", (f"file:{scout_db}?mode=ro",))
         try:
+            live_reply_available = self._attached_column_exists(
+                "live", "messages", "reply_to_message_id"
+            )
+            scout_reply_available = self._attached_column_exists(
+                "scout", "scout_messages", "reply_to_message_id"
+            )
+            live_select_sql = (
+                """
+                SELECT id AS cursor, chat_id, telegram_msg_id, chat_title,
+                       sender_id, sender_name, text, date, NULL AS content_hash,
+                       reply_to_message_id
+                  FROM live.messages
+                 WHERE id > ? AND text IS NOT NULL AND trim(text) <> ''
+                 ORDER BY id LIMIT ?
+                """
+                if live_reply_available
+                else """
+                SELECT id AS cursor, chat_id, telegram_msg_id, chat_title,
+                       sender_id, sender_name, text, date, NULL AS content_hash,
+                       NULL AS reply_to_message_id
+                  FROM live.messages
+                 WHERE id > ? AND text IS NOT NULL AND trim(text) <> ''
+                 ORDER BY id LIMIT ?
+                """
+            )
+            scout_select_sql = (
+                """
+                SELECT rowid AS cursor, chat_id, telegram_msg_id, NULL AS chat_title,
+                       sender_id, sender_name, text, date, content_hash,
+                       reply_to_message_id
+                  FROM scout.scout_messages
+                 WHERE rowid > ? AND text IS NOT NULL AND trim(text) <> ''
+                 ORDER BY rowid LIMIT ?
+                """
+                if scout_reply_available
+                else """
+                SELECT rowid AS cursor, chat_id, telegram_msg_id, NULL AS chat_title,
+                       sender_id, sender_name, text, date, content_hash,
+                       NULL AS reply_to_message_id
+                  FROM scout.scout_messages
+                 WHERE rowid > ? AND text IS NOT NULL AND trim(text) <> ''
+                 ORDER BY rowid LIMIT ?
+                """
+            )
             stats = {
                 "live": self._sync_stream(
                     stream="live",
-                    select_sql="""
-                        SELECT id AS cursor, chat_id, telegram_msg_id, chat_title,
-                               sender_id, sender_name, text, date, NULL AS content_hash
-                          FROM live.messages
-                         WHERE id > ? AND text IS NOT NULL AND trim(text) <> ''
-                         ORDER BY id LIMIT ?
-                    """,
+                    select_sql=live_select_sql,
                     # messages.id is AUTOINCREMENT, so the retention purge that
                     # runs daily against this table can never cause an id to be
                     # reused. Drift detection here would only misread a purge as
@@ -682,13 +730,7 @@ class SearchDatabase:
                 ),
                 "scout": self._sync_stream(
                     stream="scout",
-                    select_sql="""
-                        SELECT rowid AS cursor, chat_id, telegram_msg_id, NULL AS chat_title,
-                               sender_id, sender_name, text, date, content_hash
-                          FROM scout.scout_messages
-                         WHERE rowid > ? AND text IS NOT NULL AND trim(text) <> ''
-                         ORDER BY rowid LIMIT ?
-                    """,
+                    select_sql=scout_select_sql,
                     # scout_messages has only a composite primary key, so its
                     # rowid is reused after a delete. Nothing deletes from it
                     # today, but a cursor that silently skips a row forever is
@@ -699,6 +741,10 @@ class SearchDatabase:
                     max_batches=max_batches,
                 ),
             }
+            stats["reply_links"] = self._reconcile_reply_links(
+                live_available=live_reply_available,
+                scout_available=scout_reply_available,
+            )
             self._refresh_chat_metadata()
             self._seed_extraction_state()
             stats["named"] = self._resolve_sender_names()
@@ -709,6 +755,56 @@ class SearchDatabase:
             conn.execute("DETACH DATABASE scout")
         self._vector_cache = None
         return stats
+
+    def _attached_column_exists(self, schema: str, table: str, column: str) -> bool:
+        """Feature-detect a source column before selecting from an older store."""
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA {schema}.table_info({table})")}
+        return column in columns
+
+    def _reconcile_reply_links(self, *, live_available: bool, scout_available: bool) -> int:
+        """Fill links on corpus rows synced before the source backfill ran."""
+        changed = 0
+        if live_available:
+            self.conn.execute(
+                """
+                UPDATE corpus_messages AS corpus
+                   SET reply_to_message_id = (
+                       SELECT live_message.reply_to_message_id
+                         FROM live.messages AS live_message
+                        WHERE live_message.chat_id = corpus.chat_id
+                          AND live_message.telegram_msg_id = corpus.telegram_msg_id
+                   )
+                 WHERE corpus.reply_to_message_id IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM live.messages AS live_message
+                        WHERE live_message.chat_id = corpus.chat_id
+                          AND live_message.telegram_msg_id = corpus.telegram_msg_id
+                          AND live_message.reply_to_message_id IS NOT NULL
+                   )
+                """
+            )
+            changed += int(self.conn.execute("SELECT changes()").fetchone()[0])
+        if scout_available:
+            self.conn.execute(
+                """
+                UPDATE corpus_messages AS corpus
+                   SET reply_to_message_id = (
+                       SELECT scout_message.reply_to_message_id
+                         FROM scout.scout_messages AS scout_message
+                        WHERE scout_message.chat_id = corpus.chat_id
+                          AND scout_message.telegram_msg_id = corpus.telegram_msg_id
+                   )
+                 WHERE corpus.reply_to_message_id IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM scout.scout_messages AS scout_message
+                        WHERE scout_message.chat_id = corpus.chat_id
+                          AND scout_message.telegram_msg_id = corpus.telegram_msg_id
+                          AND scout_message.reply_to_message_id IS NOT NULL
+                   )
+                """
+            )
+            changed += int(self.conn.execute("SELECT changes()").fetchone()[0])
+        return changed
 
     def _sync_stream(
         self,
@@ -771,6 +867,7 @@ class SearchDatabase:
                         r["sender_name"],
                         r["text"],
                         r["date"],
+                        r["reply_to_message_id"],
                         digest,
                     )
                 )
@@ -779,9 +876,15 @@ class SearchDatabase:
                     """
                     INSERT INTO corpus_messages (
                         source, chat_id, telegram_msg_id, chat_title,
-                        sender_id, sender_name, text, date, content_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
+                        sender_id, sender_name, text, date, reply_to_message_id, content_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, telegram_msg_id) DO UPDATE SET
+                        reply_to_message_id = COALESCE(
+                            excluded.reply_to_message_id,
+                            corpus_messages.reply_to_message_id
+                        )
+                    WHERE excluded.reply_to_message_id IS NOT NULL
+                      AND corpus_messages.reply_to_message_id IS NULL
                     """,
                     payload,
                 )
@@ -1281,7 +1384,8 @@ class SearchDatabase:
             """
             SELECT m.corpus_id, m.chat_id, m.telegram_msg_id,
                    COALESCE(m.chat_title, c.title) AS chat_title, m.sender_name,
-                   m.text, m.date, m.content_hash, m.source, bm25(corpus_fts) AS rank
+                   m.text, m.date, m.content_hash, m.source, m.reply_to_message_id,
+                   bm25(corpus_fts) AS rank
               FROM corpus_fts
               JOIN corpus_messages m ON m.corpus_id = corpus_fts.rowid
               LEFT JOIN corpus_chats c ON c.chat_id = m.chat_id
@@ -1363,7 +1467,7 @@ class SearchDatabase:
             """
             SELECT m.corpus_id, m.chat_id, m.telegram_msg_id,
                    COALESCE(m.chat_title, c.title) AS chat_title, m.sender_name,
-                   m.text, m.date, m.content_hash, m.source
+                   m.text, m.date, m.content_hash, m.source, m.reply_to_message_id
               FROM corpus_messages m
               LEFT JOIN corpus_chats c ON c.chat_id = m.chat_id
              WHERE m.corpus_id IN (SELECT value FROM json_each(?))
@@ -2498,6 +2602,61 @@ class SearchDatabase:
             ).fetchall()
         ]
 
+    def parent_text_for_reply(self, message: CorpusRow) -> str | None:
+        """Return a reply's parent text, or None for non-replies and corpus gaps."""
+        if message.reply_to_message_id is None:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT text FROM corpus_messages
+             WHERE chat_id = ? AND telegram_msg_id = ?
+            """,
+            (message.chat_id, message.reply_to_message_id),
+        ).fetchone()
+        return str(row["text"]) if row is not None else None
+
+    def reply_linkage_stats(self, *, chat_id: int | None = None) -> dict[str, object]:
+        """Measure reply coverage with explicit populations and question heuristic."""
+        row = self.conn.execute(
+            """
+            SELECT
+                count(*) AS rows_total,
+                count(answer.reply_to_message_id) AS reply_rows,
+                count(parent.corpus_id) AS replies_with_parent,
+                count(CASE
+                    WHEN parent.corpus_id IS NOT NULL
+                     AND (instr(parent.text, '?') > 0 OR instr(parent.text, '？') > 0)
+                    THEN 1
+                END) AS replies_whose_parent_is_question
+              FROM corpus_messages AS answer
+              LEFT JOIN corpus_messages AS parent
+                ON parent.chat_id = answer.chat_id
+               AND parent.telegram_msg_id = answer.reply_to_message_id
+             WHERE (? IS NULL OR answer.chat_id = ?)
+            """,
+            (chat_id, chat_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("reply linkage measurement returned no row")
+        return {
+            "scope": "whole_corpus" if chat_id is None else "chat",
+            "chat_id": chat_id,
+            "rows_total": int(row["rows_total"]),
+            "reply_rows": {
+                "count": int(row["reply_rows"]),
+                "population": "rows_total",
+            },
+            "replies_with_parent": {
+                "count": int(row["replies_with_parent"]),
+                "population": "reply_rows",
+            },
+            "replies_whose_parent_is_question": {
+                "count": int(row["replies_whose_parent_is_question"]),
+                "population": "replies_with_parent",
+                "question_rule": "parent text contains ? or full-width ？",
+            },
+        }
+
     def recent(
         self,
         *,
@@ -2510,7 +2669,7 @@ class SearchDatabase:
             """
             SELECT m.corpus_id, m.chat_id, m.telegram_msg_id,
                    COALESCE(m.chat_title, c.title) AS chat_title, m.sender_name,
-                   m.text, m.date, m.content_hash, m.source
+                   m.text, m.date, m.content_hash, m.source, m.reply_to_message_id
               FROM corpus_messages m
               LEFT JOIN corpus_chats c ON c.chat_id = m.chat_id
              WHERE 1=1
@@ -2595,6 +2754,7 @@ def _row_to_corpus(row: sqlite3.Row, *, lane: str) -> CorpusRow:
         date=row["date"],
         content_hash=row["content_hash"],
         source=row["source"],
+        reply_to_message_id=row["reply_to_message_id"],
         lanes=[lane] if lane in {"lexical", "semantic"} else [],
     )
 

@@ -1930,7 +1930,9 @@ class TestCrosspostDedup:
         # long and a short form, both of which fold to one canonical. The whole run died on
         # one message, so this must be tolerated, and one message vouching for one place is
         # one mention.
-        text = "Лучше всего Vinmec Da Nang International Hospital, я про Vinmec слышала только хорошее"
+        text = (
+            "Лучше всего Vinmec Da Nang International Hospital, я про Vinmec слышала только хорошее"
+        )
         corpus_id = self._crosspost(search, [-900], text)[0]
         search.record_extraction(
             corpus_id,

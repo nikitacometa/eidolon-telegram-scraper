@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
 
@@ -43,11 +44,53 @@ class DailyMessage(TypedDict):
     date: str
 
 
+@dataclass(frozen=True, slots=True)
+class ReplyBackfillReport:
+    """One bounded pass over legacy Telegram payloads."""
+
+    scanned: int
+    updated: int
+    no_reply: int
+    invalid_json: int
+    remaining: int
+
+    def as_dict(self) -> dict[str, int]:
+        """Return a stable CLI-friendly representation."""
+        return {
+            "scanned": self.scanned,
+            "updated": self.updated,
+            "no_reply": self.no_reply,
+            "invalid_json": self.invalid_json,
+            "remaining": self.remaining,
+        }
+
+
 def _normalize_delivery_error_code(error_code: str | None) -> str:
     """Return a bounded non-PII code suitable for durable storage."""
     if error_code is not None and _SAFE_ERROR_CODE.fullmatch(error_code):
         return error_code
     return "delivery_error"
+
+
+def _reply_id_from_raw_json(raw_json: str) -> tuple[int | None, bool]:
+    """Return ``(reply id, valid payload)`` from a serialized Telethon message."""
+    try:
+        payload = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return None, False
+    if not isinstance(payload, dict):
+        return None, False
+    reply_header = payload.get("reply_to")
+    if reply_header is None:
+        return None, True
+    if not isinstance(reply_header, dict):
+        return None, False
+    value = reply_header.get("reply_to_msg_id")
+    if value is None:
+        return None, True
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None, False
+    return value, True
 
 
 class Database:
@@ -88,6 +131,15 @@ class Database:
         if "chat_title" not in message_columns:
             await self.conn.execute("ALTER TABLE messages ADD COLUMN chat_title TEXT")
             logger.info("Migration: added chat_title column to messages")
+        if "reply_to_message_id" not in message_columns:
+            await self.conn.execute("ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER")
+            logger.info("Migration: added messages.reply_to_message_id")
+        if "reply_backfill_checked" not in message_columns:
+            await self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN reply_backfill_checked "
+                "INTEGER NOT NULL DEFAULT 0 CHECK(reply_backfill_checked IN (0, 1))"
+            )
+            logger.info("Migration: added messages.reply_backfill_checked")
 
         cursor = await self.conn.execute("PRAGMA table_info(alerts)")
         alert_columns = {row[1] for row in await cursor.fetchall()}
@@ -313,6 +365,7 @@ class Database:
         text: str | None,
         date: str,
         raw_json: str | None = None,
+        reply_to_message_id: int | None = None,
         watcher_names: Sequence[str] = (),
         watcher_fingerprints: Mapping[str, str] | None = None,
     ) -> int | None:
@@ -328,9 +381,10 @@ class Database:
                     """
                     INSERT INTO messages (
                         telegram_msg_id, chat_id, chat_title, sender_id,
-                        sender_name, text, date, raw_json
+                        sender_name, text, date, raw_json, reply_to_message_id,
+                        reply_backfill_checked
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
                     RETURNING id
                     """,
@@ -343,6 +397,7 @@ class Database:
                         text,
                         date,
                         raw_json,
+                        reply_to_message_id,
                     ),
                 )
                 inserted = await cursor.fetchone()
@@ -398,6 +453,73 @@ class Database:
             except BaseException:
                 await self.conn.rollback()
                 raise
+
+    async def backfill_reply_to_message_ids(self, *, limit: int) -> ReplyBackfillReport:
+        """Fill reply targets from stored raw payloads without contacting Telegram.
+
+        Each row is marked after inspection, including ordinary non-replies, so
+        repeated bounded calls advance instead of getting stuck on the same
+        prefix. The data update and progress marker share one transaction.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.conn.execute(
+                    """
+                    SELECT id, raw_json
+                      FROM messages
+                     WHERE reply_backfill_checked = 0 AND raw_json IS NOT NULL
+                     ORDER BY id
+                     LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = list(await cursor.fetchall())
+                updates: list[tuple[int | None, int]] = []
+                updated = 0
+                no_reply = 0
+                invalid_json = 0
+                for row in rows:
+                    reply_id, valid = _reply_id_from_raw_json(str(row["raw_json"]))
+                    if not valid:
+                        invalid_json += 1
+                    elif reply_id is None:
+                        no_reply += 1
+                    else:
+                        updated += 1
+                    updates.append((reply_id, int(row["id"])))
+
+                if updates:
+                    await self.conn.executemany(
+                        """
+                        UPDATE messages
+                           SET reply_to_message_id = ?, reply_backfill_checked = 1
+                         WHERE id = ?
+                        """,
+                        updates,
+                    )
+                cursor = await self.conn.execute(
+                    """
+                    SELECT count(*) FROM messages
+                     WHERE reply_backfill_checked = 0 AND raw_json IS NOT NULL
+                    """
+                )
+                remaining_row = await cursor.fetchone()
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.rollback()
+                raise
+
+        return ReplyBackfillReport(
+            scanned=len(rows),
+            updated=updated,
+            no_reply=no_reply,
+            invalid_json=invalid_json,
+            remaining=int(remaining_row[0]) if remaining_row is not None else 0,
+        )
 
     async def store_alert(
         self,

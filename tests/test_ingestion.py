@@ -26,6 +26,7 @@ def _telegram_event() -> SimpleNamespace:
         chat_id=-100123,
         text="Villa available near the beach",
         date=datetime(2026, 3, 4, 12, 0, tzinfo=UTC),
+        reply_to=None,
         to_dict=lambda: {"id": 42, "message": "Villa available near the beach"},
     )
     return SimpleNamespace(
@@ -124,3 +125,16 @@ async def test_optional_raw_payload_failure_does_not_drop_update(db: Database) -
     assert message_id is not None
     cursor = await db.conn.execute("SELECT raw_json FROM messages WHERE id = ?", (message_id,))
     assert (await cursor.fetchone())[0] is None
+
+
+async def test_live_ingestion_reads_nested_reply_header(db: Database) -> None:
+    event = _telegram_event()
+    event.message.reply_to = SimpleNamespace(reply_to_msg_id=19)
+
+    message_id = await ingest_message(event, db)
+
+    assert message_id is not None
+    cursor = await db.conn.execute(
+        "SELECT reply_to_message_id FROM messages WHERE id = ?", (message_id,)
+    )
+    assert (await cursor.fetchone())[0] == 19

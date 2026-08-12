@@ -9,6 +9,8 @@
     python3 index_cli.py search "концерт бар живая музыка"
     python3 index_cli.py places --event concert --city "Da Nang"
     python3 index_cli.py refs             # unjoined chats mentioned in the corpus
+    python3 index_cli.py backfill-replies --limit 5000
+    python3 index_cli.py reply-stats [--chat-id -100123]
 
 Safe to interrupt: every stage tracks its own cursor and resumes.
 """
@@ -23,6 +25,7 @@ import sys
 
 from config.settings import settings
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
+from storage.db import Database
 from storage.search import (
     REEXTRACTABLE_STATUSES,
     SearchDatabase,
@@ -66,6 +69,16 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "backfill-replies":
+        database = Database(settings.db_path)
+        await database.connect()
+        try:
+            reply_report = await database.backfill_reply_to_message_ids(limit=args.limit)
+        finally:
+            await database.close()
+        print(json.dumps(reply_report.as_dict(), indent=2))
+        return 0
+
     with SearchDatabase(settings.search_db_path) as search:
         search.connect()
 
@@ -138,6 +151,16 @@ async def _dispatch(args: argparse.Namespace) -> int:
             print(json.dumps(references, indent=2, ensure_ascii=False))
             return 0
 
+        if args.command == "reply-stats":
+            print(
+                json.dumps(
+                    search.reply_linkage_stats(chat_id=args.chat_id),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
     return 1
 
 
@@ -151,6 +174,16 @@ def main() -> int:
     sub.add_parser("status", help="index counts and backlogs")
     sub.add_parser("sync", help="copy new messages from both stores")
     sub.add_parser("embed", help="embed messages that have no vector yet")
+
+    p_backfill_replies = sub.add_parser(
+        "backfill-replies", help="fill reply ids from stored live raw_json; no Telegram calls"
+    )
+    p_backfill_replies.add_argument("--limit", type=int, default=5000)
+
+    p_reply_stats = sub.add_parser(
+        "reply-stats", help="measure reply-parent coverage in the corpus"
+    )
+    p_reply_stats.add_argument("--chat-id", type=int)
 
     p_extract = sub.add_parser("extract", help="run versioned entities-v4 extraction jobs")
     p_extract.add_argument("--limit", type=int, default=500)

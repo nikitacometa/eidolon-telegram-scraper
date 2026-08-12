@@ -34,7 +34,7 @@ from pipeline.dispatcher import AlertDispatcher
 from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.governor import TelegramActionGovernor
-from pipeline.ingestion import NewMessageEvent, ingest_message
+from pipeline.ingestion import NewMessageEvent, ingest_message, reply_to_message_id
 from pipeline.joiner import JoinWorker
 from pipeline.llm import LLMClassifier
 from pipeline.models import (
@@ -521,6 +521,7 @@ class Eidolon:
                 forward_message_id=(
                     int(getattr(forward, "channel_post", 0)) or None if forward else None
                 ),
+                reply_to_message_id=reply_to_message_id(message),
                 source="live",
             )
         )

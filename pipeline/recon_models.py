@@ -377,6 +377,7 @@ class ScoutMessage:
     entities: list[dict[str, object]] = field(default_factory=list)
     forward_chat_id: int | None = None
     forward_message_id: int | None = None
+    reply_to_message_id: int | None = None
     source: str = "live"
 
     def __post_init__(self) -> None:

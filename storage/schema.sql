@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT,
     date TIMESTAMP NOT NULL,
     raw_json TEXT,
+    reply_to_message_id INTEGER,
+    reply_backfill_checked INTEGER NOT NULL DEFAULT 0
+        CHECK(reply_backfill_checked IN (0, 1)),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(chat_id, telegram_msg_id)
 );

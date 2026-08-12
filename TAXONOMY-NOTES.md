@@ -479,3 +479,67 @@ Two defects were found by this pilot that no offline test caught, both now fixed
 the packed message (self-promotion invisible). Both are exactly the class of failure a
 mocked test cannot see — the lesson is that at least one live path must be exercised
 before an extractor is called done.
+
+## Reply linkage
+
+`reply_to_message_id` теперь проходит через live ingestion и reconnaissance capture/backfill в
+`messages` / `scout_messages`, затем в `corpus_messages`. Значение читается из
+`message.reply_to.reply_to_msg_id`: сам `MessageReplyHeader` не трактуется как integer. Все три
+таблицы мигрируются feature detection без пересоздания. Повторный scout crawl обогащает уже
+существующую строку reply link, но не считает её новым сообщением; последующий corpus sync
+reconcile-ит строки, которые были проиндексированы до backfill.
+
+Для answer-to-parent lookup используется `SearchDatabase.parent_text_for_reply()`. Non-reply и
+reply с отсутствующим в corpus parent возвращают `None`; отсутствие parent является штатным. На
+`corpus_messages` создаётся partial index `(chat_id, reply_to_message_id)` для сканирования answers
+и measurement join. Parent lookup уже покрыт существующим UNIQUE index
+`(chat_id, telegram_msg_id)`, отдельный parent index не нужен.
+
+Bounded offline backfill live `raw_json` (повторять, пока `remaining` не станет `0`):
+
+```bash
+uv run python index_cli.py backfill-replies --limit 5000
+```
+
+Команда печатает `scanned`, `updated`, `no_reply`, `invalid_json` и `remaining`. Проверенные
+non-reply строки помечаются отдельно от nullable reply id, поэтому следующий запуск двигается
+дальше, а не перечитывает один и тот же prefix. Telegram и provider API команда не вызывает.
+Строки без сохранённого `raw_json` восстановить offline невозможно.
+
+После backfill или re-scrape сначала обновить derived corpus, затем измерить весь corpus:
+
+```bash
+uv run python index_cli.py sync
+uv run python index_cli.py reply-stats
+```
+
+Или один chat:
+
+```bash
+uv run python index_cli.py reply-stats --chat-id -1001234567890
+```
+
+JSON явно называет population каждого числа: `reply_rows` считается от `rows_total`,
+`replies_with_parent` от `reply_rows`, `replies_whose_parent_is_question` от
+`replies_with_parent`. Последняя метрика использует только наличие `?` или full-width `？` в parent
+text. Это слабое место плана: вопросы без знака вопроса будут undercounted, а риторические вопросы
+попадут в count. Для первого viability measurement прозрачная deterministic эвристика лучше
+скрытого LLM-вызова, но число нельзя называть semantic question recall. Исторический scout corpus
+не получит links сам по себе: для него по-прежнему нужен re-scrape.
+
+Offline verification: `mypy --strict` проверил 39 source files, `ruff format --check .` проверил
+74 files, `ruff check .` прошёл. Full `pytest --cov` дал `652 passed`, total coverage `85.49%` и
+единственный разрешённый failure
+`test_backfill_stops_when_history_runs_out` (`history_calls=2`, expected `1`); test и pagination
+semantics не менялись. Оба новых CLI subcommand отдельно прошли на temporary SQLite databases.
+
+Четыре production-value mutation были проверены после `py_compile`; каждый named test стал red,
+после восстановления все четыре снова green:
+
+- crawler reply id `17` заменялся на `18` — падал
+  `test_reply_field_survives_crawler_store_and_corpus_sync`;
+- raw payload key `reply_to_msg_id` заменялся на `reply_to_msg_id_mutated` — падал
+  `test_raw_json_reply_backfill_is_idempotent`;
+- missing-parent fallback `None` заменялся на empty string — падал
+  `test_reply_with_absent_parent_returns_none`;
+- non-reply fallback `None` заменялся на empty string — падал `test_non_reply_returns_none`.
