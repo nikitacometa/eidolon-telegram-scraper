@@ -1922,6 +1922,44 @@ class TestCrosspostDedup:
         )
         assert counts == {"pending": 2}
 
+    def test_one_message_naming_a_place_twice_yields_one_mention(
+        self, search: SearchDatabase
+    ) -> None:
+        # Measured on production 2026-08-12: a targeted re-extraction aborted with
+        # UNIQUE(place_id, corpus_id) because a single message named the same hospital in a
+        # long and a short form, both of which fold to one canonical. The whole run died on
+        # one message, so this must be tolerated, and one message vouching for one place is
+        # one mention.
+        text = "Лучше всего Vinmec Da Nang International Hospital, я про Vinmec слышала только хорошее"
+        corpus_id = self._crosspost(search, [-900], text)[0]
+        search.record_extraction(
+            corpus_id,
+            [
+                {
+                    "name": "Vinmec Da Nang International Hospital",
+                    "place_type": "hospital",
+                    "city_area": "Da Nang",
+                    "event_types": [],
+                    "evidence": "Лучше всего Vinmec Da Nang International Hospital",
+                    "confidence": 0.9,
+                },
+                {
+                    "name": "Vinmec Da Nang International Hospital",
+                    "place_type": "hospital",
+                    "city_area": "Da Nang",
+                    "event_types": [],
+                    "evidence": "я про Vinmec слышала только хорошее",
+                    "confidence": 0.8,
+                },
+            ],
+            model="test",
+        )
+
+        mentions = search.conn.execute(
+            "SELECT COUNT(*) AS n FROM place_mentions WHERE corpus_id = ?", (corpus_id,)
+        ).fetchone()["n"]
+        assert mentions == 1
+
     def test_every_crosspost_still_gets_its_own_mention(self, search: SearchDatabase) -> None:
         # The saving must be invisible in the result: dropping the copies'
         # place_mentions would quietly change every venue's mention count.

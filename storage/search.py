@@ -1705,6 +1705,14 @@ class SearchDatabase:
             new_ids: set[int] = set()
             for entity in validated:
                 place_id = self._upsert_entity(corpus_id, entity)
+                # The extractor sometimes returns the same entity twice for one message, and both
+                # copies fold to one canonical. The DELETE above already cleared this message's
+                # old mentions, so a second insert here can only be that self-collision -- which
+                # aborted a whole production run on UNIQUE(place_id, corpus_id) (2026-08-12,
+                # after 452 messages). Skipping is also the right semantics: one message
+                # vouching for one place is one mention, however many times it says the name.
+                if place_id in new_ids:
+                    continue
                 new_ids.add(place_id)
                 descriptor_id = self._upsert_descriptor(
                     entity, embedding_model=descriptor_embedding_model
