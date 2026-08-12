@@ -1,0 +1,12 @@
+{
+  "dataset": "place-retrieval-golden-v1",
+  "fixture": "place-retrieval-fixture-v1",
+  "k": 5,
+  "metrics": {
+    "macro_recall_at_5": 1.0,
+    "pooled_precision_at_5": 1.0,
+    "positive_non_empty_share": 1.0,
+    "negative_non_empty_share": 0.0,
+    "name_compatibility_recall_at_5": 1.0
+  }
+}

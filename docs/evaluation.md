@@ -68,3 +68,33 @@ negative, so recall is `0.75`; no prompt or threshold was tuned against this res
 next milestone is an uncertainty-routing experiment on a development corpus, followed by
 a newly authored blind set. Reported token and provider-call totals cover per-message
 inference; one-time reference index seeding is excluded.
+
+## Entity Retrieval Gate
+
+Open-taxonomy retrieval has a separate 48-query JSONL contract. Forty-two cases are
+verified against the anonymized raw-message fixture; six hookah cases are explicitly
+`pending_evidence` and are reported but not scored. The pending marker is not a positive
+label: production evidence currently shows marketplace ads, not a named lounge, and the
+owner's live sweep must decide whether those cases become verified `must_be_empty` cases.
+
+The deterministic CI command makes no provider calls:
+
+```bash
+uv run eidolon-place-eval \
+  --dataset evals/data/place-retrieval-golden-v1.jsonl \
+  --fixture evals/data/place-retrieval-fixture-v1.db \
+  --query-vectors evals/data/place-query-vectors-v1.npz \
+  --k 5 \
+  --fail-on-regression docs/place-retrieval-baseline-v1.json
+```
+
+The deployment smoke is lexical-only and has a five-second budget:
+
+```bash
+uv run eidolon-place-eval --smoke --db data/eidolon_search.db --timeout 5
+```
+
+The smoke checks migration invariants, old/new name lookup, SYNCHØUSE folding, terminal
+retrieval, honest empty behavior, FTS row parity, active prompt version, and descriptor
+embedding backlog. It reports evidence-dependent checks as pending; it does not turn
+missing labels into green results and does not replace the full gate.

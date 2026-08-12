@@ -1,0 +1,6 @@
+{"id":"person-short-barber-contact","message":"Барбер Дананг, пишите в личку @someone","expected_entity_count":1,"expected_entity_kind":"person","boundary":"ongoing_service"}
+{"id":"marketplace-used-phone","message":"Продам iPhone 13, 128GB, пишите @seller","expected_entity_count":0,"boundary":"one_off_marketplace"}
+{"id":"marketplace-short-bike-rental","message":"Сдам байк на три дня, телефон +84 905 123 456","expected_entity_count":0,"boundary":"one_off_marketplace"}
+{"id":"service-repair-house-call","message":"Сергей @sergeyrepair ремонтирует айфоны с выездом по Данангу","expected_entity_count":1,"expected_entity_kind":"person","boundary":"ongoing_service"}
+{"id":"author-self-promo-barber","author":"@barber_danang (Иван)","message":"Я барбер, стригу мужчин в Дананге","expected_entity_count":1,"expected_entity_kind":"person","expected_name":"@barber_danang","boundary":"author_identity_for_ongoing_service"}
+{"id":"author-ordinary-chatter","author":"@weather_person (Пётр)","message":"Сегодня отличная погода","expected_entity_count":0,"boundary":"author_metadata_only"}

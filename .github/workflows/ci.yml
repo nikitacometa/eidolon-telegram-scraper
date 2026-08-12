@@ -55,6 +55,15 @@ jobs:
       - name: Type check
         run: uv run mypy
 
+      - name: Open-taxonomy retrieval gate
+        run: >-
+          uv run eidolon-place-eval
+          --dataset evals/data/place-retrieval-golden-v1.jsonl
+          --fixture evals/data/place-retrieval-fixture-v1.db
+          --query-vectors evals/data/place-query-vectors-v1.npz
+          --k 5
+          --fail-on-regression docs/place-retrieval-baseline-v1.json
+
       - name: Test with coverage
         run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
 
