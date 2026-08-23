@@ -115,6 +115,12 @@ def test_search_terms_cover_every_spelling_and_keep_the_topic() -> None:
 
 def test_search_terms_without_a_place_fall_back_to_the_topic() -> None:
     assert _search_terms(build_policy(topic="handpan", location=None)) == (["handpan"], ["handpan"])
+    # A hashtag is one token: the policy splits the topic on whitespace before
+    # it gets here, so a multi-word topic never reaches the hashtag surface whole.
+    assert _search_terms(build_policy(topic="expats community", location=None)) == (
+        ["expats"],
+        ["expats"],
+    )
 
 
 def test_replace_keeps_the_rest_of_the_job() -> None:
