@@ -185,6 +185,17 @@ class ScoutDatabase:
             row = await cursor.fetchone()
         return _job_from_row(row) if row is not None else None
 
+    async def next_queued_job(self) -> ReconJob | None:
+        """The oldest job nobody has started, for the in-daemon discovery worker."""
+        async with self.conn.execute(
+            # created_at has second resolution; two jobs queued in one second keep
+            # their insertion order through rowid rather than a random uuid.
+            "SELECT * FROM recon_jobs WHERE status = ? ORDER BY created_at, rowid LIMIT 1",
+            (ReconJobStatus.QUEUED.value,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _job_from_row(row) if row is not None else None
+
     async def active_jobs(self) -> list[ReconJob]:
         """Return jobs that a restarted scheduler must pick back up."""
         placeholders = ",".join("?" for _ in ACTIVE_JOB_STATUSES)

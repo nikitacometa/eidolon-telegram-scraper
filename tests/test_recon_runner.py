@@ -103,6 +103,8 @@ class FakeTelegram:
         self.join_error = join_error
         self.joined: list[str] = []
         self.history_calls = 0
+        self.title_queries: list[str] = []
+        self.hashtag_queries: list[str] = []
         self.entities = {
             channel.username: channel for channel in (search_results or []) if channel.username
         }
@@ -121,6 +123,7 @@ class FakeTelegram:
 
     async def __call__(self, request: object) -> object:
         if isinstance(request, SearchPostsRequest):
+            self.hashtag_queries.append(str(request.hashtag))
             return SimpleNamespace(
                 chats=list(self.search_results),
                 messages=[
@@ -130,6 +133,7 @@ class FakeTelegram:
                 users=[],
             )
         if isinstance(request, ContactsSearchRequest):
+            self.title_queries.append(str(request.q))
             return SimpleNamespace(chats=[], users=[], messages=[])
         if isinstance(request, JoinChannelRequest):
             name = str(getattr(request.channel, "username", request.channel))
@@ -464,3 +468,30 @@ async def test_discovery_only_run_scores_without_touching_anything(
     assert [finding.chat_ref for finding in report.recommended] == ["danang_housing"]
     assert report.rejected == 1
     assert await db.observation_snapshot() == {}
+
+
+async def test_title_search_runs_over_every_spelling_of_the_place(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A Russian chat is titled «Далат», a Vietnamese one «Đà Lạt»; the Latin form finds neither."""
+    client = FakeTelegram(search_results=[])
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="dalat-titles",
+            topic="expats community",
+            location="Da Lat, Vietnam",
+            max_join_attempts=0,
+        )
+    )
+
+    await _runner(scout, db, client, pages=1).run(job)
+
+    assert client.title_queries == [
+        "da lat",
+        "da lat expats",
+        "dalat",
+        "далат",
+        "да лат",
+        "đà lạt",
+    ]
+    assert client.hashtag_queries == ["dalat", "dalatexpats", "далат", "đàlạt"]

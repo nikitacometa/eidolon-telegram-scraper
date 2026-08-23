@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # standing on history nobody requested.
     backfill_enabled: bool = False
     join_queue_enabled: bool = False
+    # Discovery jobs (Telegram's own chat search) run inside the daemon, which
+    # owns the session. Off, a job an agent submits would sit queued forever,
+    # so the bridge refuses to accept one.
+    discovery_enabled: bool = False
     # Watchers the assistant creates reach the daemon by polling a revision
     # counter. Off means an agent can still write one, and it will take effect
     # at the next restart rather than never -- but the tool would be reporting

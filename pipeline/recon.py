@@ -215,9 +215,15 @@ class ReconRunner:
         return None
 
     async def _search_surfaces(self, job: ReconJob, policy: ScoringPolicy) -> str | None:
-        """Query Telegram's public search surfaces for the job's topic."""
-        queries = _search_terms(policy)
-        for term in queries:
+        """Query Telegram's public search surfaces for the job's topic.
+
+        Title search runs over every spelling of the place, not the first two:
+        a Russian chat is titled «Далат», a Vietnamese one «Đà Lạt», and the
+        Latin form finds neither. The title surface is also the one that
+        returns chats rather than posts, so it gets the wider net.
+        """
+        hashtags, titles = _search_terms(policy)
+        for term in hashtags:
             result = await self._discovery.search_hashtag(job_id=job.id, hashtag=term)
             halt = _halt_reason(result)
             if halt is not None:
@@ -225,7 +231,7 @@ class ReconRunner:
             for described in result.value or ():
                 await self._register(job, described, wave=0)
 
-        for term in queries[:2]:
+        for term in titles:
             result = await self._discovery.search_contacts(job_id=job.id, query=term)
             halt = _halt_reason(result)
             if halt is not None:
@@ -469,12 +475,37 @@ def _from_stored(chat: object) -> DiscoveredChat:
     )
 
 
-def _search_terms(policy: ScoringPolicy) -> list[str]:
-    """Build the query list for wave zero, city first."""
-    terms = [term.replace(" ", "") for term in policy.location_keywords[:3]]
-    if policy.location_keywords and policy.topic_keywords:
-        terms.append(f"{policy.location_keywords[0].replace(' ', '')}{policy.topic_keywords[0]}")
-    return list(dict.fromkeys(term for term in terms if term))
+# Hashtag search costs 10 calls an hour, title search 10 more; wave zero must
+# fit inside both with room for a second job the same hour.
+MAX_HASHTAG_QUERIES = 4
+MAX_TITLE_QUERIES = 6
+
+
+def _search_terms(policy: ScoringPolicy) -> tuple[list[str], list[str]]:
+    """Build wave-zero queries: hashtags without spaces, titles as written.
+
+    Both lists put the place first. A hashtag is one token, so spellings with a
+    space collapse; a title query keeps the space because that is how people
+    name chats. The last entry of each pairs the place with the topic.
+    """
+    places = [term for term in policy.location_keywords if term]
+    topic = policy.topic_keywords[0] if policy.topic_keywords else None
+    if not places:
+        return ([topic] if topic else []), ([topic] if topic else [])
+
+    # The place-plus-topic pair goes second, before the other spellings: when
+    # the cap bites, a spelling is a better loss than the topic itself.
+    hashtags = [places[0].replace(" ", "")]
+    titles = [places[0]]
+    if topic:
+        hashtags.append(f"{places[0].replace(' ', '')}{topic}")
+        titles.append(f"{places[0]} {topic}")
+    hashtags.extend(place.replace(" ", "") for place in places[1:])
+    titles.extend(places[1:])
+    return (
+        list(dict.fromkeys(hashtags))[:MAX_HASHTAG_QUERIES],
+        list(dict.fromkeys(titles))[:MAX_TITLE_QUERIES],
+    )
 
 
 def _halt_reason(result: ActionResult[object]) -> str | None:

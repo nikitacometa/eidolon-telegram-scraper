@@ -28,6 +28,7 @@ import logging
 import os
 import sqlite3
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -271,6 +272,154 @@ class EidolonTools:
                 "means many people in the monitored chats linked it."
             ),
         }
+
+    async def discover_chats(
+        self,
+        *,
+        topic: str,
+        location: str | None = None,
+        seeds: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Ask the daemon to search Telegram itself for chats about a place.
+
+        This is the only tool that reaches chats nobody in the corpus has
+        linked yet. It spends the account's search budget (a few calls an
+        hour), so one job per topic and place per day collapses onto the same
+        row, and the job never joins: joining stays with ``queue_chat_join``.
+        """
+        if not self._writable:
+            raise PermissionError("this bridge runs read-only; discovery is not available")
+        if not settings.discovery_enabled:
+            raise RuntimeError(
+                "discovery is switched off on this deployment (DISCOVERY_ENABLED=false), "
+                "so a job would never be executed"
+            )
+        topic = topic.strip()
+        if not topic:
+            raise ValueError("topic is empty")
+        place = location.strip() if location else None
+        clean_seeds = [normalize_username(seed) for seed in (seeds or []) if seed.strip()]
+        key = f"mcp:{topic.lower()}:{(place or '').lower()}:{datetime.now(UTC):%Y-%m-%d}"
+
+        with sqlite3.connect(f"file:{self._scout_db}", uri=True, timeout=15.0) as conn:
+            conn.execute("PRAGMA busy_timeout=15000")
+            existing = conn.execute(
+                "SELECT id, status FROM recon_jobs WHERE idempotency_key = ?", (key,)
+            ).fetchone()
+            if existing:
+                return {
+                    "job_id": existing[0],
+                    "queued": False,
+                    "already": existing[1],
+                    "note": "Same topic and place today; read discovery_results for it.",
+                }
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO recon_jobs (
+                    id, idempotency_key, topic, location, seeds, status,
+                    max_waves, lookback_days, max_join_attempts, deadline_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'queued', 1, 30, 0, datetime('now', '+1 day'))
+                """,
+                (job_id, key, topic, place, json.dumps(clean_seeds, separators=(",", ":"))),
+            )
+            conn.commit()
+        return {
+            "job_id": job_id,
+            "queued": True,
+            "note": (
+                "Queued. The daemon searches Telegram's chat titles and hashtags for every "
+                "spelling of the place within a minute or two, scores what it finds, and "
+                "joins nothing. Call discovery_results with this job_id after a few minutes; "
+                "then queue_chat_join the ones worth having."
+            ),
+        }
+
+    async def discovery_results(
+        self, *, job_id: str | None = None, limit: int = 60
+    ) -> dict[str, Any]:
+        """What a discovery job found, newest job first when none is named."""
+        limit = max(1, min(limit, MAX_LIMIT))
+        with sqlite3.connect(f"file:{self._scout_db}?mode=ro", uri=True, timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            if job_id is None:
+                row = conn.execute(
+                    "SELECT * FROM recon_jobs ORDER BY created_at DESC, id DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM recon_jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                return {"job": None, "result_count": 0, "candidates": [], "recent_jobs": []}
+            candidates = conn.execute(
+                """
+                SELECT c.state, c.policy_score, c.independent_sources, c.risk_flags, c.wave,
+                       s.username, s.title, s.chat_type, s.participants, s.telegram_chat_id,
+                       s.visibility, s.membership
+                FROM job_candidates c JOIN scout_chats s ON s.id = c.chat_uuid
+                WHERE c.job_id = ?
+                ORDER BY COALESCE(c.policy_score, -1) DESC, c.id
+                LIMIT ?
+                """,
+                (row["id"], limit),
+            ).fetchall()
+            queued = {
+                r[0]: r[1]
+                for r in conn.execute("SELECT chat_ref, state FROM join_queue").fetchall()
+            }
+            recent = conn.execute(
+                "SELECT id, topic, location, status, created_at FROM recon_jobs "
+                "ORDER BY created_at DESC LIMIT 5"
+            ).fetchall()
+        observed = self._observed_chat_ids()
+        results = []
+        for c in candidates:
+            username = c["username"]
+            known = None
+            if c["telegram_chat_id"] is not None and int(c["telegram_chat_id"]) in observed:
+                known = "in corpus"
+            elif username and username.lower() in queued:
+                known = f"join queue: {queued[username.lower()]}"
+            results.append(
+                {
+                    "username": username,
+                    "title": c["title"],
+                    "chat_type": c["chat_type"],
+                    "participants": c["participants"],
+                    "score": c["policy_score"],
+                    "state": c["state"],
+                    "independent_sources": c["independent_sources"],
+                    "risk_flags": json.loads(c["risk_flags"] or "[]"),
+                    "visibility": c["visibility"],
+                    "already": known,
+                }
+            )
+        return {
+            "job": {
+                "id": row["id"],
+                "topic": row["topic"],
+                "location": row["location"],
+                "status": row["status"],
+                "stop_reason": row["stop_reason"],
+                "created_at": row["created_at"],
+                "completed_at": row["completed_at"],
+            },
+            "result_count": len(results),
+            "candidates": results,
+            "recent_jobs": [dict(r) for r in recent],
+            "note": (
+                "state=approved means the scorer would join it; rejected means it looks off-topic "
+                "or risky; blocked_private means it could not be proven public. Nothing here has "
+                "been joined — use queue_chat_join for the ones worth having."
+            ),
+        }
+
+    def _observed_chat_ids(self) -> set[int]:
+        try:
+            with sqlite3.connect(f"file:{self._live_db}?mode=ro", uri=True, timeout=15.0) as conn:
+                return {int(r[0]) for r in conn.execute("SELECT chat_id FROM observed_chats")}
+        except sqlite3.Error:
+            return set()
 
     async def resume_chat(
         self, chat_id: int, *, mode: str = "monitor", watcher_name: str | None = None
@@ -673,6 +822,22 @@ READ_TOOLS = [
         inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
+        name="discovery_results",
+        description=(
+            "What a discover_chats job found: chats Telegram's own search returned for the "
+            "place, with title, member count, score and whether we already have them. With "
+            "no job_id, the most recent job. Nothing listed here is joined by itself."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "job_id": {"type": ["string", "null"], "description": "From discover_chats."},
+                "limit": {"type": ["integer", "null"], "default": 60, "maximum": 60},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
         name="find_chat_candidates",
         description=(
             "Telegram chats and channels referenced inside collected messages that the "
@@ -691,6 +856,37 @@ READ_TOOLS = [
 ]
 
 WRITE_TOOLS = [
+    Tool(
+        name="discover_chats",
+        description=(
+            "Search Telegram itself for chats about a place or topic — the only way to find "
+            "chats nobody in the corpus has linked. The daemon runs the search within minutes "
+            "over every spelling of the place (Latin, Cyrillic, Vietnamese), scores the results "
+            "and joins nothing. Spends a few search calls of the account's hourly budget; one "
+            "job per topic and place per day. Read the outcome with discovery_results."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "What the chats should be about, e.g. 'expats community'.",
+                },
+                "location": {
+                    "type": ["string", "null"],
+                    "description": "City, e.g. 'Da Lat' — transliterations are added automatically.",
+                },
+                "seeds": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
+                    "description": "Known public usernames to start from, optional.",
+                },
+            },
+            "required": ["topic"],
+        },
+    ),
     Tool(
         name="resume_chat",
         description=(

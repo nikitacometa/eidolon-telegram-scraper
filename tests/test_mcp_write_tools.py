@@ -192,6 +192,7 @@ class TestToolExposure:
 
     def test_every_write_tool_is_accounted_for(self) -> None:
         assert {tool.name for tool in WRITE_TOOLS} == {
+            "discover_chats",
             "queue_chat_join",
             "resume_chat",
             "backfill_chat",

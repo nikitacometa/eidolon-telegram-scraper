@@ -276,6 +276,7 @@ def build_policy(
 # of place names.
 _TRANSLITERATIONS: dict[str, tuple[str, ...]] = {
     "da nang": ("danang", "дананг", "да нанг", "đà nẵng", "đà nang"),
+    "da lat": ("dalat", "далат", "да лат", "đà lạt", "lam dong", "lâm đồng"),
     "hoi an": ("hoian", "хойан", "хой ан", "hội an"),
     "nha trang": ("nhatrang", "нячанг", "нha trang"),
     "ho chi minh": ("saigon", "сайгон", "хошимин"),

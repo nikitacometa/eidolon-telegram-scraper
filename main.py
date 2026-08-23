@@ -30,6 +30,8 @@ from pipeline.agent_watchers import (
 )
 from pipeline.backfill import BackfillWorker
 from pipeline.crawler import TelegramCrawler
+from pipeline.discovery import TelegramDiscovery
+from pipeline.discovery_worker import DiscoveryWorker
 from pipeline.dispatcher import AlertDispatcher
 from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
@@ -45,6 +47,7 @@ from pipeline.models import (
 )
 from pipeline.policy import effective_policy_fingerprint
 from pipeline.processor import MessageProcessor
+from pipeline.recon import ReconRunner
 from pipeline.recon_models import ScoutMessage
 from pipeline.summarizer import DailySummarizer
 from storage.db import Database
@@ -129,9 +132,21 @@ class Eidolon:
             resolve_entity=self._named_entity,
             on_joined=self.reload_observation,
         )
+        self.discovery = DiscoveryWorker(
+            scout=self.scout,
+            runner=ReconRunner(
+                scout=self.scout,
+                db=self.db,
+                client=self.client,
+                governor=self.governor,
+                discovery=TelegramDiscovery(client=self.client, governor=self.governor),
+                crawler=self.crawler,
+            ),
+        )
         self._backfill_task: asyncio.Task[None] | None = None
         self._agent_watcher_task: asyncio.Task[None] | None = None
         self._joiner_task: asyncio.Task[None] | None = None
+        self._discovery_task: asyncio.Task[None] | None = None
         self.embedding_filter = EmbeddingFilter()
         self.llm_classifier = LLMClassifier()
         self.summarizer = DailySummarizer()
@@ -256,6 +271,12 @@ class Eidolon:
                 name="join-queue",
             )
             logger.info("Join queue worker enabled")
+        if settings.discovery_enabled:
+            self._discovery_task = asyncio.create_task(
+                self.discovery.run_forever(self._shutdown_event),
+                name="discovery",
+            )
+            logger.info("Discovery worker enabled")
         if settings.agent_watchers_enabled:
             self._agent_watcher_task = asyncio.create_task(
                 AgentWatcherSync(
@@ -287,7 +308,12 @@ class Eidolon:
         # Stop the archive first. It is the only task that keeps a Telegram
         # request in flight for seconds at a time, and cutting the connection
         # underneath it turns a clean pause into an ambiguous outcome.
-        for task in (self._backfill_task, self._joiner_task, self._agent_watcher_task):
+        for task in (
+            self._backfill_task,
+            self._joiner_task,
+            self._discovery_task,
+            self._agent_watcher_task,
+        ):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -295,6 +321,7 @@ class Eidolon:
         self._backfill_task = None
         self._agent_watcher_task = None
         self._joiner_task = None
+        self._discovery_task = None
 
         # Stop ingress before draining the bounded queue. A message committed
         # just before disconnect already has durable pending watcher jobs.
