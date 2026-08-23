@@ -37,7 +37,8 @@ CREATE TABLE backfill_targets (
     state TEXT NOT NULL DEFAULT 'pending', last_error TEXT, not_before TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, watcher_name TEXT,
-    target_days INTEGER, state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
+    target_days INTEGER, state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 """
 
 
@@ -379,3 +380,81 @@ class TestQueueChatJoin:
         monkeypatch.setattr(cs.settings, "watchers_path", tmp_path / "absent.yml")
 
         assert tools.known_watcher_names() == ["agent-live-music"]
+
+
+class TestUpgradingAQueuedJoin:
+    async def test_a_pending_row_takes_the_policy(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["danang-signal"])
+        await tools.queue_chat_join("@DalatChat")
+
+        result = await tools.queue_chat_join("@DalatChat", watcher_name="danang-signal")
+
+        assert result["queued"] is False
+        assert result["watcher_name"] == "danang-signal"
+        with sqlite3.connect(tools._scout_db) as conn:
+            assert conn.execute("SELECT watcher_name FROM join_queue").fetchone() == (
+                "danang-signal",
+            )
+
+    async def test_a_joined_chat_is_bound_to_that_policy_alone(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        # The live DB already carries a danang-signal binding; an explicit
+        # policy must not drag it along the way the neighbour default does.
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["agent-live-music"])
+        with sqlite3.connect(tools._scout_db) as conn:
+            conn.execute(
+                "INSERT INTO join_queue (chat_ref, state, joined_chat_id) "
+                "VALUES ('dalatchat', 'joined', -300)"
+            )
+            conn.commit()
+
+        result = await tools.queue_chat_join("dalatchat", watcher_name="agent-live-music")
+
+        assert result["already"] == "joined"
+        assert result["watcher_name"] == "agent-live-music"
+        with sqlite3.connect(tools._live_db) as conn:
+            bindings = conn.execute(
+                "SELECT watcher_name FROM chat_policy_bindings WHERE chat_id = -300"
+            ).fetchall()
+            mode = conn.execute("SELECT mode FROM observed_chats WHERE chat_id = -300").fetchone()
+        assert bindings == [("agent-live-music",)]
+        assert mode == ("monitor",)
+
+    async def test_a_repeat_without_a_policy_changes_nothing(self, tools: EidolonTools) -> None:
+        await tools.queue_chat_join("@DalatChat")
+
+        result = await tools.queue_chat_join("@DalatChat")
+
+        assert result == {
+            "chat_ref": "dalatchat",
+            "queued": False,
+            "already": "pending",
+            "joined_chat_id": None,
+            "watcher_name": None,
+        }
+
+
+class TestResumeWithAPolicy:
+    async def test_naming_a_policy_binds_only_it(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["agent-live-music"])
+
+        result = await tools.resume_chat(-100, watcher_name="agent-live-music")
+
+        assert result["watchers"] == ["agent-live-music"]
+        with sqlite3.connect(tools._live_db) as conn:
+            bindings = conn.execute(
+                "SELECT watcher_name FROM chat_policy_bindings WHERE chat_id = -100"
+            ).fetchall()
+        assert bindings == [("agent-live-music",)]
+
+    async def test_a_policy_with_a_non_monitor_mode_is_refused(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["agent-live-music"])
+        with pytest.raises(ValueError, match="monitor"):
+            await tools.resume_chat(-100, mode="recon", watcher_name="agent-live-music")

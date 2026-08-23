@@ -272,14 +272,28 @@ class EidolonTools:
             ),
         }
 
-    async def resume_chat(self, chat_id: int, *, mode: str = "monitor") -> dict[str, Any]:
-        """Put an already-joined chat back under observation."""
+    async def resume_chat(
+        self, chat_id: int, *, mode: str = "monitor", watcher_name: str | None = None
+    ) -> dict[str, Any]:
+        """Put an already-joined chat back under observation.
+
+        Without ``watcher_name`` a monitored chat is bound to every policy its
+        neighbours use, which is right for one city and wrong for two: a
+        Phangan chat resumed that way ended up classified by the Da Nang
+        events policy. Naming the policy binds that one alone.
+        """
         if not self._writable:
             raise PermissionError(
                 "this bridge runs read-only; changing observation is not available"
             )
         if mode not in {"monitor", "recon", "paused"}:
             raise ValueError(f"mode must be monitor, recon or paused; got {mode!r}")
+        if watcher_name is not None:
+            if mode != "monitor":
+                raise ValueError("watcher_name only makes sense with mode='monitor'")
+            known = self.known_watcher_names()
+            if watcher_name not in known:
+                raise ValueError(f"unknown watcher {watcher_name!r}; known: {known}")
 
         with sqlite3.connect(f"file:{self._live_db}", uri=True, timeout=15.0) as conn:
             conn.execute("PRAGMA busy_timeout=15000")
@@ -299,10 +313,15 @@ class EidolonTools:
             )
             watchers: list[str] = []
             if mode == "monitor":
-                watchers = [
-                    str(r[0])
-                    for r in conn.execute("SELECT DISTINCT watcher_name FROM chat_policy_bindings")
-                ]
+                if watcher_name is not None:
+                    watchers = [watcher_name]
+                else:
+                    watchers = [
+                        str(r[0])
+                        for r in conn.execute(
+                            "SELECT DISTINCT watcher_name FROM chat_policy_bindings"
+                        )
+                    ]
                 conn.executemany(
                     "INSERT INTO chat_policy_bindings (chat_id, watcher_name, source) "
                     "VALUES (?, ?, 'manual') ON CONFLICT(chat_id, watcher_name) DO NOTHING",
@@ -437,15 +456,40 @@ class EidolonTools:
         with sqlite3.connect(f"file:{self._scout_db}", uri=True, timeout=15.0) as conn:
             conn.execute("PRAGMA busy_timeout=15000")
             existing = conn.execute(
-                "SELECT state, joined_chat_id FROM join_queue WHERE chat_ref = ?", (ref,)
+                "SELECT state, joined_chat_id, watcher_name FROM join_queue WHERE chat_ref = ?",
+                (ref,),
             ).fetchone()
             if existing:
-                return {
+                state, joined_chat_id, bound = existing
+                reply: dict[str, Any] = {
                     "chat_ref": ref,
                     "queued": False,
-                    "already": existing[0],
-                    "joined_chat_id": existing[1],
+                    "already": state,
+                    "joined_chat_id": joined_chat_id,
+                    "watcher_name": bound,
                 }
+                # A repeat with a policy is a request to upgrade, not a
+                # duplicate: a pending row takes the policy for its join, a
+                # joined chat is bound to it now.
+                if watcher_name is not None and watcher_name != bound:
+                    if state == "pending":
+                        conn.execute(
+                            "UPDATE join_queue SET watcher_name = ?, updated_at = CURRENT_TIMESTAMP "
+                            "WHERE chat_ref = ?",
+                            (watcher_name, ref),
+                        )
+                        conn.commit()
+                        reply["watcher_name"] = watcher_name
+                        reply["monitoring"] = f"will alert through {watcher_name!r} once joined"
+                    elif state == "joined" and joined_chat_id is not None:
+                        bound_now = await self.resume_chat(
+                            int(joined_chat_id), mode="monitor", watcher_name=watcher_name
+                        )
+                        reply["watcher_name"] = watcher_name
+                        reply["monitoring"] = (
+                            f"already joined; now bound to {bound_now['watchers']}"
+                        )
+                return reply
             conn.execute(
                 """
                 INSERT INTO join_queue (chat_ref, label, target_days, watcher_name, state)
@@ -645,6 +689,13 @@ WRITE_TOOLS = [
                     "description": (
                         "monitor runs the full pipeline and can alert; recon stores messages "
                         "with no alerts and no LLM cost; paused stops both. Defaults to monitor."
+                    ),
+                },
+                "watcher_name": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Policy to bind when monitoring, e.g. danang-signal. Omitted, the chat "
+                        "is bound to every policy its neighbours use, which mixes cities."
                     ),
                 },
             },
