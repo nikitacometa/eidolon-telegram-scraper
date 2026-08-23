@@ -383,6 +383,11 @@ class CorpusRow:
     score: float = 0.0
     lanes: list[str] = field(default_factory=list)
     duplicate_chat_ids: list[int] = field(default_factory=list)
+    # The message this one answers, when it is an answer and the question is
+    # in the corpus. Six in ten messages in a city chat are replies, and an
+    # answer alone ("да, Beeppub, каждый день с 21") names neither the
+    # question nor what was asked about.
+    in_reply_to: dict[str, Any] | None = None
 
     def as_dict(self, *, text_limit: int | None = None) -> dict[str, Any]:
         body = self.text
@@ -394,6 +399,7 @@ class CorpusRow:
             "chat_title": self.chat_title,
             "message_link": message_link(self.chat_id, self.telegram_msg_id),
             "reply_to_message_id": self.reply_to_message_id,
+            "in_reply_to": self.in_reply_to,
             "sender": self.sender_name,
             "date": self.date,
             "text": body,
@@ -1543,7 +1549,50 @@ class SearchDatabase:
                 if lane_name not in existing.lanes:
                     existing.lanes.append(lane_name)
 
-        return _rollup_duplicates(sorted(fused.values(), key=lambda x: -x.score), limit)
+        rows = _rollup_duplicates(sorted(fused.values(), key=lambda x: -x.score), limit)
+        self.attach_reply_context(rows)
+        return rows
+
+    def attach_reply_context(self, rows: Sequence[CorpusRow], *, text_limit: int = 300) -> None:
+        """Fill ``in_reply_to`` on every row that answers a message we hold.
+
+        One query for the whole page rather than one per row: a page is at
+        most sixty rows, and the parent lookup is by the (chat, message id)
+        unique index, so the cost is one index probe per reply.
+        """
+        wanted = [
+            (row.chat_id, row.reply_to_message_id)
+            for row in rows
+            if row.reply_to_message_id is not None
+        ]
+        if not wanted:
+            return
+        placeholders = " OR ".join("(chat_id = ? AND telegram_msg_id = ?)" for _ in wanted)
+        params = [value for pair in wanted for value in pair]
+        parents = {
+            (int(r["chat_id"]), int(r["telegram_msg_id"])): r
+            for r in self.conn.execute(
+                # Only "?" placeholders are interpolated; every value stays bound.
+                f"SELECT chat_id, telegram_msg_id, sender_name, date, text "  # noqa: S608
+                f"FROM corpus_messages WHERE {placeholders}",
+                params,
+            )
+        }
+        for row in rows:
+            if row.reply_to_message_id is None:
+                continue
+            parent = parents.get((row.chat_id, row.reply_to_message_id))
+            if parent is None:
+                continue
+            body = str(parent["text"])
+            if len(body) > text_limit:
+                body = body[:text_limit].rstrip() + "…"
+            row.in_reply_to = {
+                "sender": parent["sender_name"],
+                "date": parent["date"],
+                "text": body,
+                "message_link": message_link(row.chat_id, row.reply_to_message_id),
+            }
 
     # ------------------------------------------------------------------
     # Embedding bookkeeping

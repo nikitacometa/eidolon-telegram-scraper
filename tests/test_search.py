@@ -2044,3 +2044,77 @@ class TestCrosspostDedup:
             "SELECT count(*) FROM extraction_state WHERE status='pending'"
         ).fetchone()[0]
         assert pending == 2
+
+
+class TestReplyContext:
+    """An answer found by search carries the question it answers."""
+
+    def _seed_thread(self, search: SearchDatabase) -> None:
+        search.conn.executemany(
+            "INSERT INTO corpus_messages (source, chat_id, telegram_msg_id, chat_title, "
+            "sender_name, text, date, content_hash, reply_to_message_id) "
+            "VALUES ('scout', -400, ?, 'Далат чат', ?, ?, ?, ?, ?)",
+            [
+                (
+                    50,
+                    "Arthur",
+                    "Подскажите, есть ли в Далате бары с живой музыкой или open mic, куда можно прийти с гитарой?",
+                    "2026-04-25T08:00:00+00:00",
+                    "q1",
+                    None,
+                ),
+                (
+                    51,
+                    "Olga",
+                    "Beeppub, каждый день с 21 до 23:30",
+                    "2026-05-22T09:00:00+00:00",
+                    "a1",
+                    50,
+                ),
+                (
+                    52,
+                    "Ivan",
+                    "Beeppub закрыт на ремонт до июня",
+                    "2026-05-23T09:00:00+00:00",
+                    "a2",
+                    999,
+                ),
+            ],
+        )
+        search.conn.commit()
+
+    def test_an_answer_carries_its_question(self, search: SearchDatabase) -> None:
+        self._seed_thread(search)
+
+        rows = search.hybrid_search(
+            match_query=build_fts_query(["beeppub"]), query_vector=None, limit=10
+        )
+
+        by_id = {row.telegram_msg_id: row for row in rows}
+        parent = by_id[51].in_reply_to
+        assert parent is not None
+        assert parent["sender"] == "Arthur"
+        assert parent["text"].startswith("Подскажите, есть ли в Далате бары")
+        assert parent["message_link"].endswith("/50")
+        assert by_id[51].as_dict()["in_reply_to"]["sender"] == "Arthur"
+
+    def test_a_reply_to_a_message_we_do_not_hold_stays_bare(self, search: SearchDatabase) -> None:
+        self._seed_thread(search)
+
+        rows = search.hybrid_search(
+            match_query=build_fts_query(["ремонт"]), query_vector=None, limit=10
+        )
+
+        assert rows[0].telegram_msg_id == 52
+        assert rows[0].reply_to_message_id == 999
+        assert rows[0].in_reply_to is None
+
+    def test_a_top_level_message_has_no_parent(self, search: SearchDatabase) -> None:
+        self._seed_thread(search)
+
+        rows = search.hybrid_search(
+            match_query=build_fts_query(["гитар"]), query_vector=None, limit=10
+        )
+
+        assert rows[0].telegram_msg_id == 50
+        assert rows[0].in_reply_to is None
