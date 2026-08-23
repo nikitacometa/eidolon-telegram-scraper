@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-063**
+- Next available ID: **E-065**
 
 ---
 
@@ -31,6 +31,8 @@
 | E-059 | Decide whether a vector pre-filter is worth its recall cost | todo | medium | A logistic probe over the existing corpus embeddings cuts 55% of calls at 98% recall (measured 2026-08-05), but on a RANDOM split — crossposted announcements leak between train and test, so the number is optimistic. Re-measure with a split by chat and by time before shipping. Not needed to reach the cost target |
 | E-061 | Onboard Da Lat | in_progress | high | 2026-08-23: policy `dalat-signal` (shares rules/examples with danang-signal via YAML anchors, own prompt), 5 chats queued with the policy — @Dalat_Vietnam (4.4k), @dalat_forum (2.2k), @dalat_ru, TravelAsk invite (1.3k, joined 07:47 through the new invite path), @dalat_insider. Web sweep found no Da Lat-specific EN/VI Telegram group; that scene is on Facebook (Expats in Dalat 36k, Dalat Digital Nomads, Ghiền Đà Lạt 1.3M) and dalat.app. Telegram-native search now runs in-daemon (E-051); @dalatrus and @dalat_info queued 13:10 UTC behind @dalat_ru, @dalat_insider last |
 | E-062 | Recon mode leaks through the MCP bridge | done | high | `queue_chat_join` now takes `watcher_name` (validated against config + agent_watchers), upgrades a pending or already-joined row, and says "archive only" when none is given; `resume_chat` takes `watcher_name` to bind one policy instead of every neighbour. Invite links (`t.me/+hash`) join via `ImportChatInviteRequest`. `search_messages` array params are `anyOf` — OpenClaw's TypeBox 1.3.3 ran `.every` on null for `type: [array, null]` and 3 of 4 bot calls on 2026-08-17 died with it |
+| E-063 | Carry the question with the answer | done | high | `hybrid_search` fills `in_reply_to` (sender, date, text, link) for every hit that replies to a message we hold — one index probe per reply. Measured on Da Lat chats: 18 046 of 29 392 messages (61%) are replies; «Beeppub с 9 до 11:30, рок» now arrives with «где в Далате послушать живую музыку». Next lever, not done: match on the question and return its answers as a thread |
+| E-064 | Use Telegram's channel recommendations in discovery | todo | medium | `TelegramDiscovery.similar_channels` (GetChannelRecommendations, budget 10/h) is implemented and called by nothing. Wire it for owner seeds in `ReconRunner._seed` so a known city chat pulls its neighbours; measure on Da Lat against the 89 candidates the title/hashtag surfaces gave |
 | E-060 | Monitor the PROEXPAT community chat | todo | medium | `-1002902498444` reached the corpus by recon sampling only: 394 messages, nothing after 2026-07-25, and it carries the one standing answer to "where are Russian books in Da Nang" — the community is assembling a lending library and takes donations. Not in `observed_chats`, so its next announcement is invisible. Join it or accept that this source is frozen |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
