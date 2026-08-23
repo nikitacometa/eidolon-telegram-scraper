@@ -445,10 +445,29 @@ class ChatIdentity:
 
 
 def normalize_username(value: str) -> str:
-    """Return a comparable username form for aliasing and deduplication."""
-    trimmed = value.strip().lower()
+    """Return a comparable chat reference for aliasing and deduplication.
+
+    A public username is case-insensitive and comes back lowercased. An invite
+    link (``t.me/+hash``, ``t.me/joinchat/hash``) is reduced to ``+hash`` with
+    its case kept: Telegram invite hashes are case-sensitive, and a lowercased
+    one opens nothing.
+    """
+    trimmed = value.strip()
     for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
-        if trimmed.startswith(prefix):
+        if trimmed.lower().startswith(prefix):
             trimmed = trimmed[len(prefix) :]
             break
-    return trimmed.split("?", 1)[0].strip("/")
+    trimmed = trimmed.split("?", 1)[0].strip("/")
+    if trimmed.lower().startswith("joinchat/"):
+        trimmed = "+" + trimmed[len("joinchat/") :]
+    if trimmed.startswith("+"):
+        return trimmed
+    return trimmed.lower()
+
+
+def invite_hash(value: str) -> str | None:
+    """The invite hash behind a chat reference, or None for a public username."""
+    normalized = normalize_username(value)
+    if normalized.startswith("+") and len(normalized) > 1:
+        return normalized[1:]
+    return None

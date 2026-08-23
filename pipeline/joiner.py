@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable
 from pipeline.crawler import TelegramCrawler
 from pipeline.governor import ActionStatus
 from pipeline.models import ObservationMode, ObservationSource
-from pipeline.recon_models import ChatMembership, JoinQueueState, QueuedJoin
+from pipeline.recon_models import ChatMembership, JoinQueueState, QueuedJoin, invite_hash
 from storage.db import Database
 from storage.scout import ScoutDatabase
 
@@ -74,20 +74,29 @@ class JoinWorker:
         if queued is None:
             return False
 
-        entity = await self._resolve_entity(queued.chat_ref)
-        if entity is None:
-            await self._scout.settle_queued_join(
-                queued.chat_ref,
-                state=JoinQueueState.FAILED,
-                error="unresolvable",
+        # An invite link resolves to nothing until it is used, so the entity
+        # arrives with the join result instead of before it.
+        entity: object | None = None
+        secret = invite_hash(queued.chat_ref)
+        if secret is not None:
+            result = await self._crawler.join_invite(
+                invite_hash=secret,
+                chat_ref=queued.chat_ref,
             )
-            logger.warning("Cannot resolve %s; dropped from the join queue", queued.chat_ref)
-            return False
-
-        result = await self._crawler.join(
-            channel=entity,
-            chat_ref=queued.chat_ref,
-        )
+        else:
+            entity = await self._resolve_entity(queued.chat_ref)
+            if entity is None:
+                await self._scout.settle_queued_join(
+                    queued.chat_ref,
+                    state=JoinQueueState.FAILED,
+                    error="unresolvable",
+                )
+                logger.warning("Cannot resolve %s; dropped from the join queue", queued.chat_ref)
+                return False
+            result = await self._crawler.join(
+                channel=entity,
+                chat_ref=queued.chat_ref,
+            )
 
         if result.status in {ActionStatus.DENIED, ActionStatus.FLOOD_WAIT}:
             await self._scout.defer_queued_join(
@@ -128,11 +137,15 @@ class JoinWorker:
             await self._scout.settle_queued_join(
                 queued.chat_ref,
                 state=JoinQueueState.FAILED,
-                error=result.error_code or "join_failed",
+                error=(outcome.error_code if outcome else None)
+                or result.error_code
+                or "join_failed",
             )
             return True
 
-        chat_id = await self._chat_id_of(entity)
+        if entity is None and outcome is not None:
+            entity = outcome.chat
+        chat_id = await self._chat_id_of(entity) if entity is not None else None
         if chat_id is None:
             await self._scout.settle_queued_join(
                 queued.chat_ref,

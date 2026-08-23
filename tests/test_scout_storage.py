@@ -20,6 +20,7 @@ from pipeline.recon_models import (
     Evidence,
     JobRequest,
     ReconJobStatus,
+    invite_hash,
     normalize_username,
 )
 from storage.scout import ScoutDatabase, invite_fingerprint
@@ -163,11 +164,31 @@ async def test_same_username_resolves_to_one_chat(scout: ScoutDatabase) -> None:
         ("https://t.me/DaNangChat", "danangchat"),
         ("t.me/danangchat/", "danangchat"),
         ("danangchat?start=1", "danangchat"),
+        # Invite hashes are case-sensitive: the same link written three ways
+        # is one key, and the hash survives untouched.
+        ("https://t.me/+mqaI5aYDQuI5ZWFi", "+mqaI5aYDQuI5ZWFi"),
+        ("t.me/joinchat/mqaI5aYDQuI5ZWFi", "+mqaI5aYDQuI5ZWFi"),
+        ("+mqaI5aYDQuI5ZWFi?x=1", "+mqaI5aYDQuI5ZWFi"),
     ],
 )
 def test_username_normalization(raw: str, expected: str) -> None:
     """Locator forms of the same username must compare equal."""
     assert normalize_username(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("https://t.me/+mqaI5aYDQuI5ZWFi", "mqaI5aYDQuI5ZWFi"),
+        ("t.me/joinchat/AbC", "AbC"),
+        ("@danangchat", None),
+        ("https://t.me/danangchat", None),
+        ("+", None),
+    ],
+)
+def test_invite_hash_is_told_apart_from_a_username(raw: str, expected: str | None) -> None:
+    """Only an invite link yields a hash; a username yields nothing."""
+    assert invite_hash(raw) == expected
 
 
 async def test_resolving_a_peer_merges_duplicate_records(scout: ScoutDatabase) -> None:

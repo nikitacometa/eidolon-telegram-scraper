@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from telethon import errors
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import Channel
 
 from pipeline.crawler import TelegramCrawler
@@ -62,10 +63,49 @@ class FakeJoins:
         return SimpleNamespace(chats=[], users=[])
 
 
+INVITE_CHANNEL = Channel(
+    id=202,
+    title="Далат 🇻🇳 Чат TravelAsk",
+    photo=None,
+    date=None,
+    username=None,
+    broadcast=False,
+    megagroup=True,
+)
+INVITE_CHAT_ID = -1000000000202
+
+
+class FakeInviteJoins:
+    """Answers invite imports the way Telegram does: the chat rides in the reply."""
+
+    def __init__(
+        self,
+        error: type[BaseException] | None = None,
+        *,
+        already_member: bool = False,
+    ) -> None:
+        self.error = error
+        self.already_member = already_member
+        self.imported: list[str] = []
+        self.checked: list[str] = []
+
+    async def __call__(self, request: object) -> object:
+        if isinstance(request, CheckChatInviteRequest):
+            self.checked.append(request.hash)
+            return SimpleNamespace(chat=INVITE_CHANNEL)
+        assert isinstance(request, ImportChatInviteRequest)
+        if self.error is not None:
+            raise self.error(request=None)
+        if self.already_member:
+            raise errors.UserAlreadyParticipantError(request=None)
+        self.imported.append(request.hash)
+        return SimpleNamespace(chats=[INVITE_CHANNEL], users=[])
+
+
 def _worker(
     scout: ScoutDatabase,
     db: Database,
-    client: FakeJoins,
+    client: object,
     *,
     policy: dict[ActionKind, BudgetRule] | None = None,
     entity: object | None = CHANNEL,
@@ -240,3 +280,75 @@ async def test_requeueing_a_joined_chat_does_not_rejoin(scout: ScoutDatabase, db
 
     assert not await worker.run_once()
     assert client.joined == ["danangevents"]
+
+
+async def test_an_invite_link_is_joined_through_its_hash(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A t.me/+hash reference needs no entity up front: the reply names the chat."""
+    client = FakeInviteJoins()
+    worker = _worker(scout, db, client, entity=None)
+    await scout.enqueue_join(
+        chat_ref="https://t.me/+mqaI5aYDQuI5ZWFi",
+        label="Далат TravelAsk",
+        watcher_name="dalat-signal",
+    )
+
+    assert await worker.run_once()
+
+    assert client.imported == ["mqaI5aYDQuI5ZWFi"]
+    snapshot = await db.observation_snapshot()
+    assert snapshot[INVITE_CHAT_ID].mode is ObservationMode.MONITOR
+    assert snapshot[INVITE_CHAT_ID].watcher_names == ("dalat-signal",)
+    assert (await scout.backfill_targets())[0].chat_id == INVITE_CHAT_ID
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.JOINED
+    assert queue[0].joined_chat_id == INVITE_CHAT_ID
+
+
+async def test_an_invite_we_already_used_still_identifies_the_chat(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """Being a member already is success, and the chat id comes from the invite check."""
+    client = FakeInviteJoins(already_member=True)
+    worker = _worker(scout, db, client, entity=None)
+    await scout.enqueue_join(chat_ref="t.me/+mqaI5aYDQuI5ZWFi")
+
+    assert await worker.run_once()
+
+    assert client.checked == ["mqaI5aYDQuI5ZWFi"]
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.JOINED
+    assert queue[0].joined_chat_id == INVITE_CHAT_ID
+
+
+@pytest.mark.parametrize("error", [errors.InviteHashExpiredError, errors.InviteHashInvalidError])
+async def test_a_dead_invite_fails_without_retrying(
+    scout: ScoutDatabase, db: Database, error: type[BaseException]
+) -> None:
+    """An expired or mistyped hash will never open; burning joins on it is waste."""
+    client = FakeInviteJoins(error=error)
+    worker = _worker(scout, db, client, entity=None)
+    await scout.enqueue_join(chat_ref="t.me/+deadhash")
+
+    assert await worker.run_once()
+
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.FAILED
+    assert queue[0].last_error == "invite_invalid"
+    assert await scout.backfill_targets() == []
+    assert not await worker.run_once()
+
+
+async def test_an_invite_awaiting_approval_is_not_membership(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A moderated invite is recorded as requested, exactly like a moderated username."""
+    client = FakeInviteJoins(error=errors.InviteRequestSentError)
+    worker = _worker(scout, db, client, entity=None)
+    await scout.enqueue_join(chat_ref="t.me/+moderated", watcher_name="dalat-signal")
+
+    assert await worker.run_once()
+
+    assert (await scout.join_queue())[0].state is JoinQueueState.REQUESTED
+    assert await db.observation_snapshot() == {}

@@ -14,7 +14,11 @@ from datetime import datetime
 
 from telethon import errors
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import GetHistoryRequest
+from telethon.tl.functions.messages import (
+    CheckChatInviteRequest,
+    GetHistoryRequest,
+    ImportChatInviteRequest,
+)
 
 from pipeline.discovery import ChatLink, extract_chat_links
 from pipeline.governor import ActionResult, ActionStatus, TelegramActionGovernor
@@ -38,6 +42,9 @@ class JoinOutcome:
 
     membership: ChatMembership
     error_code: str | None = None
+    # Only an invite join learns the chat from Telegram's answer; a username
+    # join already held the entity before asking.
+    chat: object | None = None
 
     @property
     def is_member(self) -> bool:
@@ -97,6 +104,62 @@ class TelegramCrawler:
             call,
             job_id=job_id,
             candidate_id=candidate_id,
+        )
+        if result.status is ActionStatus.REJECTED:
+            return ActionResult(
+                status=result.status,
+                value=JoinOutcome(
+                    membership=ChatMembership.FAILED,
+                    error_code=result.error_code,
+                ),
+                error_code=result.error_code,
+                duration_ms=result.duration_ms,
+            )
+        return result
+
+    async def join_invite(
+        self,
+        *,
+        invite_hash: str,
+        chat_ref: str,
+    ) -> ActionResult[JoinOutcome]:
+        """Join one chat through its invite link.
+
+        Spends the same join budget as a username join: to the account's
+        standing an invite is a join like any other. A dead or expired hash is
+        a terminal failure, not something to retry into; ``REQUESTED`` keeps
+        its meaning of "an admin has not answered yet".
+
+        The chat comes back inside Telegram's reply, which is the only place it
+        can come from: an invite link names nothing until it is used.
+        """
+
+        async def call() -> JoinOutcome:
+            try:
+                response = await self._client(ImportChatInviteRequest(hash=invite_hash))  # type: ignore[operator]
+            except errors.InviteRequestSentError:
+                logger.info("Join request for %s awaits admin approval", chat_ref)
+                return JoinOutcome(membership=ChatMembership.REQUESTED)
+            except errors.UserAlreadyParticipantError:
+                # The invite cannot be imported twice, but checking it still
+                # tells us which chat we are already in.
+                invite = await self._client(CheckChatInviteRequest(hash=invite_hash))  # type: ignore[operator]
+                return JoinOutcome(
+                    membership=ChatMembership.MEMBER,
+                    chat=getattr(invite, "chat", None),
+                )
+            except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+                return JoinOutcome(membership=ChatMembership.FAILED, error_code="invite_invalid")
+            chats = list(getattr(response, "chats", ()) or ())
+            return JoinOutcome(
+                membership=ChatMembership.MEMBER,
+                chat=chats[0] if chats else None,
+            )
+
+        result: ActionResult[JoinOutcome] = await self._governor.run(
+            ActionKind.JOIN,
+            f"queue:join:{chat_ref}",
+            call,
         )
         if result.status is ActionStatus.REJECTED:
             return ActionResult(

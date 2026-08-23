@@ -379,10 +379,39 @@ class EidolonTools:
             ),
         }
 
+    def known_watcher_names(self) -> list[str]:
+        """Policies a joined chat can be bound to: the config file plus stored ones."""
+        from config.watchers import WatcherConfigError, load_watchers
+
+        names: list[str] = []
+        try:
+            names.extend(watcher.name for watcher in load_watchers(settings.watchers_path))
+        except WatcherConfigError:
+            logger.warning("watchers config unreadable; only stored watchers are known")
+        try:
+            with sqlite3.connect(f"file:{self._live_db}?mode=ro", uri=True, timeout=15.0) as conn:
+                rows = conn.execute(
+                    "SELECT name FROM agent_watchers WHERE status = 'active' ORDER BY name"
+                ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        names.extend(row[0] for row in rows if row[0] not in names)
+        return names
+
     async def queue_chat_join(
-        self, chat_ref: str, *, label: str | None = None, target_days: int = 730
+        self,
+        chat_ref: str,
+        *,
+        label: str | None = None,
+        target_days: int = 730,
+        watcher_name: str | None = None,
     ) -> dict[str, Any]:
-        """Ask the daemon to join a chat. It decides when, not the caller."""
+        """Ask the daemon to join a chat. It decides when, not the caller.
+
+        ``watcher_name`` decides what the join turns into. With a policy the
+        chat is monitored and alerts; without one it is only archived for
+        search, which is silent by design and must be said so in the reply.
+        """
         if not self._writable:
             raise PermissionError("this bridge runs read-only; joining is not available")
         if not settings.join_queue_enabled:
@@ -397,6 +426,13 @@ class EidolonTools:
         ref = normalize_username(chat_ref)
         if not ref:
             raise ValueError("chat_ref is empty")
+        if watcher_name is not None:
+            known = self.known_watcher_names()
+            if watcher_name not in known:
+                raise ValueError(
+                    f"unknown watcher {watcher_name!r}; a chat bound to a policy nobody "
+                    f"runs would look monitored and never alert. Known: {known}"
+                )
 
         with sqlite3.connect(f"file:{self._scout_db}", uri=True, timeout=15.0) as conn:
             conn.execute("PRAGMA busy_timeout=15000")
@@ -412,15 +448,21 @@ class EidolonTools:
                 }
             conn.execute(
                 """
-                INSERT INTO join_queue (chat_ref, label, target_days, state)
-                VALUES (?, ?, ?, 'pending')
+                INSERT INTO join_queue (chat_ref, label, target_days, watcher_name, state)
+                VALUES (?, ?, ?, ?, 'pending')
                 """,
-                (ref, label, target_days),
+                (ref, label, target_days, watcher_name),
             )
             conn.commit()
         return {
             "chat_ref": ref,
             "queued": True,
+            "watcher_name": watcher_name,
+            "monitoring": (
+                f"will alert through {watcher_name!r}"
+                if watcher_name
+                else "archive only: searchable, but no alerts until resume_chat(mode='monitor')"
+            ),
             "note": (
                 "Queued. The daemon joins at most a few chats a day, deliberately: join "
                 "rate is what gets a Telegram account limited. History download starts "
@@ -445,16 +487,27 @@ READ_TOOLS = [
                     "type": "string",
                     "description": "Natural-language description of what to find. Used for semantic search.",
                 },
+                # anyOf, not type: ["array", "null"]. OpenClaw compiles tool
+                # schemas with TypeBox 1.3.3, whose code for a typed union with
+                # `items` runs `.every` on null; the model passes null for unused
+                # arrays, and the call died with "Cannot read properties of null".
                 "keywords": {
-                    "type": ["array", "null"],
-                    "items": {"type": "string"},
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
                     "description": (
                         "Word stems for exact matching, matched as prefixes and OR-ed. "
                         "Include both Russian and English forms: the corpus is ~96% "
                         "Cyrillic but event posts often use English party vocabulary."
                     ),
                 },
-                "chat_ids": {"type": ["array", "null"], "items": {"type": "integer"}},
+                "chat_ids": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "integer"}},
+                        {"type": "null"},
+                    ],
+                },
                 "days": {
                     "type": ["integer", "null"],
                     "description": "Only messages from the last N days.",
@@ -623,17 +676,22 @@ WRITE_TOOLS = [
     Tool(
         name="queue_chat_join",
         description=(
-            "Queue a public chat for the daemon to join, after which its history is "
-            "downloaded and it is monitored. This is a request, not an immediate action: "
-            "the daemon joins a few chats a day at most, because join rate is what gets a "
-            "Telegram account limited. Safe to call and idempotent per chat."
+            "Queue a chat for the daemon to join, after which its history is downloaded "
+            "(730 days by default) and it becomes searchable. Pass `watcher_name` to also "
+            "monitor it for alerts; without one the chat is archived silently. This is a "
+            "request, not an immediate action: the daemon joins a few chats a day at most, "
+            "because join rate is what gets a Telegram account limited. Safe to call and "
+            "idempotent per chat."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "chat_ref": {
                     "type": "string",
-                    "description": "Public username or t.me link, e.g. danangevents or https://t.me/danangevents",
+                    "description": (
+                        "Public username, t.me link or invite link, e.g. danangevents, "
+                        "https://t.me/danangevents or https://t.me/+AbCdEf"
+                    ),
                 },
                 "label": {
                     "type": ["string", "null"],
@@ -643,6 +701,14 @@ WRITE_TOOLS = [
                     "type": ["integer", "null"],
                     "default": 730,
                     "description": "How far back to download history.",
+                },
+                "watcher_name": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Monitoring policy to bind the chat to once joined, e.g. "
+                        "danang-signal. Omit to archive for search only, with no alerts. "
+                        "An unknown name is refused."
+                    ),
                 },
             },
             "required": ["chat_ref"],

@@ -49,8 +49,8 @@ CREATE TABLE scout_messages (
     PRIMARY KEY (chat_id, telegram_msg_id)
 );
 CREATE TABLE backfill_targets (chat_id INTEGER PRIMARY KEY, label TEXT);
-CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, target_days INTEGER,
-    state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
+CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, watcher_name TEXT,
+    target_days INTEGER, state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
 CREATE TABLE scout_chats (chat_id INTEGER PRIMARY KEY, username TEXT);
 """
 

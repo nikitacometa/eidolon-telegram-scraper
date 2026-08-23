@@ -24,6 +24,9 @@ CREATE TABLE chat_policy_bindings (
     PRIMARY KEY (chat_id, watcher_name));
 CREATE TABLE agent_watchers_meta (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL DEFAULT 0);
 INSERT INTO agent_watchers_meta (id, generation) VALUES (1, 0);
+CREATE TABLE agent_watchers (name TEXT PRIMARY KEY, status TEXT NOT NULL);
+INSERT INTO agent_watchers VALUES ('agent-live-music', 'active');
+INSERT INTO agent_watchers VALUES ('agent-retired', 'revoked');
 """
 
 SCOUT_SCHEMA = """
@@ -33,8 +36,8 @@ CREATE TABLE backfill_targets (
     messages_stored INTEGER NOT NULL DEFAULT 0, pages_done INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'pending', last_error TEXT, not_before TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, target_days INTEGER,
-    state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
+CREATE TABLE join_queue (chat_ref TEXT PRIMARY KEY, label TEXT, watcher_name TEXT,
+    target_days INTEGER, state TEXT NOT NULL DEFAULT 'pending', joined_chat_id INTEGER);
 """
 
 
@@ -203,11 +206,32 @@ class TestToolExposure:
         for name, spec in schema.get("properties", {}).items():
             if name in required:
                 continue
-            declared = spec.get("type")
-            if declared is None:
+            allowed = _declared_types(spec)
+            if not allowed:
                 continue
-            allowed = declared if isinstance(declared, list) else [declared]
             assert "null" in allowed, f"{tool.name}.{name} is optional but rejects null"
+
+    @pytest.mark.parametrize("tool", WRITE_TOOLS + READ_TOOLS, ids=lambda t: t.name)
+    def test_a_nullable_array_is_a_union_of_branches(self, tool: Any) -> None:
+        # OpenClaw validates arguments with TypeBox 1.3.3, whose code for
+        # {"type": ["array", "null"], "items": ...} is
+        #   (Array.isArray(x) || x === null) && x.every(...)
+        # so a null argument throws instead of validating. Measured 2026-08-17:
+        # three of four search_messages calls from the bot died that way. An
+        # anyOf compiles to separately guarded branches and survives null.
+        for name, spec in tool.inputSchema.get("properties", {}).items():
+            if "items" in spec:
+                declared = spec.get("type")
+                assert not isinstance(declared, list), (
+                    f"{tool.name}.{name}: typed union with items breaks under TypeBox; use anyOf"
+                )
+
+
+def _declared_types(spec: dict[str, Any]) -> list[str]:
+    declared = spec.get("type")
+    if declared is not None:
+        return declared if isinstance(declared, list) else [declared]
+    return [t for branch in spec.get("anyOf", []) for t in _declared_types(branch)]
 
 
 class TestNullArgumentHandling:
@@ -292,3 +316,66 @@ class TestDisabledWorkers:
         monkeypatch.setattr(cs.settings, "join_queue_enabled", True)
         assert (await tools.backfill_chat(-100))["target_days"] == 730
         assert (await tools.queue_chat_join("somechat"))["queued"] is True
+
+
+class TestQueueChatJoin:
+    async def test_a_policy_makes_the_join_monitored(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["danang-signal"])
+
+        result = await tools.queue_chat_join("@DalatChat", watcher_name="danang-signal")
+
+        assert result["queued"] is True
+        assert "danang-signal" in result["monitoring"]
+        with sqlite3.connect(tools._scout_db) as conn:
+            row = conn.execute("SELECT chat_ref, watcher_name FROM join_queue").fetchone()
+        assert row == ("dalatchat", "danang-signal")
+
+    async def test_no_policy_is_said_to_be_silent(self, tools: EidolonTools) -> None:
+        # The old reply claimed the chat "is monitored"; four chats were archived
+        # for weeks with no alerts on the strength of that sentence.
+        result = await tools.queue_chat_join("@DalatChat")
+
+        assert result["watcher_name"] is None
+        assert "no alerts" in result["monitoring"]
+        with sqlite3.connect(tools._scout_db) as conn:
+            assert conn.execute("SELECT watcher_name FROM join_queue").fetchone() == (None,)
+
+    async def test_an_unknown_policy_is_refused_before_anything_is_queued(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["danang-signal"])
+
+        with pytest.raises(ValueError, match="unknown watcher"):
+            await tools.queue_chat_join("@DalatChat", watcher_name="dalat-signa")
+        with sqlite3.connect(tools._scout_db) as conn:
+            assert conn.execute("SELECT count(*) FROM join_queue").fetchone()[0] == 0
+
+    async def test_an_invite_link_keeps_its_hash_case(self, tools: EidolonTools) -> None:
+        result = await tools.queue_chat_join("https://t.me/+mqaI5aYDQuI5ZWFi")
+
+        assert result["chat_ref"] == "+mqaI5aYDQuI5ZWFi"
+
+    def test_known_policies_come_from_config_and_stored_watchers(
+        self, tools: EidolonTools, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        import config.settings as cs
+
+        config = tmp_path / "watchers.yml"
+        config.write_text(
+            "watchers:\n  - name: dalat-signal\n    rules:\n      keywords: [концерт]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cs.settings, "watchers_path", config)
+
+        assert tools.known_watcher_names() == ["dalat-signal", "agent-live-music"]
+
+    def test_a_missing_config_still_knows_stored_watchers(
+        self, tools: EidolonTools, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        import config.settings as cs
+
+        monkeypatch.setattr(cs.settings, "watchers_path", tmp_path / "absent.yml")
+
+        assert tools.known_watcher_names() == ["agent-live-music"]
