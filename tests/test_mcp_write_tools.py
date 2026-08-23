@@ -434,8 +434,9 @@ class TestUpgradingAQueuedJoin:
         # by name must not be the call that drops the first.
         monkeypatch.setattr(tools, "known_watcher_names", lambda: ["agent-live-music"])
 
-        await tools.resume_chat(-200, watcher_name="agent-live-music")
+        result = await tools.resume_chat(-200, watcher_name="agent-live-music")
 
+        assert result["watchers"] == ["agent-live-music", "danang-signal"]
         with sqlite3.connect(tools._live_db) as conn:
             bindings = conn.execute(
                 "SELECT watcher_name FROM chat_policy_bindings WHERE chat_id = -200 ORDER BY 1"

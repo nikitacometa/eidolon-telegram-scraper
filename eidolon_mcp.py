@@ -334,6 +334,16 @@ class EidolonTools:
             # change that did not happen.
             conn.execute("UPDATE agent_watchers_meta SET generation = generation + 1 WHERE id = 1")
             conn.commit()
+            # Report what the chat answers to now, not only what this call added.
+            if mode == "monitor":
+                watchers = [
+                    str(r[0])
+                    for r in conn.execute(
+                        "SELECT watcher_name FROM chat_policy_bindings WHERE chat_id = ? "
+                        "ORDER BY watcher_name",
+                        (chat_id,),
+                    )
+                ]
         return {
             "chat_id": chat_id,
             "mode": mode,
