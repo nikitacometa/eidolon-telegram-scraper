@@ -280,7 +280,10 @@ class EidolonTools:
         Without ``watcher_name`` a monitored chat is bound to every policy its
         neighbours use, which is right for one city and wrong for two: a
         Phangan chat resumed that way ended up classified by the Da Nang
-        events policy. Naming the policy binds that one alone.
+        events policy. Naming the policy adds that one and nothing else;
+        bindings the chat already has are left as they are, because a chat
+        legitimately answers to several policies and an LLM-reachable call
+        should not be the thing that silently drops one.
         """
         if not self._writable:
             raise PermissionError(
@@ -485,9 +488,16 @@ class EidolonTools:
                         bound_now = await self.resume_chat(
                             int(joined_chat_id), mode="monitor", watcher_name=watcher_name
                         )
+                        conn.execute(
+                            "UPDATE join_queue SET watcher_name = ?, updated_at = CURRENT_TIMESTAMP "
+                            "WHERE chat_ref = ?",
+                            (watcher_name, ref),
+                        )
+                        conn.commit()
                         reply["watcher_name"] = watcher_name
                         reply["monitoring"] = (
-                            f"already joined; now bound to {bound_now['watchers']}"
+                            f"already joined; now bound to {bound_now['watchers']}, "
+                            "earlier bindings kept"
                         )
                 return reply
             conn.execute(

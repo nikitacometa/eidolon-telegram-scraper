@@ -422,6 +422,25 @@ class TestUpgradingAQueuedJoin:
             mode = conn.execute("SELECT mode FROM observed_chats WHERE chat_id = -300").fetchone()
         assert bindings == [("agent-live-music",)]
         assert mode == ("monitor",)
+        with sqlite3.connect(tools._scout_db) as conn:
+            assert conn.execute(
+                "SELECT watcher_name FROM join_queue WHERE chat_ref = 'dalatchat'"
+            ).fetchone() == ("agent-live-music",)
+
+    async def test_an_explicit_policy_keeps_the_bindings_a_chat_already_has(
+        self, tools: EidolonTools, monkeypatch: Any
+    ) -> None:
+        # -200 is bound to danang-signal in the fixture. Adding a second policy
+        # by name must not be the call that drops the first.
+        monkeypatch.setattr(tools, "known_watcher_names", lambda: ["agent-live-music"])
+
+        await tools.resume_chat(-200, watcher_name="agent-live-music")
+
+        with sqlite3.connect(tools._live_db) as conn:
+            bindings = conn.execute(
+                "SELECT watcher_name FROM chat_policy_bindings WHERE chat_id = -200 ORDER BY 1"
+            ).fetchall()
+        assert bindings == [("agent-live-music",), ("danang-signal",)]
 
     async def test_a_repeat_without_a_policy_changes_nothing(self, tools: EidolonTools) -> None:
         await tools.queue_chat_join("@DalatChat")
