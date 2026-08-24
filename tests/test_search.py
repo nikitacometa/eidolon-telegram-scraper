@@ -2118,3 +2118,67 @@ class TestReplyContext:
 
         assert rows[0].telegram_msg_id == 50
         assert rows[0].in_reply_to is None
+
+
+class TestDescriptorAggregateScope:
+    """Recording one message recomputes only the descriptors that message touched."""
+
+    def _message(self, search: SearchDatabase, chat_id: int, msg_id: int, text: str) -> int:
+        cursor = search.conn.execute(
+            """
+            INSERT INTO corpus_messages (
+                source, chat_id, telegram_msg_id, text, date, content_hash
+            ) VALUES ('scout', ?, ?, ?, '2026-08-01T10:00:00+00:00', ?)
+            """,
+            (chat_id, msg_id, text, content_digest(text)),
+        )
+        search._seed_extraction_state()
+        return int(cursor.lastrowid or 0)
+
+    @staticmethod
+    def _entity(name: str, descriptor: str, evidence: str) -> dict:
+        return {
+            "name": name,
+            "aliases": [],
+            "entity_kind": "place",
+            "access_modes": ["visit"],
+            "descriptor": descriptor,
+            "descriptor_language": "ru",
+            "offerings": [],
+            "city_area": "Da Lat",
+            "evidence": evidence,
+            "confidence": 0.9,
+        }
+
+    def test_a_replacement_shrinks_its_descriptor_and_leaves_strangers_alone(
+        self, search: SearchDatabase
+    ) -> None:
+        osteo_text = "Очень хороший остеопат в клинике Ось, всем советую"
+        barber_text = "Барбершоп Клок в центре, стригут отлично"
+        osteo_id = self._message(search, -600, 1, osteo_text)
+        barber_id = self._message(search, -600, 2, barber_text)
+        search.record_extraction(
+            osteo_id, [self._entity("Ось", "остеопат", "остеопат в клинике Ось")], model="test"
+        )
+        search.record_extraction(
+            barber_id, [self._entity("Клок", "барбер", "Барбершоп Клок в центре")], model="test"
+        )
+        sentinel = "2020-01-01 00:00:00"
+        search.conn.execute("UPDATE descriptors SET updated_at = ?", (sentinel,))
+        search.conn.commit()
+
+        # The re-extraction of the osteopath message now finds nothing in it.
+        search.record_extraction(osteo_id, [], model="test")
+
+        rows = {
+            str(r["normalized"]): r
+            for r in search.conn.execute(
+                "SELECT normalized, mention_count, updated_at FROM descriptors"
+            )
+        }
+        assert rows["остеопат"]["mention_count"] == 0
+        assert rows["остеопат"]["updated_at"] != sentinel
+        # The barber was not part of this message; recomputing it would mean the
+        # whole-table pass that burned fourteen minutes of CPU per index tick.
+        assert rows["барбер"]["mention_count"] == 1
+        assert rows["барбер"]["updated_at"] == sentinel

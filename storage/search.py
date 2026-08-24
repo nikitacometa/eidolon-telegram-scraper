@@ -557,6 +557,12 @@ class SearchDatabase:
             "ON corpus_messages(chat_id, reply_to_message_id) "
             "WHERE reply_to_message_id IS NOT NULL"
         )
+        # Descriptor stats are recomputed after every extraction; without this
+        # index each recompute scans the whole mentions table per descriptor.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_place_mentions_descriptor "
+            "ON place_mentions(descriptor_id) WHERE descriptor_id IS NOT NULL"
+        )
 
         # Legacy facets are compatibility projections only. They provide useful
         # lexical coverage before v3 backfill without pretending an English enum
@@ -1854,6 +1860,16 @@ class SearchDatabase:
                     "SELECT place_id FROM place_mentions WHERE corpus_id = ?", (corpus_id,)
                 )
             }
+            # Descriptors of the mentions about to be deleted: after the DELETE
+            # nothing else remembers that their counts must shrink.
+            touched_descriptors = {
+                int(row["descriptor_id"])
+                for row in conn.execute(
+                    "SELECT descriptor_id FROM place_mentions "
+                    "WHERE corpus_id = ? AND descriptor_id IS NOT NULL",
+                    (corpus_id,),
+                )
+            }
             conn.execute("DELETE FROM place_mentions WHERE corpus_id = ?", (corpus_id,))
             new_ids: set[int] = set()
             for entity in validated:
@@ -1870,6 +1886,8 @@ class SearchDatabase:
                 descriptor_id = self._upsert_descriptor(
                     entity, embedding_model=descriptor_embedding_model
                 )
+                if descriptor_id is not None:
+                    touched_descriptors.add(int(descriptor_id))
                 conn.execute(
                     """
                     INSERT INTO place_mentions (
@@ -1894,7 +1912,7 @@ class SearchDatabase:
                     ),
                 )
             affected = old_ids | new_ids
-            self._refresh_entity_aggregates(affected)
+            self._refresh_entity_aggregates(affected, descriptor_ids=touched_descriptors)
             if affected:
                 marks = ",".join("?" for _ in affected)
                 conn.execute(
@@ -2141,8 +2159,21 @@ class SearchDatabase:
             )
         return descriptor_id
 
-    def _refresh_entity_aggregates(self, place_ids: set[int]) -> None:
-        """Rebuild every projection touched by one atomic extraction replacement."""
+    def _refresh_entity_aggregates(
+        self, place_ids: set[int], *, descriptor_ids: set[int] | None = None
+    ) -> None:
+        """Rebuild every projection touched by one atomic extraction replacement.
+
+        ``descriptor_ids`` names descriptors whose mentions were REMOVED, which
+        the mention rows can no longer reveal. Descriptors still attached to
+        the affected places are collected on the walk below. Recomputing the
+        whole descriptors table here instead used to burn fourteen minutes of
+        CPU per index tick once the corpus passed 130k messages: every message
+        recorded meant three correlated subqueries for each of 1 800
+        descriptors (measured 2026-08-24, every tick killed by TimeoutStartSec
+        for a day while the backlog stood still).
+        """
+        touched_descriptors: set[int] = set(descriptor_ids or ())
         for place_id in place_ids:
             mentions = self.conn.execute(
                 """
@@ -2171,6 +2202,7 @@ class SearchDatabase:
             for mention in mentions:
                 descriptor_id = mention["descriptor_id"]
                 if descriptor_id is not None:
+                    touched_descriptors.add(int(descriptor_id))
                     stats = descriptor_stats.setdefault(
                         int(descriptor_id),
                         {
@@ -2241,8 +2273,11 @@ class SearchDatabase:
                 ),
             )
 
+        if not touched_descriptors:
+            return
+        marks = ",".join("?" for _ in touched_descriptors)
         self.conn.execute(
-            """
+            f"""
             UPDATE descriptors SET
                 mention_count = (SELECT count(*) FROM place_mentions pm
                                   WHERE pm.descriptor_id = descriptors.descriptor_id),
@@ -2253,7 +2288,9 @@ class SearchDatabase:
                                  JOIN corpus_messages m USING(corpus_id)
                                  WHERE pm.descriptor_id = descriptors.descriptor_id),
                 updated_at = CURRENT_TIMESTAMP
-            """
+             WHERE descriptor_id IN ({marks})
+            """,  # noqa: S608 -- `marks` is generated placeholders, values are bound
+            tuple(touched_descriptors),
         )
 
     def search_places(
