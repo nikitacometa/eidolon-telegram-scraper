@@ -707,8 +707,8 @@ class TestPlaces:
         search.record_extraction(
             corpus_id,
             [],
-            model="entities-v4",
-            prompt_version="entities-v4",
+            model="entities-v5",
+            prompt_version="entities-v5",
             error="APITimeoutError: timed out",
         )
 
@@ -756,7 +756,7 @@ class TestPlaces:
                     "confidence": 0.95,
                 }
             ],
-            model="entities-v4",
+            model="entities-v5",
         )
 
         assert search.search_places(name_query="Old Cafe") == []
@@ -765,7 +765,7 @@ class TestPlaces:
             "SELECT active_prompt_version FROM extraction_state WHERE corpus_id=?",
             (corpus_id,),
         ).fetchone()[0]
-        assert state == "entities-v4"
+        assert state == "entities-v5"
 
     def test_prompt_bump_creates_exactly_one_job_per_message(
         self, search: SearchDatabase, sources: tuple[Path, Path]
@@ -776,7 +776,7 @@ class TestPlaces:
         search._seed_extraction_state()
 
         jobs = search.conn.execute(
-            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v4'"
+            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v5'"
         ).fetchone()[0]
         assert jobs == search.status()["messages_indexed"]
 
@@ -799,7 +799,7 @@ class TestPlaces:
         search.record_extraction(corpus_id, [], model="m", error="RateLimitError: slow down")
         row = search.conn.execute(
             "SELECT status, error FROM extraction_jobs WHERE corpus_id = ? "
-            "AND prompt_version='entities-v4'",
+            "AND prompt_version='entities-v5'",
             (corpus_id,),
         ).fetchone()
         assert row["status"] == "error"
@@ -818,7 +818,7 @@ class TestPlaces:
         ).fetchone()[0]
         assert skipped == 0
         queued = search.conn.execute(
-            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v4'"
+            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v5'"
         ).fetchone()[0]
         assert queued == search.status()["messages_indexed"]
 
@@ -873,7 +873,7 @@ class TestPlaces:
         search._seed_extraction_state()
 
         job = search.conn.execute(
-            "SELECT status FROM extraction_jobs WHERE corpus_id=? AND prompt_version='entities-v4'",
+            "SELECT status FROM extraction_jobs WHERE corpus_id=? AND prompt_version='entities-v5'",
             (corpus_id,),
         ).fetchone()
         assert job["status"] == "pending"
@@ -1381,7 +1381,7 @@ class TestExtractionRetry:
         assert db.status()["place_fts_next_rows"] == 1
         assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
         jobs = db.conn.execute(
-            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v4'"
+            "SELECT count(*) FROM extraction_jobs WHERE prompt_version='entities-v5'"
         ).fetchone()[0]
         assert jobs == 1
         db.close()

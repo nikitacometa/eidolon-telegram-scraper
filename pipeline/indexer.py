@@ -113,7 +113,7 @@ For every entity found, report:
 - descriptor_language: the phrase's language tag, such as ru, en, or vi
 - offerings: open raw phrases for services, products, and activities; never map
   them to a closed event taxonomy
-- city_area: Da Nang, Hoi An, Hue, Nha Trang, Phangan, or unknown
+- city_area: Da Nang, Hoi An, Hue, Nha Trang, Da Lat, Phangan, or unknown
 - evidence: a verbatim fragment from the message, at most 200 characters, that
   shows the identity and, when possible, descriptor/offering. Never paraphrase.
 - confidence: 0.0 to 1.0

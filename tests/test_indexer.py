@@ -291,7 +291,7 @@ async def test_medical_service_and_existing_types_reach_the_place_index(
     assert report["processed"] == 1
     result = search.search_places(name_query=name)
     assert result[0]["place_type"] == place_type
-    assert EXTRACTION_PROMPT_VERSION == "entities-v4"
+    assert EXTRACTION_PROMPT_VERSION == "entities-v5"
     assert "descriptor" in SYSTEM_PROMPT
 
 
@@ -326,7 +326,7 @@ async def test_targeted_no_venue_pass_honours_limit(search: SearchDatabase) -> N
     attempts = [
         row["attempts"]
         for row in search.conn.execute(
-            "SELECT attempts FROM extraction_jobs WHERE prompt_version='entities-v4' "
+            "SELECT attempts FROM extraction_jobs WHERE prompt_version='entities-v5' "
             "ORDER BY corpus_id"
         ).fetchall()
     ]
@@ -438,7 +438,7 @@ async def test_a_failed_pack_settles_every_message_in_it(search: SearchDatabase)
     states = {
         r["corpus_id"]: r["status"]
         for r in search.conn.execute(
-            "SELECT corpus_id, status FROM extraction_jobs WHERE prompt_version='entities-v4'"
+            "SELECT corpus_id, status FROM extraction_jobs WHERE prompt_version='entities-v5'"
         )
     }
     assert all(states[i] == "error" for i in ids)

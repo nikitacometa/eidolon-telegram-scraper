@@ -37,7 +37,10 @@ SEARCH_SCHEMA_PATH = Path(__file__).parent / "search_schema.sql"
 # The current writer replaces active mentions in one transaction, so an explicit
 # pilot may safely sample every settled legacy state, including ``extracted``.
 REEXTRACTABLE_STATUSES = frozenset({"extracted", "no_venue", "skipped"})
-ENTITY_EXTRACTION_VERSION = "entities-v4"
+# v5 adds Da Lat to the extractor's city list. Without it every Da Lat entity
+# came back city_area=unknown (1,460 of 1,657 measured 2026-08-24), because the
+# closed list in the prompt could not name the city the chat is about.
+ENTITY_EXTRACTION_VERSION = "entities-v5"
 ENTITY_KINDS = frozenset({"place", "person", "organization"})
 ACCESS_MODES = frozenset({"visit", "house_call", "delivery", "remote", "unknown"})
 
