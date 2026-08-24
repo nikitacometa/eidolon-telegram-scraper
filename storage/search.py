@@ -1087,6 +1087,16 @@ class SearchDatabase:
                         (row["dup_id"],),
                     )
                 }
+                # Same bookkeeping as record_extraction: descriptors of the rows
+                # deleted here are invisible to the scoped recompute afterwards.
+                touched_descriptors = {
+                    int(item["descriptor_id"])
+                    for item in conn.execute(
+                        "SELECT descriptor_id FROM place_mentions "
+                        "WHERE corpus_id = ? AND descriptor_id IS NOT NULL",
+                        (row["dup_id"],),
+                    )
+                }
                 conn.execute("DELETE FROM place_mentions WHERE corpus_id = ?", (row["dup_id"],))
                 conn.execute(
                     """
@@ -1110,7 +1120,7 @@ class SearchDatabase:
                     )
                 }
                 affected = old_ids | new_ids
-                self._refresh_entity_aggregates(affected)
+                self._refresh_entity_aggregates(affected, descriptor_ids=touched_descriptors)
                 if affected:
                     marks = ",".join("?" for _ in affected)
                     conn.execute(
