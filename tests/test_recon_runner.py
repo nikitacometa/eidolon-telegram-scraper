@@ -320,7 +320,11 @@ async def test_a_halt_stops_the_job_immediately(scout: ScoutDatabase, db: Databa
 
 
 async def test_backfill_stops_when_history_runs_out(scout: ScoutDatabase, db: Database) -> None:
-    """A short page means there is nothing older to ask for."""
+    """A short page earns one confirming call; the empty page it returns ends the walk.
+
+    Only an empty page proves the end — a short page can sit mid-chat where
+    deletions made the id range sparse (see TelegramCrawler._read_page).
+    """
     housing = _channel(110, "danang_housing", "Da Nang Housing")
     client = FakeTelegram(
         search_results=[housing],
@@ -330,7 +334,7 @@ async def test_backfill_stops_when_history_runs_out(scout: ScoutDatabase, db: Da
 
     await _runner(scout, db, client, pages=10).run(job)
 
-    assert client.history_calls == 1
+    assert client.history_calls == 2
 
 
 async def test_rerunning_a_job_does_not_rejoin(scout: ScoutDatabase, db: Database) -> None:
