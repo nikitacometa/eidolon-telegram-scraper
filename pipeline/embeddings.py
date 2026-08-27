@@ -14,7 +14,7 @@ from typing import cast
 import chromadb
 from chromadb.api import ClientAPI
 from chromadb.api.models.Collection import Collection
-from chromadb.api.types import IncludeEnum, PyEmbeddings
+from chromadb.api.types import PyEmbeddings
 from chromadb.config import Settings as ChromaSettings
 from openai import AsyncOpenAI
 
@@ -107,10 +107,7 @@ class EmbeddingFilter:
                 # Watcher examples are bounded to 200 entries. Querying the
                 # complete corpus guarantees that both labels are considered.
                 n_results=reference_count,
-                include=[
-                    IncludeEnum.distances,
-                    IncludeEnum.metadatas,
-                ],
+                include=["distances", "metadatas"],
             )
 
             distances = (results.get("distances") or [[]])[0]
