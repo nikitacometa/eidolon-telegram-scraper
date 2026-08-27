@@ -102,7 +102,9 @@ ignore_missing_imports = true
 
 [tool.bandit]
 exclude_dirs = ["tests", ".venv", "tmp"]
-skips = ["B101"]
+# B310/B608 stay enforced by ruff (S310/S608) with per-site reviewed noqa;
+# bandit does not read noqa markers, so it would re-flag every reviewed site.
+skips = ["B101", "B310", "B608"]
 
 [tool.coverage.run]
 branch = true

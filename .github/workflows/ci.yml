@@ -71,7 +71,14 @@ jobs:
         run: uv run bandit -r . -c pyproject.toml
 
       - name: Dependency vulnerability scan
-        run: uv run pip-audit --local --skip-editable
+        # The ignored CVEs are in ChromaDB's client-server auth layer
+        # (RBAC/authorization providers); this project runs the embedded
+        # PersistentClient with no server, and no fixed release exists.
+        run: >-
+          uv run pip-audit --local --skip-editable
+          --ignore-vuln CVE-2026-45830
+          --ignore-vuln CVE-2026-45831
+          --ignore-vuln CVE-2026-45833
 
   container:
     name: Container build
