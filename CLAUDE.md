@@ -28,6 +28,9 @@ python3 -m pytest tests/
 
 # Lint & format
 ruff check . && ruff format --check .
+
+# Activate the pre-push CI gate (once per clone)
+git config core.hooksPath .githooks
 ```
 
 ## Architecture
