@@ -170,6 +170,33 @@ async def test_a_late_duplicate_does_not_reopen_a_finalized_unit(store: HousingS
     assert unit.state is UnitState.EXTRACTING
 
 
+async def test_replaying_a_message_does_not_inflate_the_photo_count(
+    store: HousingStore,
+) -> None:
+    """Recovery replays an interrupted job; the unit must land on the same numbers.
+
+    A count that grows on every retry would later request photographs that do
+    not exist and report an advertisement as carrying more images than it does.
+    """
+    key = unit_key_for(-100777, grouped_id=321, telegram_msg_id=1)
+    for _ in range(3):
+        await store.record_message(
+            unit_key=key,
+            chat_id=-100777,
+            grouped_id=321,
+            message_id=1,
+            telegram_msg_id=1,
+            text="Сдаю виллу",
+            has_media=True,
+            telegram_photo_id=555,
+        )
+
+    unit = await store.get_unit(key)
+    assert unit is not None
+    assert unit.media_count == 1
+    assert len(unit.members) == 1
+
+
 def test_media_pointer_reads_a_photo_without_asking_telegram() -> None:
     """The pointer comes off the delivered object: no request, no budget."""
     message = SimpleNamespace(

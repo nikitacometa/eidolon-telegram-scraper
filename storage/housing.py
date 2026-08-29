@@ -172,7 +172,12 @@ class HousingStore:
                             NULLIF(excluded.assembled_text, ''),
                             housing_live_units.assembled_text
                         ),
-                        media_count = housing_live_units.media_count + excluded.media_count,
+                        -- media_count is recomputed from the members below
+                        -- rather than incremented here: recovery replays a
+                        -- message whose durable job was interrupted, and an
+                        -- increment would count that message's photograph
+                        -- twice while the member insert correctly ignores it.
+                        media_count = housing_live_units.media_count,
                         -- Only a unit still assembling may have its deadline
                         -- pushed out. A late duplicate of a message whose unit
                         -- already went to extraction must not reopen it.
@@ -218,6 +223,20 @@ class HousingStore:
                         telegram_photo_id,
                         1 if has_text else 0,
                     ),
+                )
+                # Derived from the members, in the same transaction that just
+                # changed them, so a replay converges on the same number
+                # instead of drifting upward on every retry.
+                await self._conn.execute(
+                    """
+                    UPDATE housing_live_units
+                    SET media_count = (
+                        SELECT COUNT(*) FROM housing_live_unit_messages
+                        WHERE unit_key = ? AND has_media = 1
+                    )
+                    WHERE unit_key = ?
+                    """,
+                    (unit_key, unit_key),
                 )
                 await self._conn.commit()
             except BaseException:
