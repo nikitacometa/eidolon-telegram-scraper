@@ -1,5 +1,6 @@
 """Tests for the housing subsystem: units, requirements, verdicts, alerts."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -7,7 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from pipeline.governor import ActionStatus
 from pipeline.housing.extractor import HousingFacts, HousingTextExtractor
+from pipeline.housing.media import MAX_BYTES, MediaDownloadWorker
 from pipeline.housing.requirements import (
     DEFAULT_REQUIREMENTS,
     FieldState,
@@ -1065,3 +1068,101 @@ async def test_a_unit_with_no_downloaded_photographs_is_not_read(
 
     assert read == 0
     assert vision.calls == []
+
+
+class FakeGovernor:
+    """A governor that runs the call and reports success."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, kind: object, key: str, call: object, **_: object) -> object:
+        self.calls += 1
+        value = await call()  # type: ignore[operator]
+        return SimpleNamespace(
+            status=ActionStatus.OK,
+            value=value,
+            ok=True,
+            error_code=None,
+            retry_after_seconds=None,
+        )
+
+
+class FakeTelegramClient:
+    """A Telegram that hands back a message and writes a file of a chosen size."""
+
+    def __init__(self, *, size: int) -> None:
+        self.size = size
+        self.downloads = 0
+
+    async def get_messages(self, chat_id: int, ids: int) -> object:
+        return SimpleNamespace(id=ids, media=object())
+
+    async def download_media(self, message: object, file: str) -> str:
+        self.downloads += 1
+        await asyncio.to_thread(Path(file).write_bytes, b"x" * self.size)
+        return file
+
+
+async def test_an_oversized_photograph_is_settled_not_retried_forever(
+    store: HousingStore, tmp_path: Path
+) -> None:
+    """A file too large to keep must stop being fetched.
+
+    Raising on the size check escapes the governor, so the row stays pending
+    and the same enormous file is downloaded again on every single cycle —
+    spending both the budget and the bandwidth with nothing to show.
+    """
+    key = unit_key_for(-100777, grouped_id=None, telegram_msg_id=3)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-100777,
+        grouped_id=None,
+        message_id=1,
+        telegram_msg_id=3,
+        text="Сдаю",
+        has_media=True,
+        telegram_photo_id=3,
+    )
+    await store.enqueue_media(unit_key=key, chat_id=-100777, photos=[(3, 3)])
+    client = FakeTelegramClient(size=MAX_BYTES + 1)
+    worker = MediaDownloadWorker(
+        store=store,
+        client=client,
+        governor=FakeGovernor(),
+        media_root=tmp_path,
+    )
+
+    assert await worker.run_once() is True
+    assert await worker.run_once() is False, "the oversized row must not come back"
+    assert client.downloads == 1
+    assert await store.downloaded_media(key) == []
+
+
+async def test_a_normal_photograph_is_stored_with_its_path(
+    store: HousingStore, tmp_path: Path
+) -> None:
+    key = unit_key_for(-100777, grouped_id=None, telegram_msg_id=4)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-100777,
+        grouped_id=None,
+        message_id=1,
+        telegram_msg_id=4,
+        text="Сдаю",
+        has_media=True,
+        telegram_photo_id=4,
+    )
+    await store.enqueue_media(unit_key=key, chat_id=-100777, photos=[(4, 4)])
+    worker = MediaDownloadWorker(
+        store=store,
+        client=FakeTelegramClient(size=2048),
+        governor=FakeGovernor(),
+        media_root=tmp_path,
+    )
+
+    assert await worker.run_once() is True
+
+    stored = await store.downloaded_media(key)
+    assert len(stored) == 1
+    assert await asyncio.to_thread(Path(stored[0]).read_bytes) == b"x" * 2048

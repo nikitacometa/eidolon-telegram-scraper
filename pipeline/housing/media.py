@@ -130,6 +130,21 @@ class MediaDownloadWorker:
             return True
 
         path, size = payload
+        if size > MAX_BYTES:
+            # A photograph too large to keep is a settled outcome, not an
+            # error to raise: raising here would escape the governor, leave
+            # the row pending forever, and re-download the same file on every
+            # cycle for as long as the advertisement exists.
+            await asyncio.to_thread(path.unlink, True)
+            await self._store.settle_media(
+                unit_key=unit_key,
+                telegram_msg_id=telegram_msg_id,
+                status="failed",
+                error="too_large",
+            )
+            logger.info("Discarded oversized photo for %s (%d bytes)", unit_key, size)
+            return True
+
         await self._store.settle_media(
             unit_key=unit_key,
             telegram_msg_id=telegram_msg_id,
@@ -162,13 +177,10 @@ class MediaDownloadWorker:
 
 
 def _measure(path: Path) -> tuple[Path, int]:
-    """Size a saved file, refusing one too large to be worth keeping.
+    """Size a saved file.
 
     Filesystem calls block, so this runs off the event loop; the daemon's
-    single thread is also serving live Telegram updates.
+    single thread is also serving live Telegram updates. Judging the size is
+    the caller's job, because only the caller can record the decision.
     """
-    size = path.stat().st_size if path.exists() else 0
-    if size > MAX_BYTES:
-        path.unlink(missing_ok=True)
-        raise ValueError(f"photograph exceeds {MAX_BYTES} bytes")
-    return path, size
+    return path, path.stat().st_size if path.exists() else 0
