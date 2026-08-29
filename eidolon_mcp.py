@@ -39,6 +39,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import ServerCapabilities, TextContent, Tool, ToolsCapability
 
 from config.settings import settings
+from pipeline.housing.requirements import (
+    DEFAULT_REQUIREMENTS,
+    RequirementsError,
+    validate_requirements,
+)
 from pipeline.recon_models import normalize_username
 from storage.search import SearchDatabase, build_fts_query, content_terms
 
@@ -560,6 +565,125 @@ class EidolonTools:
             ),
         }
 
+    async def get_housing_requirements(self) -> dict[str, Any]:
+        """What the housing filter is currently looking for."""
+        with sqlite3.connect(f"file:{self._live_db}?mode=ro", uri=True, timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT r.revision, r.definition_json, r.created_by, r.created_at
+                FROM housing_requirements_active a
+                JOIN housing_requirements_revisions r ON r.revision = a.active_revision
+                WHERE a.id = 1
+                """
+            ).fetchone()
+            history = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT revision, created_by, created_at FROM housing_requirements_revisions"
+                    " ORDER BY revision DESC LIMIT 10"
+                ).fetchall()
+            ]
+        if row is None:
+            return {
+                "revision": 0,
+                "definition": DEFAULT_REQUIREMENTS,
+                "note": (
+                    "Nothing saved yet, so these are the defaults the daemon will seed on "
+                    "the first listing it sees."
+                ),
+                "history": [],
+            }
+        return {
+            "revision": int(row["revision"]),
+            "definition": json.loads(str(row["definition_json"])),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "history": history,
+        }
+
+    async def preview_housing_requirements(self, definition: dict[str, Any]) -> dict[str, Any]:
+        """Check a proposed change without committing it."""
+        try:
+            cleaned = validate_requirements(definition)
+        except RequirementsError as error:
+            return {"valid": False, "error": str(error)}
+        return {
+            "valid": True,
+            "definition": cleaned,
+            "note": (
+                "Nothing has changed yet. Call update_housing_requirements with this "
+                "definition and the current revision to make it live."
+            ),
+        }
+
+    async def update_housing_requirements(
+        self,
+        definition: dict[str, Any],
+        *,
+        expected_revision: int | None = None,
+        created_by: str | None = "openclaw",
+    ) -> dict[str, Any]:
+        """Change what counts as a match, effective within about half a minute.
+
+        The daemon reads the active revision on every listing it judges, so no
+        restart and no deployment is involved. ``expected_revision`` guards
+        against two edits made from the same starting point: the second is
+        refused rather than silently overwriting the first.
+        """
+        if not self._writable:
+            raise PermissionError("this bridge runs read-only; requirements cannot be changed")
+        cleaned = validate_requirements(definition)
+        # The bridge's client sends an explicit null for an omitted optional
+        # field rather than leaving it out, and the column is NOT NULL: taking
+        # the value as given turns a normal edit into an integrity error.
+        author = (created_by or "openclaw").strip() or "openclaw"
+        payload = json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(f"file:{self._live_db}", uri=True, timeout=15.0) as conn:
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT active_revision FROM housing_requirements_active WHERE id = 1"
+            ).fetchone()
+            current = int(row[0]) if row is not None else 0
+            if expected_revision is not None and expected_revision != current:
+                conn.rollback()
+                return {
+                    "updated": False,
+                    "conflict": True,
+                    "active_revision": current,
+                    "note": (
+                        f"Requirements moved on: you edited from revision {expected_revision}, "
+                        f"the active one is {current}. Read them again before changing them."
+                    ),
+                }
+            revision = current + 1
+            conn.execute(
+                "INSERT INTO housing_requirements_revisions"
+                " (revision, definition_json, created_by) VALUES (?, ?, ?)",
+                (revision, payload, author),
+            )
+            conn.execute(
+                """
+                INSERT INTO housing_requirements_active (id, active_revision, generation)
+                VALUES (1, ?, 1)
+                ON CONFLICT(id) DO UPDATE SET
+                    active_revision = excluded.active_revision,
+                    generation = housing_requirements_active.generation + 1
+                """,
+                (revision,),
+            )
+            conn.commit()
+        return {
+            "updated": True,
+            "revision": revision,
+            "definition": cleaned,
+            "note": (
+                "Live within about half a minute. Listings already judged keep the verdict "
+                "they were given; new ones are judged against this revision."
+            ),
+        }
+
     def known_watcher_names(self) -> list[str]:
         """Policies a joined chat can be bound to: the config file plus stored ones."""
         from config.watchers import WatcherConfigError, load_watchers
@@ -938,6 +1062,67 @@ WRITE_TOOLS = [
                 "label": {"type": ["string", "null"]},
             },
             "required": ["chat_id"],
+        },
+    ),
+    Tool(
+        name="get_housing_requirements",
+        description=(
+            "What the Phangan housing filter is currently looking for: bedrooms, "
+            "bathrooms, television size and the monthly rent window, plus the revision "
+            "number needed to change them safely."
+        ),
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    Tool(
+        name="preview_housing_requirements",
+        description=(
+            "Validate a proposed set of housing requirements without changing anything. "
+            "Use this before update_housing_requirements when the wording of the request "
+            "is ambiguous, so an unsupported criterion is caught before it is saved."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "definition": {
+                    "type": "object",
+                    "description": (
+                        'Full requirements document, e.g. {"bedrooms": {"operator": '
+                        '"at_least", "value": 2}, "bathrooms": {"operator": '
+                        '"at_least", "value": 2}, "tv": {"minimum_class": '
+                        '"large"}, "monthly_rent_thb": {"min": 20000, "max": '
+                        "40000}}. Supported keys: bedrooms, bathrooms, tv, monthly_rent_thb."
+                    ),
+                }
+            },
+            "required": ["definition"],
+        },
+    ),
+    Tool(
+        name="update_housing_requirements",
+        description=(
+            "Change what the housing filter counts as a match. Takes effect within about "
+            "half a minute with no restart. Pass the whole document, not a patch: an "
+            "omitted criterion is dropped, which is how a requirement is removed. Pass "
+            "expected_revision from get_housing_requirements so a concurrent edit is "
+            "refused rather than overwritten."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "definition": {
+                    "type": "object",
+                    "description": "The full requirements document, as in preview.",
+                },
+                "expected_revision": {
+                    "type": ["integer", "null"],
+                    "description": "Revision the edit was made against.",
+                },
+                "created_by": {
+                    "type": ["string", "null"],
+                    "description": "Who asked for the change.",
+                },
+            },
+            "required": ["definition"],
         },
     ),
     Tool(

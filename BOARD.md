@@ -1,13 +1,13 @@
 # Eidolon — Task Board
 
-> Last updated: 2026-08-23
+> Last updated: 2026-08-29
 
 ## Conventions
 
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-066**
+- Next available ID: **E-073**
 
 ---
 
@@ -21,7 +21,7 @@
 | E-049 | Fix the zero-alert cascade | done | critical | Measured: L1 dropped 56% of real event announcements and L2 rejected the rest against bare-keyword references. Now L1 is a negative-only gate and L2 has 25 sentence examples at threshold 0.34 — 90.6% end-to-end recall on a held-out set of 64 real announcements, ~16 L3 calls/day |
 | E-050 | Rebind the Phangan chats or retire them | done | high | Both rebound via `resume_chat` and backfilled to the 730-day horizon (43,695 + 6,373 messages). Live ingest confirmed 2026-08-05 by arrival, not by config: 11 messages in 24h |
 | E-051 | Run discovery for the first time | done | high | 2026-08-23: `DiscoveryWorker` runs `recon_jobs` inside the daemon (`DISCOVERY_ENABLED=true`), always with zero joins; the bridge queues jobs with `discover_chats` and reads them with `discovery_results` (read profile too). First job: Da Lat, 10 governed searches in 5 s, 89 candidates, two real resident chats the web sweep had missed (@dalatrus 1.9k, @dalat_info 731), Vietnamese escort/delivery spam scored ≤57 and rejected. Old note: `telegram_actions` has only `join` and `history_page` — zero `hashtag_search`, `recommendations` or `contacts_search` ever. All 14 joins came from a hand-written seed list, and the queue has been empty since 2026-08-02 |
-| E-052 | Fix `ReconRunner` history storage | todo | high | Pre-existing on main: `test_a_topic_becomes_joined_chats_with_history` and `test_links_in_history_become_next_wave_candidates` fail — the runner joins but stores 0 messages, so snowball never seeds the next wave. `BackfillWorker` is unaffected |
+| E-052 | Fix `ReconRunner` history storage | done | high | Stale as written: both named tests pass on main as of 2026-08-29, verified by running them against a stashed tree. Whatever broke them was fixed by an earlier change; the runner stores history |
 | E-053 | Stop reading a short history page as the end of a chat | done | high | `len(raw) < 100` ended the walk mid-chat; only an empty page proves the bottom. Re-ran the three suspect targets — Telegram returned empty pages, so nothing was recoverable below their stop points, but the truncation class is closed and `complete` vs `exhausted` now means what it says |
 | E-054 | Mine contact handles out of message text | done | high | `message_contacts` + `extract_contacts()`: 8,328 rows, 2,810 distinct — 1,484 Telegram handles, 984 map links, 211 phones. Attached to venues through `place_mentions`, surfaced by `search_places` as `contacts` and `posted_by` |
 | E-055 | Merge duplicate places | todo | high | Measured 2026-08-05: 152 rows in 71 exact-token-set collisions and 600 containment pairs. `AUM` alone is split across 5 rows (`AUM`, `АУМ`, `AUM centre`, `AUM Sound Healing Center`, `AUM Sound Center`), so one venue ranks as five. Auto-merge is unsafe as-is — `Indriya Retreat Phangan` and `Indriya Retreat` are different places, and `Студия` is a generic word extracted as a name |
@@ -35,6 +35,13 @@
 | E-065 | Thread retrieval: match the question, return its answers | todo | medium | 2026-08-24: `in_reply_to` now carries the parent per hit (E-063), but a hit on the QUESTION still returns it alone. 61% of Da Lat messages are replies; «кто был у проктолога» should come back as the thread. Needs the reverse join (children of a matched parent) with a cap |
 | E-064 | Use Telegram's channel recommendations in discovery | todo | medium | `TelegramDiscovery.similar_channels` (GetChannelRecommendations, budget 10/h) is implemented and called by nothing. Wire it for owner seeds in `ReconRunner._seed` so a known city chat pulls its neighbours; measure on Da Lat against the 89 candidates the title/hashtag surfaces gave |
 | E-060 | Monitor the PROEXPAT community chat | todo | medium | `-1002902498444` reached the corpus by recon sampling only: 394 messages, nothing after 2026-07-25, and it carries the one standing answer to "where are Russian books in Da Nang" — the community is assembling a lending library and takes donations. Not in `observed_chats`, so its next announcement is invisible. Join it or accept that this source is frozen |
+| E-066 | Phangan housing subsystem | done | critical | 2026-08-29: `pipeline/housing/` — album-aware content units, text extraction, tri-state matching (satisfied/violated/**unknown**), editable requirements with append-only revisions, own alert outbox. `dispatch: external` on the watcher skips the relevance ladder entirely. 794 tests; every guard mutant-checked |
+| E-067 | Read listing photographs | done | critical | Two of four criteria (bathrooms, TV size) are almost never in the text — 2.3% and 0%. Governed download on its own two budgets (live/backfill), one vision call per unit, visual counts treated as a LOWER bound so a photo can never reject a listing. Verdict upgrades send a second alert carrying the photo |
+| E-068 | Historical listings and price trend | in_progress | high | `index_cli.py housing-extract` / `housing-trend`. 1,176 listings extracted so far from the two joined housing chats (515 priced, 2025-05 to 2026-08). Trend gates on n>=20 monthly / n>=10 quarterly and counts a crosspost once; append-only snapshots record `n_chats_included` so a bucket that moves says why |
+| E-069 | Join the remaining 23 Phangan chats | in_progress | high | Queue holds 8 housing chats at 730 days and 15 general at 90, paced 6/day one per 2h. Joined so far: `rent_phangan` (8,219), `kohphanganrentals` (1,624). The rest land over ~4 days |
+| E-070 | Measure vision accuracy on real listing photos | todo | high | The only measured fact is that gpt-5.6-luna reads a synthetic 5-stripe PNG correctly. Before trusting bathroom counts at volume, hand-label 30-50 real Phangan listing photographs and compare |
+| E-071 | Requirements editing over the MCP bridge | todo | high | `HousingStore.save_requirements` has optimistic concurrency and validation; the bridge tools (`get/preview/update_housing_requirements`) are not written yet, so today an edit means a SQL statement |
+| E-072 | Retroactive re-match after a requirements change | todo | medium | `units_for_rematch` exists and is unwindowed by design; nothing calls it yet. A loosened budget should surface archive listings as one digest, not as hundreds of individual alerts |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
 

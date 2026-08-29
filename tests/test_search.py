@@ -1029,6 +1029,9 @@ class TestJoinRequestNormalization:
             "queue_chat_join",
             "resume_chat",
             "backfill_chat",
+            "get_housing_requirements",
+            "preview_housing_requirements",
+            "update_housing_requirements",
         }
 
 

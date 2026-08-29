@@ -27,6 +27,12 @@ INSERT INTO agent_watchers_meta (id, generation) VALUES (1, 0);
 CREATE TABLE agent_watchers (name TEXT PRIMARY KEY, status TEXT NOT NULL);
 INSERT INTO agent_watchers VALUES ('agent-live-music', 'active');
 INSERT INTO agent_watchers VALUES ('agent-retired', 'revoked');
+CREATE TABLE housing_requirements_revisions (
+    revision INTEGER PRIMARY KEY, definition_json TEXT NOT NULL, created_by TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE housing_requirements_active (
+    id INTEGER PRIMARY KEY CHECK (id = 1), active_revision INTEGER NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0);
 """
 
 SCOUT_SCHEMA = """
@@ -67,6 +73,18 @@ def tools(tmp_path: Path) -> EidolonTools:
         conn.executescript(SCOUT_SCHEMA)
     SearchDatabase(search).connect()
     return EidolonTools(search_db=search, scout_db=scout, live_db=live, writable=True)
+
+
+def _bridge(root: Path, *, writable: bool) -> EidolonTools:
+    """A bridge over its own empty databases, for permission tests."""
+    root.mkdir(parents=True, exist_ok=True)
+    live, scout, search = root / "live.db", root / "scout.db", root / "search.db"
+    with sqlite3.connect(live) as conn:
+        conn.executescript(LIVE_SCHEMA)
+    with sqlite3.connect(scout) as conn:
+        conn.executescript(SCOUT_SCHEMA)
+    SearchDatabase(search).connect()
+    return EidolonTools(search_db=search, scout_db=scout, live_db=live, writable=writable)
 
 
 def _generation(tools: EidolonTools) -> int:
@@ -196,6 +214,9 @@ class TestToolExposure:
             "queue_chat_join",
             "resume_chat",
             "backfill_chat",
+            "get_housing_requirements",
+            "preview_housing_requirements",
+            "update_housing_requirements",
         }
 
     @pytest.mark.parametrize("tool", WRITE_TOOLS + READ_TOOLS, ids=lambda t: t.name)
@@ -479,3 +500,105 @@ class TestResumeWithAPolicy:
         monkeypatch.setattr(tools, "known_watcher_names", lambda: ["agent-live-music"])
         with pytest.raises(ValueError, match="monitor"):
             await tools.resume_chat(-100, mode="recon", watcher_name="agent-live-music")
+
+
+# ---------------------------------------------------------------------------
+# Housing requirements: the owner changing his own mind
+# ---------------------------------------------------------------------------
+
+
+async def test_requirements_start_as_the_stated_defaults(tools: EidolonTools) -> None:
+    """Before anything is saved, the answer names what the daemon will seed."""
+    current = await tools.get_housing_requirements()
+
+    assert current["revision"] == 0
+    assert current["definition"]["bedrooms"] == {"operator": "at_least", "value": 2}
+    assert current["definition"]["monthly_rent_thb"] == {"min": 20000, "max": 40000}
+
+
+async def test_an_edit_becomes_the_active_revision(tools: EidolonTools) -> None:
+    result = await tools.update_housing_requirements(
+        {
+            "bedrooms": {"operator": "at_least", "value": 2},
+            "monthly_rent_thb": {"min": 25000, "max": 55000},
+        },
+        created_by="nikita",
+    )
+
+    assert result["updated"] is True
+    assert result["revision"] == 1
+    current = await tools.get_housing_requirements()
+    assert current["definition"]["monthly_rent_thb"] == {"min": 25000, "max": 55000}
+    # A criterion left out of the document is removed, which is how the owner
+    # stops filtering on it — so it must actually be gone.
+    assert "tv" not in current["definition"]
+
+
+async def test_a_concurrent_edit_is_refused_rather_than_overwriting(
+    tools: EidolonTools,
+) -> None:
+    await tools.update_housing_requirements(
+        {"bedrooms": {"operator": "at_least", "value": 3}}, expected_revision=0
+    )
+
+    result = await tools.update_housing_requirements(
+        {"bedrooms": {"operator": "at_least", "value": 1}}, expected_revision=0
+    )
+
+    assert result["updated"] is False
+    assert result["conflict"] is True
+    current = await tools.get_housing_requirements()
+    assert current["definition"]["bedrooms"]["value"] == 3
+
+
+async def test_an_unsupported_criterion_is_refused_before_it_is_saved(
+    tools: EidolonTools,
+) -> None:
+    """A silently dropped criterion is a filter that stopped filtering."""
+    with pytest.raises(ValueError, match="unknown requirement"):
+        await tools.update_housing_requirements({"pool": {"required": True}})
+
+    preview = await tools.preview_housing_requirements({"pool": {"required": True}})
+    assert preview["valid"] is False
+    assert "unknown requirement" in preview["error"]
+
+
+async def test_previewing_changes_nothing(tools: EidolonTools) -> None:
+    await tools.preview_housing_requirements({"monthly_rent_thb": {"min": 1000, "max": 2000}})
+
+    assert (await tools.get_housing_requirements())["revision"] == 0
+
+
+async def test_a_read_only_bridge_cannot_change_the_requirements(tmp_path: Path) -> None:
+    reader = _bridge(tmp_path / "ro", writable=False)
+    with pytest.raises(PermissionError):
+        await reader.update_housing_requirements({"bedrooms": {"operator": "at_least", "value": 1}})
+
+
+async def test_an_explicit_null_author_does_not_break_the_update(tools: EidolonTools) -> None:
+    """The bridge's client sends null for an omitted optional field.
+
+    The column is NOT NULL, so passing the value straight through turned an
+    ordinary edit into an integrity error — the same shape as the TypeBox null
+    that broke three of four bridge calls in August.
+    """
+    result = await tools.update_housing_requirements(
+        {"bedrooms": {"operator": "at_least", "value": 2}}, created_by=None
+    )
+
+    assert result["updated"] is True
+    assert (await tools.get_housing_requirements())["created_by"] == "openclaw"
+
+
+def test_the_requirements_tools_are_owner_only() -> None:
+    """Julia's bridge sees read tools only; these three are not among them."""
+    read_names = {tool.name for tool in READ_TOOLS}
+    write_names = {tool.name for tool in WRITE_TOOLS}
+
+    for name in (
+        "get_housing_requirements",
+        "preview_housing_requirements",
+        "update_housing_requirements",
+    ):
+        assert name in write_names
+        assert name not in read_names
