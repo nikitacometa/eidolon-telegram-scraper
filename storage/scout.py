@@ -959,6 +959,32 @@ class ScoutDatabase:
         rule: BudgetRule,
     ) -> BudgetDenial | None:
         """Return a denial when a rolling window is already full."""
+        if rule.min_interval_seconds:
+            async with self.conn.execute(
+                """
+                SELECT CAST(
+                           (julianday('now') - julianday(MAX(reserved_at))) * 86400 AS INTEGER
+                       ) AS since
+                FROM telegram_actions
+                WHERE account_id = ? AND kind = ?
+                """,
+                (account_id, kind.value),
+            ) as cursor:
+                row = await cursor.fetchone()
+            since = None if row is None or row["since"] is None else int(row["since"])
+            if since is not None and since < rule.min_interval_seconds:
+                return BudgetDenial(
+                    kind=kind,
+                    scope=BudgetScope.COOLDOWN,
+                    used=1,
+                    cap=None,
+                    retry_after_seconds=max(rule.min_interval_seconds - since, 1),
+                    reason=(
+                        f"{kind.value} is paced at one per "
+                        f"{rule.min_interval_seconds}s; last one was {since}s ago"
+                    ),
+                )
+
         for scope, cap, window in (
             (BudgetScope.HOUR, rule.per_hour, "-1 hour"),
             (BudgetScope.DAY, rule.per_day, "-24 hours"),

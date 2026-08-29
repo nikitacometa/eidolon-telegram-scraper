@@ -169,19 +169,29 @@ class BudgetRule:
 
     per_hour: int | None = None
     per_day: int | None = None
+    # Spacing between two calls of this kind. A daily cap alone permits the
+    # whole day's allowance inside one minute, which is the shape of a burst
+    # Telegram notices; this is what makes a pace a pace.
+    min_interval_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.per_hour is not None and self.per_hour < 0:
             raise ValueError("per_hour must not be negative")
         if self.per_day is not None and self.per_day < 0:
             raise ValueError("per_day must not be negative")
+        if self.min_interval_seconds is not None and self.min_interval_seconds < 0:
+            raise ValueError("min_interval_seconds must not be negative")
 
 
 # Starting operator policy, not documented Telegram limits: no public source
 # states a safe rate. These are deliberately below folklore consensus and are
 # meant to be tightened from observed FloodWait telemetry.
 DEFAULT_BUDGET_POLICY: dict[ActionKind, BudgetRule] = {
-    ActionKind.JOIN: BudgetRule(per_hour=1, per_day=3),
+    # Six a day, one every two hours: onboarding a city means joining fifteen
+    # to twenty chats, and three a day made that a week of waiting. The two
+    # numbers do different jobs — the interval shapes the pace, the daily cap
+    # bounds the total — so neither is redundant.
+    ActionKind.JOIN: BudgetRule(per_day=6, min_interval_seconds=2 * 60 * 60),
     ActionKind.FULLTEXT_SEARCH: BudgetRule(per_day=5),
     ActionKind.HASHTAG_SEARCH: BudgetRule(per_hour=10, per_day=20),
     ActionKind.CONTACTS_SEARCH: BudgetRule(per_hour=10, per_day=20),

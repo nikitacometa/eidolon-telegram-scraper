@@ -281,6 +281,18 @@ _TRANSLITERATIONS: dict[str, tuple[str, ...]] = {
     "nha trang": ("nhatrang", "нячанг", "нha trang"),
     "ho chi minh": ("saigon", "сайгон", "хошимин"),
     "hanoi": ("ханой", "hà nội"),
-    "phangan": ("panganm", "панган", "ко панган", "koh phangan"),
+    # "panganm" was a typo and cost a query slot on every Phangan job:
+    # hashtag:panganm returned 0 chats on 2026-08-29 while hashtag:панган
+    # returned 13. Spellings are ordered by what a chat is actually titled,
+    # because MAX_HASHTAG_QUERIES truncates the tail.
+    "phangan": (
+        "pangan",
+        "панган",
+        "пханган",
+        "koh phangan",
+        "kohphangan",
+        "ко панган",
+        "เกาะพะงัน",
+    ),
     "bali": ("бали",),
 }

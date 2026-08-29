@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from telethon import errors
+
 from pipeline.crawler import TelegramCrawler
 from pipeline.discovery import ChatLink, DiscoveredChat, TelegramDiscovery
 from pipeline.governor import ActionResult, ActionStatus, TelegramActionGovernor
@@ -144,9 +146,19 @@ class ReconRunner:
     # ------------------------------------------------------------------
 
     async def _seed(self, job: ReconJob, policy: ScoringPolicy, report: ReconReport) -> None:
-        """Register the chats the owner named as wave-zero candidates."""
+        """Register the chats the owner named as wave-zero candidates.
+
+        Seeds are hand-written references, so one of them being dead, renamed
+        or mistyped is ordinary. Each is isolated: a job that discards its
+        whole search because the fourth of six names no longer exists loses
+        work that had nothing to do with that name.
+        """
         for seed in job.seeds:
-            described = await self._resolve(job, seed)
+            try:
+                described = await self._resolve(job, seed)
+            except Exception:
+                logger.warning("Seed %s could not be resolved; skipping it", seed, exc_info=True)
+                continue
             if described is None:
                 continue
             described.evidence = Evidence(
@@ -392,7 +404,17 @@ class ReconRunner:
         from pipeline.discovery import describe_chat
 
         async def call() -> object:
-            return await self._client.get_entity(reference)  # type: ignore[attr-defined]
+            try:
+                return await self._client.get_entity(reference)  # type: ignore[attr-defined]
+            except ValueError as error:
+                # Telethon catches UsernameNotOccupiedError inside
+                # `_get_entity_from_string` (users.py:565) and re-raises it as
+                # a plain ValueError, so the governor's list of rejected RPC
+                # errors never sees it: the exception escaped and killed the
+                # whole discovery job. Putting the RPC error back is what
+                # makes that list apply — the slot settles as a rejection
+                # rather than as an ambiguous call of unknown outcome.
+                raise errors.UsernameNotOccupiedError(request=None) from error
 
         result: ActionResult[object] = await self._governor.run(
             ActionKind.RESOLVE_USERNAME,
@@ -406,7 +428,10 @@ class ReconRunner:
 
     async def _input_entity(self, job: ReconJob, reference: str) -> object | None:
         async def call() -> object:
-            return await self._client.get_input_entity(reference)  # type: ignore[attr-defined]
+            try:
+                return await self._client.get_input_entity(reference)  # type: ignore[attr-defined]
+            except ValueError as error:
+                raise errors.UsernameNotOccupiedError(request=None) from error
 
         result: ActionResult[object] = await self._governor.run(
             ActionKind.RESOLVE_USERNAME,

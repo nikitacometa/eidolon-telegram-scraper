@@ -97,10 +97,12 @@ class FakeTelegram:
         search_results: list[Channel] | None = None,
         history: dict[str, list[SimpleNamespace]] | None = None,
         join_error: type[BaseException] | None = None,
+        entity_errors: dict[str, BaseException] | None = None,
     ) -> None:
         self.search_results = search_results or []
         self.history = history or {}
         self.join_error = join_error
+        self.entity_errors = entity_errors or {}
         self.joined: list[str] = []
         self.history_calls = 0
         self.title_queries: list[str] = []
@@ -110,15 +112,24 @@ class FakeTelegram:
         }
 
     async def get_entity(self, reference: str) -> Channel:
-        entity = self.entities.get(str(reference).lstrip("@"))
+        name = str(reference).lstrip("@")
+        if name in self.entity_errors:
+            raise self.entity_errors[name]
+        entity = self.entities.get(name)
         if entity is None:
-            raise errors.UsernameNotOccupiedError(request=None)
+            # A ValueError, not UsernameNotOccupiedError: Telethon catches the
+            # RPC error inside `_get_entity_from_string` (users.py:565) and
+            # re-raises `ValueError('No user has "x" as username')`. Raising
+            # the RPC form here is what let a real crash through — the
+            # governor's rejected-error list never sees it, and one dead seed
+            # killed a whole discovery job in production on 2026-08-29.
+            raise ValueError(f'No user has "{reference}" as username')
         return entity
 
     async def get_input_entity(self, reference: str) -> SimpleNamespace:
         name = str(reference).lstrip("@")
         if name not in self.entities:
-            raise errors.UsernameNotOccupiedError(request=None)
+            raise ValueError(f"Cannot find any entity corresponding to {reference!r}")
         return SimpleNamespace(username=name)
 
     async def __call__(self, request: object) -> object:
@@ -499,3 +510,105 @@ async def test_title_search_runs_over_every_spelling_of_the_place(
         "đà lạt",
     ]
     assert client.hashtag_queries == ["dalat", "dalatexpats", "далат", "đàlạt"]
+
+
+async def test_a_dead_seed_does_not_kill_the_job(scout: ScoutDatabase, db: Database) -> None:
+    """Seeds are hand-written, so one of them being gone is ordinary.
+
+    Measured 2026-08-29: a Phangan discovery job died whole on its first
+    unresolvable seed, losing the five live ones behind it, because Telethon
+    reports an unused username as a plain ValueError that the governor's
+    rejected-error list does not cover.
+    """
+    alive = _channel(400, "phangan_housing", "Phangan Housing and Rent")
+    client = FakeTelegram(search_results=[alive])
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="phangan-dead-seed",
+            topic="housing rent",
+            location="Phangan",
+            seeds=("no_such_chat_anywhere", "phangan_housing"),
+            max_join_attempts=0,
+        )
+    )
+
+    report = await _runner(scout, db, client, pages=1).run(job)
+
+    assert report.stop_reason == "frontier empty"
+    assert [finding.chat_ref for finding in report.recommended] == ["phangan_housing"]
+
+    # The dead seed must settle as a rejection, not as a call of unknown
+    # outcome: "ambiguous" is what the governor records when an exception it
+    # does not recognise escapes, and that is the state the crash left behind.
+    cursor = await scout.conn.execute(
+        "SELECT outcome, error_code FROM telegram_actions WHERE idempotency_key LIKE ?",
+        (f"{job.id}:resolve:no_such_chat_anywhere",),
+    )
+    row = await cursor.fetchone()
+    assert row is not None, "resolving a dead seed must still spend a governed slot"
+    assert row["outcome"] == "failed"
+    assert row["error_code"] == "UsernameNotOccupiedError"
+
+
+async def test_phangan_spellings_reach_the_search_surfaces(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """The island is written five ways and the chats are titled in all of them."""
+    client = FakeTelegram(search_results=[])
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="phangan-titles",
+            topic="housing rent",
+            location="Phangan",
+            max_join_attempts=0,
+        )
+    )
+
+    await _runner(scout, db, client, pages=1).run(job)
+
+    assert client.title_queries == [
+        "phangan",
+        "phangan housing",
+        "pangan",
+        "панган",
+        "пханган",
+        "koh phangan",
+    ]
+    assert client.hashtag_queries == [
+        "phangan",
+        "phanganhousing",
+        "pangan",
+        "панган",
+    ]
+    assert "panganm" not in client.hashtag_queries
+
+
+async def test_a_seed_that_fails_unexpectedly_does_not_kill_the_job(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """The isolation is per seed, not per error type.
+
+    Resolving a name is one Telegram call among many, and the ways it can go
+    wrong are open-ended — a transport hiccup, a library change, a peer type
+    the describer does not know. None of them is a reason to discard the
+    other five names the job was given.
+    """
+    alive = _channel(401, "phangan_rent", "Phangan Rent")
+    client = FakeTelegram(
+        search_results=[alive],
+        entity_errors={"exploding_seed": RuntimeError("transport died mid-resolve")},
+    )
+    job = await scout.create_job(
+        JobRequest(
+            idempotency_key="phangan-exploding-seed",
+            topic="housing rent",
+            location="Phangan",
+            seeds=("exploding_seed", "phangan_rent"),
+            max_join_attempts=0,
+        )
+    )
+
+    report = await _runner(scout, db, client, pages=1).run(job)
+
+    assert report.status is ReconJobStatus.COMPLETED
+    assert [finding.chat_ref for finding in report.recommended] == ["phangan_rent"]

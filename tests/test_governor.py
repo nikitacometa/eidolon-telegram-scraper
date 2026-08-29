@@ -328,3 +328,61 @@ async def test_replayed_read_is_allowed_to_run_again(scout: ScoutDatabase) -> No
 
     assert second.ok
     assert calls == 2
+
+
+async def test_joins_are_paced_apart_not_just_capped(scout: ScoutDatabase) -> None:
+    """A daily cap alone lets the whole day's joins land inside one minute.
+
+    The interval is what Telegram actually reads as a person versus a script,
+    so it is enforced separately from the rolling windows.
+    """
+    policy = {ActionKind.JOIN: BudgetRule(per_day=6, min_interval_seconds=7200)}
+    governor = TelegramActionGovernor(scout=scout, policy=policy)
+    reached = 0
+
+    async def call() -> str:
+        nonlocal reached
+        reached += 1
+        return "joined"
+
+    first = await governor.run(ActionKind.JOIN, "join-1", call)
+    second = await governor.run(ActionKind.JOIN, "join-2", call)
+
+    assert first.ok
+    assert second.status is ActionStatus.DENIED
+    assert reached == 1, "the paced call must not reach Telegram"
+    assert second.denial is not None
+    assert second.denial.retry_after_seconds is not None
+    assert 7000 <= second.denial.retry_after_seconds <= 7200
+
+
+async def test_an_unpaced_action_class_runs_back_to_back(scout: ScoutDatabase) -> None:
+    """Pacing applies only where a rule asks for it; reads stay unthrottled."""
+    policy = {ActionKind.HISTORY_PAGE: BudgetRule(per_day=10)}
+    governor = TelegramActionGovernor(scout=scout, policy=policy)
+
+    async def call() -> str:
+        return "page"
+
+    first = await governor.run(ActionKind.HISTORY_PAGE, "page-1", call)
+    second = await governor.run(ActionKind.HISTORY_PAGE, "page-2", call)
+
+    assert first.ok
+    assert second.ok
+
+
+async def test_the_default_join_policy_is_six_a_day_two_hours_apart(scout: ScoutDatabase) -> None:
+    """The shipped default is the pace, not a value a caller has to remember."""
+    governor = TelegramActionGovernor(scout=scout)
+
+    async def call() -> str:
+        return "joined"
+
+    first = await governor.run(ActionKind.JOIN, "default-join-1", call)
+    second = await governor.run(ActionKind.JOIN, "default-join-2", call)
+
+    assert first.ok
+    assert second.status is ActionStatus.DENIED
+    assert second.denial is not None
+    assert second.denial.retry_after_seconds is not None
+    assert second.denial.retry_after_seconds > 3600
