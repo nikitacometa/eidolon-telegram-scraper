@@ -340,3 +340,19 @@ CREATE INDEX IF NOT EXISTS idx_housing_media_pending
 -- partial because only a completed download has a file to reuse.
 CREATE INDEX IF NOT EXISTS idx_housing_media_photo
     ON housing_media(telegram_photo_id) WHERE download_status = 'downloaded';
+
+-- What kind of chat a housing-bound chat is.
+--
+-- A dedicated rentals board and the island's general talk chat need different
+-- treatment: in the first, every message is a candidate and is read in full;
+-- in the second, listings are one message in five and a cheap lexical gate
+-- keeps the model bill proportional to listings rather than to conversation.
+-- Absence from this table means general, which is the cautious default only
+-- in the sense that it spends less — a chat wrongly marked general still sees
+-- every message that mentions housing or a price.
+CREATE TABLE IF NOT EXISTS housing_chat_kinds (
+    chat_id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'general_island'
+        CHECK(kind IN ('dedicated_housing', 'general_island')),
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

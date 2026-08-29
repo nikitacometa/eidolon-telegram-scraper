@@ -822,3 +822,24 @@ class HousingStore:
         )
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
+
+    async def chat_kind(self, chat_id: int) -> str:
+        """Whether this chat is a rentals board or the island's talk chat."""
+        cursor = await self._conn.execute(
+            "SELECT kind FROM housing_chat_kinds WHERE chat_id = ?", (chat_id,)
+        )
+        row = await cursor.fetchone()
+        return str(row[0]) if row is not None else "general_island"
+
+    async def set_chat_kind(self, chat_id: int, kind: str) -> None:
+        """Record what a chat is, so the gate knows how much to trust it."""
+        async with self._write_lock:
+            await self._conn.execute(
+                """
+                INSERT INTO housing_chat_kinds (chat_id, kind) VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    kind = excluded.kind, updated_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, kind),
+            )
+            await self._conn.commit()

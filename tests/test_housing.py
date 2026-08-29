@@ -10,6 +10,7 @@ import pytest
 
 from pipeline.governor import ActionStatus
 from pipeline.housing.extractor import HousingFacts, HousingTextExtractor
+from pipeline.housing.gate import could_be_housing
 from pipeline.housing.media import MAX_BYTES, MediaDownloadWorker
 from pipeline.housing.requirements import (
     DEFAULT_REQUIREMENTS,
@@ -449,6 +450,10 @@ class FakeExtractor:
 
 
 async def _queue_unit(store: HousingStore, text: str, *, chat_id: int = -1001199262612) -> str:
+    # These fixtures are about what the subsystem does with an advertisement,
+    # so the chat is a rentals board and the lexical gate does not apply. The
+    # gate has its own tests below.
+    await store.set_chat_kind(chat_id, "dedicated_housing")
     key = unit_key_for(chat_id, grouped_id=None, telegram_msg_id=100)
     await store.record_message(
         unit_key=key,
@@ -767,6 +772,7 @@ async def test_photos_are_requested_only_when_they_could_answer_something(
     store: HousingStore,
 ) -> None:
     """A listing that already states everything must not spend a download."""
+    await store.set_chat_kind(-100777, "dedicated_housing")
     key = unit_key_for(-100777, grouped_id=1, telegram_msg_id=1)
     await store.record_message(
         unit_key=key,
@@ -801,6 +807,7 @@ async def test_photos_are_requested_only_when_they_could_answer_something(
 async def test_photos_are_requested_when_a_criterion_is_unanswered(
     store: HousingStore,
 ) -> None:
+    await store.set_chat_kind(-100777, "dedicated_housing")
     key = unit_key_for(-100777, grouped_id=2, telegram_msg_id=2)
     await store.record_message(
         unit_key=key,
@@ -962,6 +969,7 @@ class FakeVision:
 
 
 async def _unit_with_photo(store: HousingStore, tmp_path: Path, facts: HousingFacts) -> str:
+    await store.set_chat_kind(-1001199262612, "dedicated_housing")
     key = unit_key_for(-1001199262612, grouped_id=None, telegram_msg_id=77)
     await store.record_message(
         unit_key=key,
@@ -1166,3 +1174,88 @@ async def test_a_normal_photograph_is_stored_with_its_path(
     stored = await store.downloaded_media(key)
     assert len(stored) == 1
     assert await asyncio.to_thread(Path(stored[0]).read_bytes) == b"x" * 2048
+
+
+# ---------------------------------------------------------------------------
+# The pre-gate
+# ---------------------------------------------------------------------------
+
+
+def test_the_gate_passes_a_listing_in_any_of_its_usual_forms() -> None:
+    for text in [
+        "Сдаю дом на длительный срок, 2 спальни, есть кондей и телевизор",
+        "Пересдаю свою виллу с 1 сентября, 25000 бат в месяц, депозит месяц",
+        "House for rent in Sri Thanu, 2 bedrooms, long term, 30k",
+        "Освобождается студия рядом с закатным пляжем, недорого, пишите в лс",
+        "Свободна квартира с 15 числа, всё есть, 18 000",
+    ]:
+        assert could_be_housing(text), text
+
+
+def test_the_gate_drops_ordinary_island_conversation() -> None:
+    for text in [
+        "У меня эти птицы как-то напали на котенка, вот сели в кустах и мяукали",
+        "Приглашаю на проф.процедуру по Шугарингу (для женщин и мужчин). Велком!",
+        "Кто знает, где починить байк недалеко от Тонг Салы? Спасибо заранее",
+    ]:
+        assert not could_be_housing(text), text
+
+
+def test_the_gate_ignores_a_message_too_short_to_be_a_listing() -> None:
+    assert not could_be_housing("сдаю")
+    assert not could_be_housing("")
+    assert not could_be_housing(None)
+
+
+def test_the_gate_reads_a_spaced_price() -> None:
+    """Prices in this corpus are written "15 000" as often as "15000"."""
+    assert could_be_housing("Освобождается с первого числа, всё включено, 15 000 в месяц")
+
+
+async def test_a_dedicated_rentals_chat_is_never_gated(store: HousingStore) -> None:
+    """On a board where everything is a listing, the gate must not apply.
+
+    A short or oddly-worded advertisement there is still an advertisement, and
+    the whole board is small enough to read in full.
+    """
+    await store.set_chat_kind(-100999, "dedicated_housing")
+    key = unit_key_for(-100999, grouped_id=None, telegram_msg_id=1)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-100999,
+        grouped_id=None,
+        message_id=1,
+        telegram_msg_id=1,
+        text="Освобождается с первого, тихо, вид на джунгли, пишите",
+        has_media=False,
+        telegram_photo_id=None,
+    )
+    extractor = FakeExtractor(HousingFacts(is_rental_offer=True, is_vehicle_ad=False, bedrooms=2))
+
+    await HousingWorker(store=store, extractor=extractor).run_once()
+
+    assert len(extractor.calls) == 1
+
+
+async def test_a_general_chat_message_that_is_only_chatter_never_reaches_the_model(
+    store: HousingStore,
+) -> None:
+    key = unit_key_for(-100777, grouped_id=None, telegram_msg_id=2)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-100777,
+        grouped_id=None,
+        message_id=1,
+        telegram_msg_id=2,
+        text="Кто знает, где починить байк недалеко от Тонг Салы? Спасибо заранее",
+        has_media=False,
+        telegram_photo_id=None,
+    )
+    extractor = FakeExtractor(HousingFacts(is_rental_offer=True, is_vehicle_ad=False))
+
+    await HousingWorker(store=store, extractor=extractor).run_once()
+
+    assert extractor.calls == []
+    unit = await store.get_unit(key)
+    assert unit is not None
+    assert unit.state is UnitState.DONE

@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from pipeline.housing.extractor import HousingTextExtractor
+from pipeline.housing.gate import could_be_housing
 from pipeline.housing.requirements import (
     DEFAULT_REQUIREMENTS,
     FieldState,
@@ -84,6 +85,10 @@ class HousingWorker:
 
     async def _process(self, unit: ContentUnit) -> None:
         """One advertisement, from assembled text to a queued alert."""
+        if not await self._worth_reading(unit):
+            await self._store.set_unit_state(unit.unit_key, UnitState.DONE)
+            return
+
         await self._store.set_unit_state(unit.unit_key, UnitState.EXTRACTING)
         facts = await self._extractor.extract(unit.assembled_text or "")
         row = facts.as_row(unit_version=unit.unit_version)
@@ -151,6 +156,20 @@ class HousingWorker:
                 unit.unit_key,
                 ", ".join(sorted(answerable)),
             )
+
+    async def _worth_reading(self, unit: ContentUnit) -> bool:
+        """Decide whether this message is worth a model call at all.
+
+        On a dedicated rentals board the answer is always yes: everything
+        posted there is a candidate. On a general chat the lexical gate runs,
+        because those chats are large and mostly conversation — see
+        pipeline/housing/gate.py for what it drops and what that was measured
+        against.
+        """
+        kind = await self._store.chat_kind(unit.chat_id)
+        if kind == "dedicated_housing":
+            return True
+        return could_be_housing(unit.assembled_text)
 
     async def _active_requirements(self) -> tuple[int, dict[str, Any]]:
         """The active revision, seeding the owner's stated criteria on first use."""
