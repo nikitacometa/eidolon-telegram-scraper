@@ -24,6 +24,7 @@ import logging
 import sys
 
 from config.settings import settings
+from pipeline.housing.history import ListingExtractor, price_trend
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
 from storage.db import Database
 from storage.search import (
@@ -37,7 +38,8 @@ from storage.session_lock import SessionInUseError, SessionLock
 # Commands that spend money or write the index. A timer tick landing on top of
 # a long manual pass would re-issue the same LLM calls for the same rows: the
 # writes are idempotent, the billing is not.
-_EXCLUSIVE = {"build", "sync", "embed", "extract"}
+# Housing extraction writes the same index and must not overlap a sync.
+_EXCLUSIVE = {"build", "sync", "embed", "extract", "housing-extract"}
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -84,6 +86,23 @@ async def _dispatch(args: argparse.Namespace) -> int:
 
         if args.command == "status":
             print(json.dumps(search.status(), indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "housing-extract":
+            extractor = ListingExtractor(search.conn)
+            seeded = extractor.seed(args.chat_id or [])
+            run = await extractor.run(limit=args.limit)
+            print(json.dumps({"seeded": seeded, **run.as_dict()}, indent=2))
+            return 0
+
+        if args.command == "housing-trend":
+            series = price_trend(
+                search.conn,
+                period_kind=args.period,
+                bedrooms=args.bedrooms,
+                persist=args.persist,
+            )
+            print(json.dumps(series, indent=2, ensure_ascii=False))
             return 0
 
         if args.command == "sync":
@@ -193,6 +212,29 @@ def main() -> int:
         action="append",
         choices=sorted(REEXTRACTABLE_STATUSES),
         help="re-extract a settled status (repeatable; bounded by --limit)",
+    )
+
+    p_housing = sub.add_parser(
+        "housing-extract", help="extract rental listings from archived housing chats"
+    )
+    p_housing.add_argument(
+        "--chat-id",
+        type=int,
+        action="append",
+        help="seed this chat's archive as pending (repeatable)",
+    )
+    p_housing.add_argument("--limit", type=int, default=500)
+
+    p_trend = sub.add_parser("housing-trend", help="price series over extracted listings")
+    p_trend.add_argument("--period", choices=["month", "quarter"], default="month")
+    p_trend.add_argument(
+        "--bedrooms",
+        default="all",
+        choices=["all", "0", "1", "2", "3+", "unknown"],
+        help="segment the series by bedroom count",
+    )
+    p_trend.add_argument(
+        "--persist", action="store_true", help="append the computed series to housing_price_trend"
     )
 
     p_build = sub.add_parser("build", help="sync, embed and extract in one pass")

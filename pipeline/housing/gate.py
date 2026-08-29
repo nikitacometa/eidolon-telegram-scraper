@@ -25,10 +25,17 @@ import re
 
 # Any of these words is enough. The list is a net, not a definition: an
 # advertisement is identified by the model, not here.
+#
+# Every stem is anchored at a word boundary, which Python's `re` computes over
+# Unicode word characters, so it works on Russian. Without the anchors the
+# stem "дом" matches inside "рядом" and the gate passes half the conversation
+# on the island — measured, not theorised: it let through "Кто подскажет
+# стоматолога рядом с Тонг Салой?".
 HOUSING_HINTS = re.compile(
-    r"сда(ю|м|ет|ёт)|сдаётся|сдается|аренд|снять|пересда|rent|for\s+rent|available"
-    r"|дом|вилл|villa|house|бунгало|bungalow|апарт|apartment|квартир|студи|studio"
-    r"|room|комнат|спальн|bedroom|\bbr\b|таунхаус|жиль",
+    r"\bсда(ю|м|ет|ёт)|\bсдаётся|\bсдается|\bаренд|\bснять|\bсниму|\bпересда"
+    r"|\brent|\bavailable|\bдом|\bвилл|\bvilla|\bhouse|\bбунгало|\bbungalow"
+    r"|\bапарт|\bapartment|\bквартир|\bстуди|\bstudio|\broom|\bкомнат|\bспальн"
+    r"|\bbedroom|\bbr\b|\bтаунхаус|\bжиль",
     re.IGNORECASE,
 )
 
@@ -37,10 +44,10 @@ HOUSING_HINTS = re.compile(
 # suffixed forms catch "15k", "30 тыс", "20к".
 PRICE_HINTS = re.compile(r"\d{4,}|\d+\s*(k|к|тыс)|бат|baht|thb|฿", re.IGNORECASE)
 
-# Below this a message cannot carry a listing: measured, the shortest real
-# advertisement in the corpus runs to well over a hundred characters, and the
-# short tail is entirely conversation.
-MIN_LENGTH = 40
+# Short enough to admit a terse real listing — "Сдаю дом 2 спальни 25000 бат"
+# is twenty-eight characters — while still dropping the one-word replies that
+# make up most of a chat's traffic.
+MIN_LENGTH = 20
 
 
 def could_be_housing(text: str | None) -> bool:

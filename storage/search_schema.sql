@@ -329,3 +329,72 @@ CREATE TABLE IF NOT EXISTS extraction_cost (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ---------------------------------------------------------------------------
+-- Housing listings: the structured record of what was on offer, and when.
+--
+-- Derived like everything else in this file — every row is rebuildable from
+-- the corpus by re-running the extractor — and written only by index_cli.py,
+-- never by the daemon.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS housing_listings (
+    listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    corpus_id INTEGER NOT NULL UNIQUE REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    -- The same advertisement crossposted into three chats is three rows with
+    -- one hash. Trend aggregation counts a hash once; keeping the rows is what
+    -- lets a later question ask where a listing appeared.
+    content_hash TEXT,
+    posted_at TIMESTAMP NOT NULL,
+    is_rental_offer INTEGER NOT NULL,
+    is_vehicle_ad INTEGER NOT NULL,
+    bedrooms INTEGER,
+    bathrooms INTEGER,
+    monthly_price_thb INTEGER,
+    price_note TEXT,
+    tv_present INTEGER,
+    tv_size_class TEXT,
+    area_raw TEXT,
+    evidence_quote TEXT,
+    extractor_version TEXT NOT NULL,
+    extracted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_housing_listings_month
+    ON housing_listings(posted_at) WHERE is_rental_offer = 1;
+CREATE INDEX IF NOT EXISTS idx_housing_listings_hash ON housing_listings(content_hash);
+
+CREATE TABLE IF NOT EXISTS housing_listing_state (
+    corpus_id INTEGER PRIMARY KEY REFERENCES corpus_messages(corpus_id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'extracted', 'not_housing', 'gated', 'error')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    attempted_at TIMESTAMP,
+    error TEXT,
+    extractor_version TEXT NOT NULL DEFAULT 'housing-text-v1'
+);
+
+CREATE INDEX IF NOT EXISTS idx_housing_state_pending
+    ON housing_listing_state(status, corpus_id);
+
+-- Append-only. A bucket recomputed after more history arrives is a new row,
+-- not an edit: "why is March different from what I saw yesterday" has to have
+-- an answer, and n_chats_included is usually it.
+CREATE TABLE IF NOT EXISTS housing_price_trend (
+    -- A counter rather than the timestamp: two runs inside the same second
+    -- are two runs, and keying on CURRENT_TIMESTAMP made the second one fail
+    -- an integrity check instead of appending.
+    run_id INTEGER NOT NULL,
+    period_kind TEXT NOT NULL CHECK(period_kind IN ('month', 'quarter')),
+    period TEXT NOT NULL,
+    bedrooms_bucket TEXT NOT NULL,
+    n_listings INTEGER NOT NULL,
+    n_priced INTEGER NOT NULL,
+    median_thb REAL,
+    p25_thb REAL,
+    p75_thb REAL,
+    n_chats_included INTEGER NOT NULL,
+    computed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (period_kind, period, bedrooms_bucket, run_id)
+);

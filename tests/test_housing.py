@@ -1193,10 +1193,19 @@ def test_the_gate_passes_a_listing_in_any_of_its_usual_forms() -> None:
 
 
 def test_the_gate_drops_ordinary_island_conversation() -> None:
+    """Including the words that merely CONTAIN a housing stem.
+
+    "рядом" ends in "дом" and "комнате" is fine but "укомплектован" is not a
+    room; without word boundaries the gate passed a question about a dentist
+    and would have sent half the island's conversation to the model. This is
+    the case that actually occurred, not an invented one.
+    """
     for text in [
         "У меня эти птицы как-то напали на котенка, вот сели в кустах и мяукали",
         "Приглашаю на проф.процедуру по Шугарингу (для женщин и мужчин). Велком!",
         "Кто знает, где починить байк недалеко от Тонг Салы? Спасибо заранее",
+        "Кто подскажет хорошего стоматолога рядом с пирсом? Заранее спасибо",
+        "Гуляли рядом с водопадом, вода тёплая, всем советую сходить туда",
     ]:
         assert not could_be_housing(text), text
 
