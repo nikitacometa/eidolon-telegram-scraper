@@ -31,7 +31,17 @@ remote_dir=$1
 revision=$2
 cd "$HOME/$remote_dir"
 
-command -v uv >/dev/null
+# `ssh host bash -s` is a non-login, non-interactive shell: it reads neither
+# .profile nor .bashrc, so the PATH it inherits is the system default and the
+# uv installed under ~/.local/bin is invisible. The check below then failed
+# under `set -e` and the deployment exited 1 having printed nothing, which
+# reads exactly like a deployment that ran.
+export PATH="$HOME/.local/bin:$PATH"
+
+command -v uv >/dev/null || {
+    printf 'ERROR: uv not found on the remote PATH (%s)\n' "$PATH" >&2
+    exit 1
+}
 previous_revision=$(git rev-parse HEAD)
 rollback() {
     printf 'Deployment failed; restoring %s\n' "$previous_revision" >&2
