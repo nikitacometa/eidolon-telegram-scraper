@@ -1,5 +1,6 @@
 """Tests for the housing subsystem: units, requirements, verdicts, alerts."""
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,13 @@ from pipeline.housing.requirements import (
     match_requirements,
     validate_requirements,
 )
-from pipeline.housing.worker import HousingAlertDelivery, HousingWorker, render_alert
+from pipeline.housing.vision import VisionReading
+from pipeline.housing.worker import (
+    HousingAlertDelivery,
+    HousingVisionWorker,
+    HousingWorker,
+    render_alert,
+)
 from pipeline.ingestion import media_pointer
 from pipeline.models import DeliveryResult
 from storage.db import Database
@@ -746,3 +753,315 @@ async def test_empty_text_is_reported_as_unreadable_without_a_call() -> None:
     facts = await extractor.extract("   ")
 
     assert facts.error == "empty_text"
+
+
+# ---------------------------------------------------------------------------
+# Photographs
+# ---------------------------------------------------------------------------
+
+
+async def test_photos_are_requested_only_when_they_could_answer_something(
+    store: HousingStore,
+) -> None:
+    """A listing that already states everything must not spend a download."""
+    key = unit_key_for(-100777, grouped_id=1, telegram_msg_id=1)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-100777,
+        grouped_id=1,
+        message_id=1,
+        telegram_msg_id=1,
+        text="Сдаю дом 2 спальни 2 санузла большой телевизор 30000 бат",
+        has_media=True,
+        telegram_photo_id=11,
+    )
+    worker = HousingWorker(
+        store=store,
+        extractor=FakeExtractor(
+            HousingFacts(
+                is_rental_offer=True,
+                is_vehicle_ad=False,
+                bedrooms=2,
+                bathrooms=2,
+                monthly_price_thb=30000,
+                tv_present=True,
+                tv_size_class="large",
+            )
+        ),
+    )
+
+    await worker.run_once()
+
+    assert await store.next_media_download(priority="live") is None
+
+
+async def test_photos_are_requested_when_a_criterion_is_unanswered(
+    store: HousingStore,
+) -> None:
+    key = unit_key_for(-100777, grouped_id=2, telegram_msg_id=2)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-100777,
+        grouped_id=2,
+        message_id=2,
+        telegram_msg_id=2,
+        text="Сдаю дом 2 спальни 30000 бат, фото ниже",
+        has_media=True,
+        telegram_photo_id=22,
+    )
+    worker = HousingWorker(
+        store=store,
+        extractor=FakeExtractor(
+            HousingFacts(
+                is_rental_offer=True,
+                is_vehicle_ad=False,
+                bedrooms=2,
+                monthly_price_thb=30000,
+            )
+        ),
+    )
+
+    await worker.run_once()
+
+    pending = await store.next_media_download(priority="live")
+    assert pending is not None
+    assert pending["telegram_photo_id"] == 22
+
+
+async def test_a_photograph_already_on_disk_is_not_fetched_again(
+    store: HousingStore, tmp_path: Path
+) -> None:
+    """The same advertisement crossposted into a second chat reuses the file."""
+    existing = tmp_path / "photo.jpg"
+    existing.write_bytes(b"jpeg")
+    first = unit_key_for(-100777, grouped_id=None, telegram_msg_id=1)
+    await store.record_message(
+        unit_key=first,
+        chat_id=-100777,
+        grouped_id=None,
+        message_id=1,
+        telegram_msg_id=1,
+        text="Сдаю",
+        has_media=True,
+        telegram_photo_id=4242,
+    )
+    await store.enqueue_media(unit_key=first, chat_id=-100777, photos=[(1, 4242)])
+    await store.settle_media(
+        unit_key=first,
+        telegram_msg_id=1,
+        status="downloaded",
+        local_path=str(existing),
+        byte_size=4,
+    )
+
+    second = unit_key_for(-100888, grouped_id=None, telegram_msg_id=9)
+    await store.record_message(
+        unit_key=second,
+        chat_id=-100888,
+        grouped_id=None,
+        message_id=2,
+        telegram_msg_id=9,
+        text="Сдаю",
+        has_media=True,
+        telegram_photo_id=4242,
+    )
+    queued = await store.enqueue_media(unit_key=second, chat_id=-100888, photos=[(9, 4242)])
+
+    assert queued == 0
+    assert await store.downloaded_media(second) == [str(existing)]
+
+
+# ---------------------------------------------------------------------------
+# Vision
+# ---------------------------------------------------------------------------
+
+
+def test_a_visual_bathroom_count_fills_an_unknown_and_is_marked_as_visual() -> None:
+    reading = VisionReading(bathrooms_visible_min=2, confidence=0.8)
+    facts = _text_facts(bathrooms=None, bathrooms_source="unknown")
+
+    merged = reading.merged_into(facts)
+
+    assert merged["bathrooms"] == 2
+    assert merged["bathrooms_source"] == "vision"
+    assert merged["vision_status"] == "done"
+
+
+def test_a_stated_bathroom_count_is_never_overwritten_by_a_photograph() -> None:
+    """Text describes the property; a photograph describes its frame.
+
+    The direction that matters is a HIGHER visual count against a lower stated
+    one: someone wrote "1 санузел", the album shows what looks like two, and
+    believing the album would turn a listing the owner ruled out into a false
+    match. A lower visual count is refused by the lower-bound rule anyway, so
+    testing that direction proves nothing about this guard.
+    """
+    reading = VisionReading(bathrooms_visible_min=2, confidence=0.9)
+    facts = _text_facts(bathrooms=1, bathrooms_source="text")
+
+    merged = reading.merged_into(facts)
+
+    assert merged["bathrooms"] == 1
+    assert merged["bathrooms_source"] == "text"
+    assert match_requirements(merged, DEFAULT_REQUIREMENTS).verdict is Verdict.HARD_MISS
+
+
+def test_a_low_confidence_reading_changes_nothing() -> None:
+    """Stored and shown, but not allowed to decide."""
+    reading = VisionReading(bathrooms_visible_min=3, tv_size_class="large", confidence=0.2)
+    facts = _text_facts(bathrooms=None, bathrooms_source="unknown", tv_source="unknown")
+
+    merged = reading.merged_into(facts)
+
+    assert merged["bathrooms"] is None
+    assert merged["vision_status"] == "done"
+
+
+def test_photographs_of_something_else_change_nothing() -> None:
+    """A price card or a logo is not evidence about the property."""
+    reading = VisionReading(bathrooms_visible_min=2, confidence=0.9, photos_show_this_listing=False)
+    facts = _text_facts(bathrooms=None, bathrooms_source="unknown")
+
+    assert reading.merged_into(facts)["bathrooms"] is None
+
+
+def test_a_television_the_photographs_missed_stays_unknown() -> None:
+    """Absence from a frame is not absence from the house."""
+    reading = VisionReading(tv_present=None, tv_size_class=None, confidence=0.9)
+    facts = _text_facts(tv_present=None, tv_size_class=None, tv_source="unknown")
+
+    merged = reading.merged_into(facts)
+
+    assert merged["tv_source"] == "unknown"
+    assert match_requirements(merged, DEFAULT_REQUIREMENTS).verdict is Verdict.POSSIBLE
+
+
+def test_a_failed_vision_read_leaves_every_unknown_untouched() -> None:
+    reading = VisionReading.unavailable("APITimeoutError")
+    facts = _text_facts(bathrooms=None, bathrooms_source="unknown")
+
+    merged = reading.merged_into(facts)
+
+    assert merged["bathrooms"] is None
+    assert merged["vision_status"] == "error"
+
+
+class FakeVision:
+    """A vision extractor whose reading the test chooses."""
+
+    def __init__(self, reading: VisionReading) -> None:
+        self.reading = reading
+        self.calls: list[list[str]] = []
+
+    async def read(self, paths: list[str], *, listing_text: str | None = None) -> VisionReading:
+        self.calls.append(paths)
+        return self.reading
+
+
+async def _unit_with_photo(store: HousingStore, tmp_path: Path, facts: HousingFacts) -> str:
+    key = unit_key_for(-1001199262612, grouped_id=None, telegram_msg_id=77)
+    await store.record_message(
+        unit_key=key,
+        chat_id=-1001199262612,
+        grouped_id=None,
+        message_id=1,
+        telegram_msg_id=77,
+        text="Сдаю дом 2 спальни 30000 бат",
+        has_media=True,
+        telegram_photo_id=77,
+    )
+    await HousingWorker(store=store, extractor=FakeExtractor(facts)).run_once()
+    photo = tmp_path / "listing.jpg"
+    photo.write_bytes(b"jpeg-bytes")
+    await store.settle_media(
+        unit_key=key,
+        telegram_msg_id=77,
+        status="downloaded",
+        local_path=str(photo),
+        byte_size=10,
+    )
+    return key
+
+
+async def test_photographs_that_complete_the_picture_upgrade_the_verdict(
+    store: HousingStore, tmp_path: Path
+) -> None:
+    """Possible becomes confirmed, and the owner is told again — with the photo."""
+    key = await _unit_with_photo(
+        store,
+        tmp_path,
+        HousingFacts(
+            is_rental_offer=True,
+            is_vehicle_ad=False,
+            bedrooms=2,
+            monthly_price_thb=30000,
+        ),
+    )
+    await store.claim_due_alerts(lease_owner="drain")  # the first, text-only alert
+
+    vision = FakeVision(
+        VisionReading(
+            bathrooms_visible_min=2,
+            tv_size_class="large",
+            tv_present=True,
+            confidence=0.9,
+        )
+    )
+    read = await HousingVisionWorker(store=store, extractor=vision).run_once()
+
+    assert read == 1
+    facts = await store.get_facts(key)
+    assert facts is not None
+    assert facts["bathrooms"] == 2
+    assert facts["bathrooms_source"] == "vision"
+    alerts = await store.claim_due_alerts(lease_owner="test")
+    assert len(alerts) == 1
+    assert alerts[0]["kind"] == AlertKind.UPDATE.value
+    assert alerts[0]["verdict"] == Verdict.CONFIRMED.value
+    assert json.loads(str(alerts[0]["photo_paths_json"]))
+
+
+async def test_photographs_that_change_nothing_send_no_second_alert(
+    store: HousingStore, tmp_path: Path
+) -> None:
+    """Repeating a verdict trains the owner to ignore these messages."""
+    await _unit_with_photo(
+        store,
+        tmp_path,
+        HousingFacts(
+            is_rental_offer=True,
+            is_vehicle_ad=False,
+            bedrooms=2,
+            monthly_price_thb=30000,
+        ),
+    )
+    await store.claim_due_alerts(lease_owner="drain")
+
+    vision = FakeVision(VisionReading(bathrooms_visible_min=None, confidence=0.9))
+    await HousingVisionWorker(store=store, extractor=vision).run_once()
+
+    assert await store.claim_due_alerts(lease_owner="test") == []
+
+
+async def test_a_unit_with_no_downloaded_photographs_is_not_read(
+    store: HousingStore,
+) -> None:
+    """Vision waits for the files rather than reading an empty list."""
+    await _queue_unit(store, "Сдаю дом 2 спальни 30000 бат")
+    await HousingWorker(
+        store=store,
+        extractor=FakeExtractor(
+            HousingFacts(
+                is_rental_offer=True,
+                is_vehicle_ad=False,
+                bedrooms=2,
+                monthly_price_thb=30000,
+            )
+        ),
+    ).run_once()
+
+    vision = FakeVision(VisionReading(bathrooms_visible_min=2, confidence=0.9))
+    read = await HousingVisionWorker(store=store, extractor=vision).run_once()
+
+    assert read == 0
+    assert vision.calls == []

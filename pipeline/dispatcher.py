@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 from datetime import datetime
+from pathlib import Path
 
 import aiohttp
 
@@ -15,6 +16,10 @@ from pipeline.models import DeliveryResult
 logger = logging.getLogger(__name__)
 
 BOT_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+PHOTO_API_URL = "https://api.telegram.org/bot{token}/sendPhoto"
+# Telegram's own ceiling on a photo caption. A listing alert that overruns it
+# is sent as text instead of silently losing its explanation.
+MAX_CAPTION_LENGTH = 1024
 
 
 class AlertDispatcher:
@@ -33,6 +38,7 @@ class AlertDispatcher:
             else settings.eidolon_bot_token or settings.pantheon_bot_token
         )
         self._url = BOT_API_URL.format(token=resolved_token)
+        self._photo_url = PHOTO_API_URL.format(token=resolved_token)
         self._chat_id = chat_id if chat_id is not None else settings.pantheon_chat_id
         self._enabled = bool(resolved_token and self._chat_id)
         self._max_attempts = max(1, max_attempts)
@@ -139,6 +145,55 @@ class AlertDispatcher:
             logger.warning("No bot token configured, skipping alert")
             return DeliveryResult(sent=False, retryable=False, error_code="dispatcher_disabled")
         return await self._deliver_html(message)
+
+    async def deliver_photo(self, caption_html: str, photo_path: str) -> DeliveryResult:
+        """Send one photograph with the alert as its caption.
+
+        A housing verdict read out of a photograph cannot be checked against a
+        quotation the way a text claim can, so the photograph travels with the
+        claim and the owner checks it himself. When the caption will not fit
+        Telegram's limit the text is sent on its own instead: losing the
+        reasoning to keep the picture would be the wrong trade.
+        """
+        if not self._session:
+            return DeliveryResult(
+                sent=False,
+                retryable=True,
+                error_code="dispatcher_not_started",
+                retry_after=1,
+            )
+        if not self._enabled:
+            return DeliveryResult(sent=False, retryable=False, error_code="dispatcher_disabled")
+        if len(caption_html) > MAX_CAPTION_LENGTH:
+            return await self._deliver_html(caption_html)
+
+        try:
+            payload = await asyncio.to_thread(Path(photo_path).read_bytes)
+        except OSError as error:
+            logger.warning("Listing photograph unreadable: %s", type(error).__name__)
+            return await self._deliver_html(caption_html)
+
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(self._chat_id))
+        form.add_field("caption", caption_html)
+        form.add_field("parse_mode", "HTML")
+        form.add_field("photo", payload, filename="listing.jpg", content_type="image/jpeg")
+        try:
+            async with self._session.post(self._photo_url, data=form) as response:
+                if response.status == 200:
+                    return DeliveryResult.success()
+                retry_after = await _retry_after_seconds(response, 1)
+                logger.warning("Photo delivery failed: status=%s", response.status)
+                return DeliveryResult(
+                    sent=False,
+                    retryable=response.status in {429} or response.status >= 500,
+                    error_code=f"http_{response.status}",
+                    retry_after=retry_after,
+                )
+        except aiohttp.ClientError as error:
+            return DeliveryResult(
+                sent=False, retryable=True, error_code=type(error).__name__, retry_after=5
+            )
 
     async def send_echo(
         self,

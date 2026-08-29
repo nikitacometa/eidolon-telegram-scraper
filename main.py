@@ -36,7 +36,13 @@ from pipeline.dispatcher import AlertDispatcher
 from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.governor import TelegramActionGovernor
-from pipeline.housing.worker import HousingAlertDelivery, HousingWorker
+from pipeline.housing.media import MediaDownloadWorker
+from pipeline.housing.vision import HousingVisionExtractor
+from pipeline.housing.worker import (
+    HousingAlertDelivery,
+    HousingVisionWorker,
+    HousingWorker,
+)
 from pipeline.ingestion import (
     NewMessageEvent,
     ingest_message,
@@ -141,6 +147,8 @@ class Eidolon:
         self.housing: HousingStore | None = None
         self._housing_task: asyncio.Task[None] | None = None
         self._housing_delivery_task: asyncio.Task[None] | None = None
+        self._housing_media_task: asyncio.Task[None] | None = None
+        self._housing_vision_task: asyncio.Task[None] | None = None
         self.governor = TelegramActionGovernor(scout=self.scout)
         self.crawler = TelegramCrawler(client=self.client, governor=self.governor)
         self.backfill = BackfillWorker(
@@ -332,6 +340,22 @@ class Eidolon:
                 ).run_forever(self._shutdown_event),
                 name="housing-delivery",
             )
+            self._housing_media_task = asyncio.create_task(
+                MediaDownloadWorker(
+                    store=self.housing,
+                    client=self.client,
+                    governor=self.governor,
+                    media_root=settings.housing_media_path,
+                ).run_forever(self._shutdown_event),
+                name="housing-media",
+            )
+            self._housing_vision_task = asyncio.create_task(
+                HousingVisionWorker(
+                    store=self.housing,
+                    extractor=HousingVisionExtractor(),
+                ).run_forever(self._shutdown_event),
+                name="housing-vision",
+            )
             logger.info("Housing subsystem enabled")
 
         if settings.backfill_enabled:
@@ -361,6 +385,8 @@ class Eidolon:
             self._agent_watcher_task,
             self._housing_task,
             self._housing_delivery_task,
+            self._housing_media_task,
+            self._housing_vision_task,
         ):
             if task is not None:
                 task.cancel()

@@ -124,6 +124,12 @@ class ActionKind(StrEnum):
     RESOLVE_USERNAME = "resolve_username"
     INVITE_CHECK = "invite_check"
     HISTORY_PAGE = "history_page"
+    # Downloading a photograph, split by what asked for it. One shared budget
+    # would let a history sweep exhaust the ceiling and leave a listing that
+    # arrived this minute waiting behind a year of old ones; two budgets make
+    # that starvation impossible rather than merely unlikely.
+    MEDIA_DOWNLOAD_LIVE = "media_download_live"
+    MEDIA_DOWNLOAD_BACKFILL = "media_download_backfill"
 
     @property
     def is_mutating(self) -> bool:
@@ -200,6 +206,11 @@ DEFAULT_BUDGET_POLICY: dict[ActionKind, BudgetRule] = {
     ActionKind.RESOLVE_USERNAME: BudgetRule(per_hour=30, per_day=100),
     ActionKind.INVITE_CHECK: BudgetRule(per_hour=10, per_day=30),
     ActionKind.HISTORY_PAGE: BudgetRule(per_hour=600, per_day=5000),
+    # Engineering guesses, unlike JOIN and HISTORY_PAGE whose numbers come from
+    # observed behaviour. A photograph download is one file request; these
+    # ceilings are what to watch and retune once there is a week of telemetry.
+    ActionKind.MEDIA_DOWNLOAD_LIVE: BudgetRule(per_hour=100, per_day=800),
+    ActionKind.MEDIA_DOWNLOAD_BACKFILL: BudgetRule(per_hour=60, per_day=1000),
 }
 
 

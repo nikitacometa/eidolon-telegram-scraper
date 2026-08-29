@@ -646,3 +646,179 @@ class HousingStore:
             (limit,),
         )
         return [str(row[0]) for row in await cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Photographs
+    # ------------------------------------------------------------------
+
+    async def enqueue_media(
+        self,
+        *,
+        unit_key: str,
+        chat_id: int,
+        photos: list[tuple[int, int]],
+        priority: str = "live",
+    ) -> int:
+        """Ask for a unit's photographs, skipping any already on disk.
+
+        ``photos`` is (telegram_msg_id, telegram_photo_id) pairs. A photograph
+        already downloaded under another unit — the same advertisement
+        crossposted into a second chat — is recorded as done immediately with
+        the existing file, so the same bytes are never fetched twice.
+        """
+        queued = 0
+        async with self._write_lock:
+            for telegram_msg_id, photo_id in photos:
+                cursor = await self._conn.execute(
+                    "SELECT local_path, byte_size FROM housing_media"
+                    " WHERE telegram_photo_id = ? AND download_status = 'downloaded'"
+                    " LIMIT 1",
+                    (photo_id,),
+                )
+                existing = await cursor.fetchone()
+                if existing is not None:
+                    await self._conn.execute(
+                        """
+                        INSERT INTO housing_media (
+                            unit_key, chat_id, telegram_msg_id, telegram_photo_id,
+                            priority, download_status, local_path, byte_size, downloaded_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, 'downloaded', ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(unit_key, telegram_msg_id) DO NOTHING
+                        """,
+                        (
+                            unit_key,
+                            chat_id,
+                            telegram_msg_id,
+                            photo_id,
+                            priority,
+                            existing["local_path"],
+                            existing["byte_size"],
+                        ),
+                    )
+                    continue
+                cursor = await self._conn.execute(
+                    """
+                    INSERT INTO housing_media (
+                        unit_key, chat_id, telegram_msg_id, telegram_photo_id, priority
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(unit_key, telegram_msg_id) DO NOTHING
+                    RETURNING unit_key
+                    """,
+                    (unit_key, chat_id, telegram_msg_id, photo_id, priority),
+                )
+                if await cursor.fetchone() is not None:
+                    queued += 1
+            await self._conn.commit()
+        return queued
+
+    async def next_media_download(self, *, priority: str) -> dict[str, Any] | None:
+        """The next photograph due for fetching at this priority."""
+        cursor = await self._conn.execute(
+            """
+            SELECT * FROM housing_media
+            WHERE download_status = 'pending'
+              AND priority = ?
+              AND (not_before IS NULL OR datetime(not_before) <= CURRENT_TIMESTAMP)
+            ORDER BY requested_at
+            LIMIT 1
+            """,
+            (priority,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def settle_media(
+        self,
+        *,
+        unit_key: str,
+        telegram_msg_id: int,
+        status: str,
+        local_path: str | None = None,
+        byte_size: int | None = None,
+        error: str | None = None,
+        retry_in_seconds: int | None = None,
+    ) -> None:
+        """Record what happened to one download attempt."""
+        async with self._write_lock:
+            await self._conn.execute(
+                """
+                UPDATE housing_media
+                SET download_status = ?,
+                    local_path = COALESCE(?, local_path),
+                    byte_size = COALESCE(?, byte_size),
+                    attempts = attempts + 1,
+                    last_error = ?,
+                    not_before = CASE
+                        WHEN ? IS NULL THEN NULL
+                        ELSE datetime(CURRENT_TIMESTAMP, ?)
+                    END,
+                    downloaded_at = CASE WHEN ? = 'downloaded' THEN CURRENT_TIMESTAMP END
+                WHERE unit_key = ? AND telegram_msg_id = ?
+                """,
+                (
+                    status,
+                    local_path,
+                    byte_size,
+                    error,
+                    retry_in_seconds,
+                    f"+{retry_in_seconds} seconds" if retry_in_seconds else None,
+                    status,
+                    unit_key,
+                    telegram_msg_id,
+                ),
+            )
+            await self._conn.commit()
+
+    async def downloaded_media(self, unit_key: str) -> list[str]:
+        """Local paths of this unit's photographs, in message order."""
+        cursor = await self._conn.execute(
+            "SELECT local_path FROM housing_media"
+            " WHERE unit_key = ? AND download_status = 'downloaded' AND local_path IS NOT NULL"
+            " ORDER BY telegram_msg_id",
+            (unit_key,),
+        )
+        return [str(row[0]) for row in await cursor.fetchall()]
+
+    async def units_awaiting_vision(self, *, limit: int = 10) -> list[str]:
+        """Units whose photographs are in and whose unknowns vision could answer.
+
+        Only units already judged worth alerting on are eligible: reading the
+        photographs of an advertisement that failed on its stated price would
+        spend the budget on a listing nobody will be shown.
+        """
+        cursor = await self._conn.execute(
+            """
+            SELECT f.unit_key
+            FROM housing_live_facts f
+            JOIN housing_matches m ON m.unit_key = f.unit_key
+            WHERE f.is_rental_offer = 1
+              AND f.vision_status IN ('not_attempted', 'pending')
+              AND m.verdict IN ('possible', 'confirmed')
+              AND EXISTS (
+                  SELECT 1 FROM housing_media
+                  WHERE housing_media.unit_key = f.unit_key
+                    AND download_status = 'downloaded'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM housing_media
+                  WHERE housing_media.unit_key = f.unit_key
+                    AND download_status = 'pending'
+              )
+            ORDER BY f.extracted_at
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [str(row[0]) for row in await cursor.fetchall()]
+
+    async def latest_match(self, unit_key: str) -> dict[str, Any] | None:
+        """The most recent verdict recorded for a unit."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM housing_matches WHERE unit_key = ?"
+            " ORDER BY requirements_revision DESC LIMIT 1",
+            (unit_key,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None

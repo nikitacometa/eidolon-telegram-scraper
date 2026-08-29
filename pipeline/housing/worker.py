@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 from typing import Any
 
@@ -118,7 +119,38 @@ class HousingWorker:
                 kind=AlertKind.LIVE,
                 body_html=render_alert(unit, row, result),
             )
+            # Photographs are asked for AFTER the alert is queued, never
+            # before. A listing whose bathrooms are unstated is worth telling
+            # the owner about immediately; waiting for a download would delay
+            # every listing on the island for a fact that may not be in the
+            # pictures anyway.
+            await self._request_photographs(unit, result)
         await self._store.set_unit_state(unit.unit_key, UnitState.DONE)
+
+    async def _request_photographs(self, unit: ContentUnit, result: MatchResult) -> None:
+        """Queue this unit's photographs when they could answer an open question."""
+        answerable = {"bathrooms", "tv"} & set(result.unknown_fields)
+        if not answerable:
+            return
+        photos = [
+            (member.telegram_msg_id, member.telegram_photo_id)
+            for member in unit.members
+            if member.telegram_photo_id is not None
+        ]
+        if not photos:
+            return
+        queued = await self._store.enqueue_media(
+            unit_key=unit.unit_key,
+            chat_id=unit.chat_id,
+            photos=photos,
+        )
+        if queued:
+            logger.info(
+                "Queued %d photo(s) for %s to answer %s",
+                queued,
+                unit.unit_key,
+                ", ".join(sorted(answerable)),
+            )
 
     async def _active_requirements(self) -> tuple[int, dict[str, Any]]:
         """The active revision, seeding the owner's stated criteria on first use."""
@@ -132,7 +164,13 @@ class HousingWorker:
         return revision, DEFAULT_REQUIREMENTS
 
 
-def render_alert(unit: ContentUnit, facts: dict[str, Any], result: MatchResult) -> str:
+def render_alert(
+    unit: ContentUnit,
+    facts: dict[str, Any],
+    result: MatchResult,
+    *,
+    photos_read: int = 0,
+) -> str:
     """Format the alert the owner actually reads.
 
     Every criterion is named with its state, including the ones nobody could
@@ -148,6 +186,8 @@ def render_alert(unit: ContentUnit, facts: dict[str, Any], result: MatchResult) 
     }
     headline = "🏠 Совпадение" if result.verdict is Verdict.CONFIRMED else "🏠 Возможно подходит"
     lines = [f"<b>{headline}</b>"]
+    if photos_read:
+        lines.append(f"<i>Уточнено по {photos_read} фото</i>")
 
     price = facts.get("monthly_price_thb")
     if isinstance(price, int):
@@ -239,7 +279,13 @@ class HousingAlertDelivery:
         due = await self._store.claim_due_alerts(lease_owner=self._lease_owner)
         sent = 0
         for alert in due:
-            result = await self._dispatcher.deliver_html(str(alert["body_html"]))
+            photos = _photo_paths(alert.get("photo_paths_json"))
+            if photos:
+                # The photograph the claim was read from travels with the
+                # claim: it is the only check available on a visual answer.
+                result = await self._dispatcher.deliver_photo(str(alert["body_html"]), photos[0])
+            else:
+                result = await self._dispatcher.deliver_html(str(alert["body_html"]))
             alert_id = int(alert["id"])
             if result.sent:
                 await self._store.settle_alert(alert_id, delivered=True)
@@ -265,3 +311,125 @@ class HousingAlertDelivery:
                 retry_in_seconds=max(int(result.retry_after or 0), 2**attempts),
             )
         return sent
+
+
+class HousingVisionWorker:
+    """Reads downloaded photographs and upgrades a verdict when they answer it.
+
+    The second half of a two-timeline subsystem: the text was judged minutes
+    ago and the owner already has an alert saying what was unknown. This loop
+    closes those unknowns when the pictures can, and tells him again only when
+    the answer actually changed the verdict.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: HousingStore,
+        extractor: Any,
+        poll_seconds: float = 20.0,
+    ) -> None:
+        self._store = store
+        self._extractor = extractor
+        self._poll_seconds = poll_seconds
+
+    async def run_forever(self, shutdown: asyncio.Event) -> None:
+        """Read photographs until asked to stop."""
+        logger.info("Housing vision worker started")
+        while not shutdown.is_set():
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Housing vision cycle failed")
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=self._poll_seconds)
+            except TimeoutError:
+                continue
+        logger.info("Housing vision worker stopped")
+
+    async def run_once(self) -> int:
+        """Read every unit whose photographs are in. Returns how many were read."""
+        keys = await self._store.units_awaiting_vision()
+        for unit_key in keys:
+            try:
+                await self._read(unit_key)
+            except Exception:
+                logger.exception("Vision read failed for %s", unit_key)
+                facts = await self._store.get_facts(unit_key)
+                if facts is not None:
+                    facts["vision_status"] = "error"
+                    await self._store.record_facts(unit_key, facts)
+        return len(keys)
+
+    async def _read(self, unit_key: str) -> None:
+        """One unit: look at its photographs, re-judge, tell the owner if it changed."""
+        unit = await self._store.get_unit(unit_key)
+        facts = await self._store.get_facts(unit_key)
+        if unit is None or facts is None:
+            return
+        paths = await self._store.downloaded_media(unit_key)
+        if not paths:
+            facts["vision_status"] = "unavailable"
+            await self._store.record_facts(unit_key, facts)
+            return
+
+        previous = await self._store.latest_match(unit_key)
+        previous_verdict = str(previous["verdict"]) if previous else None
+
+        reading = await self._extractor.read(paths, listing_text=unit.assembled_text)
+        merged = reading.merged_into(facts)
+        await self._store.record_facts(unit_key, merged)
+
+        active = await self._store.active_requirements()
+        if active is None:
+            return
+        revision, requirements = active
+        result = match_requirements(merged, requirements)
+        await self._store.record_match(
+            unit_key=unit_key,
+            requirements_revision=revision,
+            verdict=result.verdict,
+            field_verdicts=result.as_dict(),
+        )
+
+        if result.verdict.value == previous_verdict:
+            # The photographs added detail but changed nothing the owner has
+            # to act on. Sending the same verdict twice trains him to ignore
+            # these messages, which is how a working filter becomes useless.
+            return
+
+        if result.verdict is Verdict.HARD_MISS:
+            body = "<b>🏠 Отбой по объявлению</b>\nПо фото видно, что не подходит:\n" + "\n".join(
+                f"❌ {_label(field.field)}: {html.escape(field.detail)}"
+                for field in result.fields
+                if field.state is FieldState.VIOLATED
+            )
+            verdict_for_alert = Verdict.POSSIBLE
+        else:
+            body = render_alert(unit, merged, result, photos_read=len(paths))
+            verdict_for_alert = result.verdict
+
+        await self._store.enqueue_alert(
+            unit_key=unit_key,
+            chat_id=unit.chat_id,
+            chat_title=None,
+            telegram_msg_id=unit.members[0].telegram_msg_id if unit.members else 0,
+            requirements_revision=revision,
+            verdict=verdict_for_alert,
+            kind=AlertKind.UPDATE,
+            body_html=body,
+            photo_paths=paths[:3] if result.verdict is not Verdict.HARD_MISS else None,
+        )
+
+
+def _photo_paths(raw: Any) -> list[str]:
+    """Read the stored photo list, tolerating a row that has none."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return []
+    return [str(path) for path in parsed] if isinstance(parsed, list) else []

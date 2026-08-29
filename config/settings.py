@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # delete, rebuilt by `python3 index_cli.py build`.
     search_db_path: Path = Path("data/eidolon_search.db")
     watchers_path: Path = Path("config/watchers.yml")
+    # Listing photographs, fetched only for advertisements already worth
+    # alerting on. Deleting this directory costs the vision answers derived
+    # from it and nothing else.
+    housing_media_path: Path = Path("data/media")
 
     # Embedding filter (Level 2)
     embedding_model: str = "text-embedding-3-small"

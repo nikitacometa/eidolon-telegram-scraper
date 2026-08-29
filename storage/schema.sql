@@ -308,3 +308,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_housing_alerts_dedup
     ON housing_alerts(unit_key, verdict, kind);
 CREATE INDEX IF NOT EXISTS idx_housing_alerts_due
     ON housing_alerts(delivery_status, next_attempt_at);
+
+-- Photographs worth fetching, and what became of the attempt.
+--
+-- This table lives beside the rest of housing rather than in the scout
+-- archive because it is part of one advertisement's life, and it deliberately
+-- outlives the 30-day sweep over `messages`: the file on disk and the vision
+-- answer derived from it stay useful long after the message row is gone.
+CREATE TABLE IF NOT EXISTS housing_media (
+    unit_key TEXT NOT NULL REFERENCES housing_live_units(unit_key) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    telegram_msg_id INTEGER NOT NULL,
+    telegram_photo_id INTEGER NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'live' CHECK(priority IN ('live', 'backfill')),
+    download_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(download_status IN ('pending', 'downloaded', 'failed_gone', 'failed')),
+    local_path TEXT,
+    byte_size INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    not_before TIMESTAMP,
+    last_error TEXT,
+    requested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    downloaded_at TIMESTAMP,
+    PRIMARY KEY (unit_key, telegram_msg_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_housing_media_pending
+    ON housing_media(download_status, priority, requested_at);
+-- Telegram's photo id is stable across reposts and chats, so the same
+-- photograph crossposted into three chats is fetched once. The index is
+-- partial because only a completed download has a file to reuse.
+CREATE INDEX IF NOT EXISTS idx_housing_media_photo
+    ON housing_media(telegram_photo_id) WHERE download_status = 'downloaded';
