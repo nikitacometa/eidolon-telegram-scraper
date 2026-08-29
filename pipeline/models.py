@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,6 +61,38 @@ class ObservationSource(StrEnum):
     CONFIG = "config"
     RECON = "recon"
     MANUAL = "manual"
+
+
+# Media pointers are read straight off a delivered Telethon message: no network
+# call, no download, just the identifiers needed to fetch the photograph later
+# if it turns out to matter.
+MEDIA_SCAN_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPointer:
+    """What a message carries besides text, and whether anyone has looked.
+
+    ``scan_version`` separates "scanned, no media" from "never scanned". The
+    two are the same zero in the database and mean opposite things: a housing
+    listing whose photographs were never looked for must not be reported as a
+    listing without photographs.
+    """
+
+    has_media: bool = False
+    telegram_photo_id: int | None = None
+    grouped_id: int | None = None
+    scan_version: int = MEDIA_SCAN_VERSION
+
+    @classmethod
+    def unscanned(cls) -> MediaPointer:
+        """A pointer from a caller that never inspected the message."""
+        return cls(has_media=False, telegram_photo_id=None, grouped_id=None, scan_version=0)
+
+    @property
+    def scanned(self) -> bool:
+        """Whether these fields were produced by code that looked at the message."""
+        return self.scan_version >= MEDIA_SCAN_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +220,11 @@ class StoredPipelineJob:
     sender_name: str
     text: str
     watcher_config_fingerprint: str
+    # Recovery has to be able to rebuild the same work item the live path
+    # built, including for a subsystem that groups messages into
+    # advertisements — otherwise a restart mid-album silently drops it.
+    telegram_msg_id: int = 0
+    media: MediaPointer = field(default_factory=MediaPointer.unscanned)
 
 
 @dataclass(slots=True)

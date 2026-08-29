@@ -13,6 +13,7 @@ from telethon.tl.types import (
     Chat,
 )
 
+from pipeline.models import MediaPointer
 from storage.db import Database
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,7 @@ async def ingest_message(
         date=msg.date.isoformat() if isinstance(msg.date, datetime) else str(msg.date),
         raw_json=raw_json,
         reply_to_message_id=reply_to_message_id(msg),
+        media=media_pointer(msg),
         watcher_names=watcher_names,
         watcher_fingerprints=watcher_fingerprints,
     )
@@ -109,6 +111,41 @@ async def ingest_message(
         )
 
     return row_id
+
+
+def media_pointer(message: object) -> MediaPointer:
+    """Read what a message carries without asking Telegram anything.
+
+    Everything here is already in the delivered object, so this costs no
+    request and no rate-limit budget. Downloading the file is a separate,
+    governed decision made much later, and only for messages that turned out
+    to be worth it.
+
+    A document is counted when Telegram labels it an image: Telegram clients
+    send a photograph as a document whenever the sender ticks "send without
+    compression", which is exactly what someone photographing an apartment
+    tends to do.
+    """
+    grouped = getattr(message, "grouped_id", None)
+    grouped_id = (
+        int(grouped) if isinstance(grouped, int) and not isinstance(grouped, bool) else None
+    )
+
+    photo = getattr(message, "photo", None)
+    photo_id = getattr(photo, "id", None) if photo is not None else None
+    if photo_id is None:
+        document = getattr(message, "document", None)
+        mime = str(getattr(document, "mime_type", "") or "") if document is not None else ""
+        if document is not None and mime.startswith("image/"):
+            photo_id = getattr(document, "id", None)
+            photo = document
+
+    has_media = photo is not None and photo_id is not None
+    return MediaPointer(
+        has_media=has_media,
+        telegram_photo_id=int(photo_id) if isinstance(photo_id, int) else None,
+        grouped_id=grouped_id,
+    )
 
 
 def reply_to_message_id(message: object) -> int | None:

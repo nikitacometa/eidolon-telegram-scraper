@@ -14,6 +14,7 @@ from pipeline.models import (
     AlertDeliveryStatus,
     AlertOutboxItem,
     DeliveryResult,
+    MediaPointer,
     ObservationMode,
     ObservationSource,
     ObservedChat,
@@ -117,7 +118,13 @@ async def test_ingress_retries_transient_sqlite_failure(
     }
     app.watcher_fingerprints = {watcher.name: effective_policy_fingerprint(watcher)}
     app.db = MagicMock()
-    event = SimpleNamespace(chat_id=-100123, text="Villa for rent")
+    event = SimpleNamespace(
+        chat_id=-100123,
+        text="Villa for rent",
+        # A real NewMessage always carries the message it delivered, and
+        # ingestion now reads its media pointers off it.
+        message=SimpleNamespace(id=7, grouped_id=None, photo=None, document=None),
+    )
     ingest = AsyncMock(side_effect=[aiosqlite.OperationalError("locked"), 42])
     sleep = AsyncMock()
     monkeypatch.setattr(main_module, "ingest_message", ingest)
@@ -194,6 +201,8 @@ async def test_pending_pipeline_job_is_replayed_from_stored_message() -> None:
         sender_name="Alice",
         text="Villa for rent",
         watcher_config_fingerprint=effective_policy_fingerprint(watcher),
+        telegram_msg_id=555,
+        media=MediaPointer(has_media=True, telegram_photo_id=4242, grouped_id=909),
     )
     app = Eidolon.__new__(Eidolon)
     app.watchers_by_name = {watcher.name: watcher}
@@ -205,11 +214,17 @@ async def test_pending_pipeline_job_is_replayed_from_stored_message() -> None:
 
     await app._recover_pending_pipeline_jobs()
 
-    app._process_watcher.assert_awaited_once_with(
-        watcher=watcher,
-        message_id=11,
-        text="Villa for rent",
-    )
+    app._process_watcher.assert_awaited_once()
+    call = app._process_watcher.await_args
+    assert call.kwargs["watcher"] == watcher
+    replayed = call.kwargs["work_item"]
+    assert replayed.message_id == 11
+    assert replayed.text == "Villa for rent"
+    # The rebuilt item carries the identity a message-grouping subsystem needs,
+    # so a restart mid-album resumes instead of losing the advertisement.
+    assert replayed.chat_id == -100123
+    assert replayed.telegram_msg_id == 555
+    assert replayed.media.grouped_id == 909
 
 
 async def test_recovery_rejects_job_from_changed_watcher_policy() -> None:

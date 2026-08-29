@@ -10,7 +10,7 @@ import logging
 import signal
 import sys
 from contextlib import AsyncExitStack, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -36,10 +36,17 @@ from pipeline.dispatcher import AlertDispatcher
 from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.governor import TelegramActionGovernor
-from pipeline.ingestion import NewMessageEvent, ingest_message, reply_to_message_id
+from pipeline.housing.worker import HousingAlertDelivery, HousingWorker
+from pipeline.ingestion import (
+    NewMessageEvent,
+    ingest_message,
+    media_pointer,
+    reply_to_message_id,
+)
 from pipeline.joiner import JoinWorker
 from pipeline.llm import LLMClassifier
 from pipeline.models import (
+    MediaPointer,
     ObservationMode,
     ObservedChat,
     PipelineOutcome,
@@ -51,6 +58,7 @@ from pipeline.recon import ReconRunner
 from pipeline.recon_models import ScoutMessage
 from pipeline.summarizer import DailySummarizer
 from storage.db import Database
+from storage.housing import HousingStore, unit_key_for
 from storage.scout import ScoutDatabase
 from storage.session_lock import SessionLock
 
@@ -60,6 +68,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("eidolon")
+
+
+# The one policy whose messages go to the housing subsystem rather than
+# through the relevance ladder. Named here so the dispatch check is a
+# comparison against a constant rather than a string spelled twice.
+HOUSING_WATCHER_NAME = "phangan-housing"
 
 
 class RuntimeConfigurationError(ValueError):
@@ -73,6 +87,12 @@ class PipelineWorkItem:
     message_id: int
     text: str | None
     watcher_names: tuple[str, ...]
+    # Identity and media pointers, carried for subsystems that work on
+    # advertisements rather than on messages. Populated always; every
+    # relevance-ladder watcher ignores them.
+    chat_id: int = 0
+    telegram_msg_id: int = 0
+    media: MediaPointer = field(default_factory=MediaPointer.unscanned)
 
 
 def _validate_runtime_configuration(watchers: list[Watcher]) -> None:
@@ -117,6 +137,10 @@ class Eidolon:
             sequential_updates=True,
         )
         self.dispatcher = AlertDispatcher()
+        # Built in start(), once the database connection it borrows exists.
+        self.housing: HousingStore | None = None
+        self._housing_task: asyncio.Task[None] | None = None
+        self._housing_delivery_task: asyncio.Task[None] | None = None
         self.governor = TelegramActionGovernor(scout=self.scout)
         self.crawler = TelegramCrawler(client=self.client, governor=self.governor)
         self.backfill = BackfillWorker(
@@ -198,6 +222,11 @@ class Eidolon:
                 stack.callback(session_lock.release)
                 await self.db.connect()
                 stack.push_async_callback(self.db.close)
+                # Housing shares the live connection rather than opening a
+                # second one: two connections to one SQLite file queue behind
+                # the same file lock anyway, and the daemon already serialises
+                # its writes through the lock this borrows.
+                self.housing = HousingStore(self.db.conn, self.db.write_lock)
                 await self.scout.connect()
                 stack.push_async_callback(self.scout.close)
                 await self.reconcile_agent_watchers(apply=False)
@@ -288,6 +317,23 @@ class Eidolon:
             )
             logger.info("Agent watcher sync enabled")
 
+        if self.housing is not None and any(
+            watcher.dispatch == "external" for watcher in self.watchers
+        ):
+            self._housing_task = asyncio.create_task(
+                HousingWorker(store=self.housing).run_forever(self._shutdown_event),
+                name="housing",
+            )
+            self._housing_delivery_task = asyncio.create_task(
+                HousingAlertDelivery(
+                    store=self.housing,
+                    dispatcher=self.dispatcher,
+                    lease_owner=f"housing-{id(self):x}",
+                ).run_forever(self._shutdown_event),
+                name="housing-delivery",
+            )
+            logger.info("Housing subsystem enabled")
+
         if settings.backfill_enabled:
             self._backfill_task = asyncio.create_task(
                 self.backfill.run_forever(self._shutdown_event),
@@ -313,6 +359,8 @@ class Eidolon:
             self._joiner_task,
             self._discovery_task,
             self._agent_watcher_task,
+            self._housing_task,
+            self._housing_delivery_task,
         ):
             if task is not None:
                 task.cancel()
@@ -622,6 +670,9 @@ class Eidolon:
             message_id=msg_id,
             text=event.text,
             watcher_names=tuple(watcher.name for watcher in watchers),
+            chat_id=chat_id,
+            telegram_msg_id=int(event.message.id),
+            media=media_pointer(event.message),
         )
 
     async def _process_work_item(self, work_item: PipelineWorkItem) -> None:
@@ -641,8 +692,7 @@ class Eidolon:
             try:
                 await self._process_watcher(
                     watcher=watcher,
-                    message_id=work_item.message_id,
-                    text=work_item.text,
+                    work_item=work_item,
                 )
             except Exception:
                 logger.exception(
@@ -655,17 +705,66 @@ class Eidolon:
         self,
         *,
         watcher: Watcher,
-        message_id: int,
-        text: str | None,
+        work_item: PipelineWorkItem,
     ) -> None:
-        """Run one watcher through the injected, independently testable processor."""
+        """Send one message to whichever judge this policy declares.
+
+        A policy with ``dispatch: external`` never touches the relevance
+        ladder. It is not a cheaper path through the same stages: the
+        subsystem behind it decides what a message even is, which for housing
+        means grouping several Telegram messages into one advertisement before
+        anything is judged at all.
+        """
+        if watcher.dispatch == "external":
+            await self._dispatch_external(watcher=watcher, work_item=work_item)
+            return
         outcome = await self.processor.process(
             watcher=watcher,
-            message_id=message_id,
-            text=text,
+            message_id=work_item.message_id,
+            text=work_item.text,
         )
         if outcome.alert_created:
             self._outbox_wakeup.set()
+
+    async def _dispatch_external(
+        self,
+        *,
+        watcher: Watcher,
+        work_item: PipelineWorkItem,
+    ) -> None:
+        """Hand a message to the subsystem registered under this policy's name."""
+        if watcher.name != HOUSING_WATCHER_NAME or self.housing is None:
+            logger.warning(
+                "Policy %s declares external dispatch with no subsystem behind it",
+                watcher.name,
+            )
+            return
+        await self.housing.record_message(
+            unit_key=unit_key_for(
+                work_item.chat_id,
+                grouped_id=work_item.media.grouped_id,
+                telegram_msg_id=work_item.telegram_msg_id,
+            ),
+            chat_id=work_item.chat_id,
+            grouped_id=work_item.media.grouped_id,
+            message_id=work_item.message_id,
+            telegram_msg_id=work_item.telegram_msg_id,
+            text=work_item.text,
+            has_media=work_item.media.has_media,
+            telegram_photo_id=work_item.media.telegram_photo_id,
+        )
+        # The durable job is finished the moment the message reaches the
+        # subsystem, because from here the advertisement's own state machine
+        # owns it. Leaving the job pending would make recovery replay it
+        # forever and, worse, would eventually refuse to make progress.
+        await self.db.record_pipeline_outcome(
+            PipelineOutcome(
+                message_id=work_item.message_id,
+                watcher_name=watcher.name,
+                processing_status=PipelineRunStatus.COMPLETED,
+                rule_passed=True,
+            )
+        )
 
     async def _recover_pending_pipeline_jobs(self) -> None:
         """Finish message/watcher jobs left pending by an interrupted process."""
@@ -706,8 +805,14 @@ class Eidolon:
                 try:
                     await self._process_watcher(
                         watcher=watcher,
-                        message_id=job.message_id,
-                        text=job.text,
+                        work_item=PipelineWorkItem(
+                            message_id=job.message_id,
+                            text=job.text,
+                            watcher_names=(job.watcher_name,),
+                            chat_id=job.chat_id,
+                            telegram_msg_id=job.telegram_msg_id,
+                            media=job.media,
+                        ),
                     )
                     recovered += 1
                 except Exception:

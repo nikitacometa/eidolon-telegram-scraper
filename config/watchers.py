@@ -70,6 +70,13 @@ class Watcher(BaseModel):
     rules: WatcherRules
     description: str = ""
     alert: Literal["immediate", "digest"] = "immediate"
+    # Where a matching message is sent for judgement. "pipeline" is the
+    # rule/embedding/LLM relevance ladder every policy has always used;
+    # "external" hands the message to a subsystem registered under the same
+    # name and skips the ladder entirely. Housing is external because its
+    # question is not "is this relevant" but "what does this advertisement
+    # say", answered over several messages and two arrival timelines.
+    dispatch: Literal["pipeline", "external"] = "pipeline"
     llm_level: int = Field(default=1, ge=1, le=3)
     target_intents: list[TargetIntent] = Field(
         default_factory=_default_target_intents,

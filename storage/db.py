@@ -19,6 +19,7 @@ from pipeline.models import (
     AlertDraft,
     AlertOutboxItem,
     DeliveryResult,
+    MediaPointer,
     ObservationMode,
     ObservationSource,
     ObservedChat,
@@ -140,6 +141,37 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0 CHECK(reply_backfill_checked IN (0, 1))"
             )
             logger.info("Migration: added messages.reply_backfill_checked")
+
+        # Media pointers, read for free off the delivered Telethon object.
+        #
+        # `media_scan_version` is the reason `has_media` can be trusted. A
+        # column added by ALTER TABLE reads 0 on every pre-existing row, which
+        # is indistinguishable from "we looked and there was no photo" -- and
+        # a housing filter that believes that would decide a listing has no
+        # photographs when in truth nobody ever looked. Version 0 means
+        # exactly that: not scanned. Only rows written by the current code
+        # carry version 1, and only those may be reasoned about.
+        media_migrations = {
+            "grouped_id": "ALTER TABLE messages ADD COLUMN grouped_id INTEGER",
+            "has_media": (
+                "ALTER TABLE messages ADD COLUMN has_media "
+                "INTEGER NOT NULL DEFAULT 0 CHECK(has_media IN (0, 1))"
+            ),
+            "telegram_photo_id": "ALTER TABLE messages ADD COLUMN telegram_photo_id INTEGER",
+            "media_scan_version": (
+                "ALTER TABLE messages ADD COLUMN media_scan_version INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        for column, statement in media_migrations.items():
+            if column not in message_columns:
+                await self.conn.execute(statement)
+                logger.info("Migration: added messages.%s", column)
+        # Unconditional: the column exists by now either way, and a fresh
+        # database needs the index just as much as a migrated one.
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_grouped "
+            "ON messages(chat_id, grouped_id) WHERE grouped_id IS NOT NULL"
+        )
 
         cursor = await self.conn.execute("PRAGMA table_info(alerts)")
         alert_columns = {row[1] for row in await cursor.fetchall()}
@@ -353,6 +385,16 @@ class Database:
             raise RuntimeError("Database not connected. Call connect() first.")
         return self._conn
 
+    @property
+    def write_lock(self) -> asyncio.Lock:
+        """The lock every writer on this connection must hold.
+
+        Exposed so a subsystem that shares this connection shares the lock
+        too. Two locks over one connection are no lock at all: SQLite would
+        see overlapping transactions from what it considers a single writer.
+        """
+        return self._write_lock
+
     async def store_message(
         self,
         *,
@@ -366,6 +408,7 @@ class Database:
         date: str,
         raw_json: str | None = None,
         reply_to_message_id: int | None = None,
+        media: MediaPointer | None = None,
         watcher_names: Sequence[str] = (),
         watcher_fingerprints: Mapping[str, str] | None = None,
     ) -> int | None:
@@ -375,6 +418,9 @@ class Database:
         pipeline execution. They can be reconstructed from SQLite on restart.
         Returns ``None`` when Telegram replays an existing message.
         """
+        # A caller that supplies no pointer has not looked at the message's
+        # media, which is a different fact from having looked and found none.
+        pointer = media if media is not None else MediaPointer.unscanned()
         async with self._write_lock:
             try:
                 cursor = await self.conn.execute(
@@ -382,9 +428,10 @@ class Database:
                     INSERT INTO messages (
                         telegram_msg_id, chat_id, chat_title, sender_id,
                         sender_name, text, date, raw_json, reply_to_message_id,
-                        reply_backfill_checked
+                        reply_backfill_checked,
+                        grouped_id, has_media, telegram_photo_id, media_scan_version
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     ON CONFLICT(chat_id, telegram_msg_id) DO NOTHING
                     RETURNING id
                     """,
@@ -398,6 +445,10 @@ class Database:
                         date,
                         raw_json,
                         reply_to_message_id,
+                        pointer.grouped_id,
+                        int(pointer.has_media),
+                        pointer.telegram_photo_id,
+                        pointer.scan_version,
                     ),
                 )
                 inserted = await cursor.fetchone()
@@ -1181,7 +1232,12 @@ class Database:
                     m.chat_id,
                     m.chat_title,
                     m.sender_name,
-                    m.text
+                    m.text,
+                    m.telegram_msg_id,
+                    m.grouped_id,
+                    m.has_media,
+                    m.telegram_photo_id,
+                    m.media_scan_version
                 FROM pipeline_runs AS p
                 JOIN messages AS m ON m.id = p.message_id
                 WHERE p.processing_status = 'pending'
@@ -1200,6 +1256,17 @@ class Database:
                 sender_name=str(row["sender_name"] or "Unknown"),
                 text=str(row["text"] or ""),
                 watcher_config_fingerprint=str(row["watcher_config_fingerprint"]),
+                telegram_msg_id=int(row["telegram_msg_id"]),
+                media=MediaPointer(
+                    has_media=bool(row["has_media"]),
+                    telegram_photo_id=(
+                        int(row["telegram_photo_id"])
+                        if row["telegram_photo_id"] is not None
+                        else None
+                    ),
+                    grouped_id=(int(row["grouped_id"]) if row["grouped_id"] is not None else None),
+                    scan_version=int(row["media_scan_version"]),
+                ),
             )
             for row in rows
         ]

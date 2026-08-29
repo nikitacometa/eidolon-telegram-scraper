@@ -119,6 +119,27 @@ class AlertDispatcher:
             )
         return result
 
+    async def deliver_html(self, message: str) -> DeliveryResult:
+        """Send an already-composed HTML message, keeping retry semantics.
+
+        The housing subsystem composes its own body — a listing alert is a
+        rendered set of criteria, not the generic watcher/sender/text form —
+        but the transport, escaping and retry classification are the same, so
+        they are shared rather than reimplemented.
+        """
+        if not self._session:
+            logger.error("Dispatcher not started. Call start() first.")
+            return DeliveryResult(
+                sent=False,
+                retryable=True,
+                error_code="dispatcher_not_started",
+                retry_after=1,
+            )
+        if not self._enabled:
+            logger.warning("No bot token configured, skipping alert")
+            return DeliveryResult(sent=False, retryable=False, error_code="dispatcher_disabled")
+        return await self._deliver_html(message)
+
     async def send_echo(
         self,
         *,
