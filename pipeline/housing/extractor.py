@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -62,7 +63,10 @@ Then the property itself:
 - tv_present / tv_size_class: whether a television is mentioned, and its size
   class if the text describes one ("большой телевизор" is large, "smart TV 55"
   is large, a bare "телевизор" is unclear). Never guess a size that is not
-  described.
+  described. If the advertisement says nothing about a television at all,
+  BOTH fields are null — not false, not "none". Silence is not a statement
+  that the property has no television, and "none" is reserved for an
+  advertisement that actually says so.
 - area_raw: the beach, village or area named, verbatim, if any.
 - evidence_quote: the verbatim fragment of the message that carries the offer.
 """
@@ -95,7 +99,7 @@ class HousingFacts:
         """
         return cls(error=error)
 
-    def as_row(self, *, unit_version: int) -> dict[str, Any]:
+    def as_row(self, *, unit_version: int, source_text: str | None = None) -> dict[str, Any]:
         """The shape HousingStore.record_facts stores.
 
         Sources are attached here, at the only place that knows how the value
@@ -103,6 +107,9 @@ class HousingFacts:
         these same columns later with source='vision', which the matcher reads
         as a lower bound rather than a total.
         """
+        tv_present, tv_size_class = televised(
+            source_text, present=self.tv_present, size_class=self.tv_size_class
+        )
         return {
             "unit_version": unit_version,
             "is_rental_offer": _as_int(self.is_rental_offer),
@@ -113,11 +120,9 @@ class HousingFacts:
             "bathrooms_source": "text" if self.bathrooms is not None else "unknown",
             "monthly_price_thb": self.monthly_price_thb,
             "price_source": "text" if self.monthly_price_thb is not None else "unknown",
-            "tv_present": _as_int(self.tv_present),
-            "tv_size_class": self.tv_size_class,
-            "tv_source": (
-                "text" if (self.tv_present is not None or self.tv_size_class) else "unknown"
-            ),
+            "tv_present": _as_int(tv_present),
+            "tv_size_class": tv_size_class,
+            "tv_source": "text" if (tv_present is not None or tv_size_class) else "unknown",
             "area_raw": self.area_raw,
             "evidence_quote": self.evidence_quote,
             "vision_status": "not_attempted",
@@ -127,6 +132,33 @@ class HousingFacts:
 
 def _as_int(value: bool | None) -> int | None:
     return None if value is None else int(value)
+
+
+# Any way this corpus refers to a television.
+TV_MENTION = re.compile(r"телевизор|телек|\bтв\b|\btv\b|smart\s*tv|плазм|проектор", re.IGNORECASE)
+
+
+def televised(
+    text: str | None, *, present: bool | None, size_class: str | None
+) -> tuple[bool | None, str | None]:
+    """Refuse a claim that a property has no television unless it says so.
+
+    Measured on 305 real Phangan listings: the model answered "no television"
+    for 194 of them, and 162 of those never mention a television in any form.
+    It was reading silence as absence. Left alone that is not a cosmetic
+    error — the matcher treats a stated absence as a violation, so those 162
+    advertisements would have been rejected outright and never reached the
+    owner, which is the exact failure this subsystem exists to avoid.
+
+    A claim of absence therefore has to be corroborated by the text actually
+    saying something about a television. Everything else passes through.
+    """
+    denies = present is False or size_class == "none"
+    if not denies:
+        return present, size_class
+    if text and TV_MENTION.search(text):
+        return present, size_class
+    return None, None
 
 
 RESPONSE_SCHEMA: dict[str, Any] = {

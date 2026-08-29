@@ -91,7 +91,7 @@ class HousingWorker:
 
         await self._store.set_unit_state(unit.unit_key, UnitState.EXTRACTING)
         facts = await self._extractor.extract(unit.assembled_text or "")
-        row = facts.as_row(unit_version=unit.unit_version)
+        row = facts.as_row(unit_version=unit.unit_version, source_text=unit.assembled_text)
         await self._store.record_facts(unit.unit_key, row)
         await self._store.set_unit_state(unit.unit_key, UnitState.EXTRACTED)
 

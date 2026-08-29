@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.settings import settings
-from pipeline.housing.extractor import EXTRACTOR_VERSION, SYSTEM_PROMPT
+from pipeline.housing.extractor import EXTRACTOR_VERSION, SYSTEM_PROMPT, televised
 from pipeline.housing.gate import could_be_housing
 
 logger = logging.getLogger(__name__)
@@ -284,6 +284,14 @@ class ListingExtractor:
             # listing is still findable, dropped from the price series.
             answer["price_note"] = f"{price} (out of plausible monthly range)"
             price = None
+        # The same corroboration the live path applies: a model that answers
+        # "no television" for an advertisement that never mentions one is
+        # reporting its own silence, not the property's.
+        tv_present, tv_size_class = televised(
+            str(row["text"] or ""),
+            present=_clean_raw_bool(answer.get("tv_present")),
+            size_class=answer.get("tv_size_class"),
+        )
         self._conn.execute(
             """
             INSERT INTO housing_listings (
@@ -315,8 +323,8 @@ class ListingExtractor:
                 _clean_int(answer.get("bathrooms")),
                 price,
                 answer.get("price_note"),
-                _clean_bool(answer.get("tv_present")),
-                answer.get("tv_size_class"),
+                _clean_bool(tv_present),
+                tv_size_class,
                 answer.get("area_raw"),
                 answer.get("evidence_quote"),
                 EXTRACTOR_VERSION,
@@ -343,6 +351,10 @@ def _clean_int(value: Any) -> int | None:
 
 def _clean_bool(value: Any) -> int | None:
     return None if not isinstance(value, bool) else int(value)
+
+
+def _clean_raw_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def price_trend(

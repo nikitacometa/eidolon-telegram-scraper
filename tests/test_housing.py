@@ -1268,3 +1268,63 @@ async def test_a_general_chat_message_that_is_only_chatter_never_reaches_the_mod
     unit = await store.get_unit(key)
     assert unit is not None
     assert unit.state is UnitState.DONE
+
+
+# ---------------------------------------------------------------------------
+# The television the model invented
+# ---------------------------------------------------------------------------
+
+
+def test_a_claimed_absent_television_is_ignored_when_the_text_never_mentions_one() -> None:
+    """Measured on 305 real listings: the model called 194 of them TV-less.
+
+    162 of those never mention a television in any form — it was reading its
+    own silence as the property's. Believing it would have rejected all 162
+    outright, since a stated absence is a violation.
+    """
+    facts = HousingFacts(
+        is_rental_offer=True,
+        is_vehicle_ad=False,
+        bedrooms=2,
+        tv_present=False,
+        tv_size_class="none",
+    )
+
+    row = facts.as_row(unit_version=1, source_text="Сдаю дом, 2 спальни, кондиционер, кухня")
+
+    assert row["tv_present"] is None
+    assert row["tv_size_class"] is None
+    assert row["tv_source"] == "unknown"
+    assert match_requirements(row, DEFAULT_REQUIREMENTS).verdict is Verdict.POSSIBLE
+
+
+def test_an_absent_television_the_text_actually_states_is_believed() -> None:
+    """A seller who writes that there is no TV is evidence, and does reject."""
+    facts = HousingFacts(
+        is_rental_offer=True,
+        is_vehicle_ad=False,
+        bedrooms=2,
+        bathrooms=2,
+        monthly_price_thb=30000,
+        tv_present=False,
+        tv_size_class="none",
+    )
+
+    row = facts.as_row(
+        unit_version=1,
+        source_text="Сдаю дом, 2 спальни, 2 санузла, 30000. Телевизора нет, только проектор",
+    )
+
+    assert row["tv_source"] == "text"
+    assert match_requirements(row, DEFAULT_REQUIREMENTS).verdict is Verdict.HARD_MISS
+
+
+def test_a_television_the_text_describes_survives_the_guard() -> None:
+    facts = HousingFacts(
+        is_rental_offer=True, is_vehicle_ad=False, tv_present=True, tv_size_class="large"
+    )
+
+    row = facts.as_row(unit_version=1, source_text="Большой телевизор, кондиционер")
+
+    assert row["tv_size_class"] == "large"
+    assert row["tv_source"] == "text"
