@@ -283,7 +283,11 @@ CREATE TABLE IF NOT EXISTS housing_requirements_active (
     -- Same counter trick as agent_watchers_meta: the daemon notices an edit
     -- with one scalar read per tick, and two edits in the same second are
     -- still two distinct generations.
-    generation INTEGER NOT NULL DEFAULT 0
+    generation INTEGER NOT NULL DEFAULT 0,
+    -- The generation whose archive re-match has been completed and digested.
+    -- Persisted so an edit made while the daemon was down is still noticed:
+    -- an in-memory marker would silently skip it on restart.
+    rematched_generation INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS housing_matches (

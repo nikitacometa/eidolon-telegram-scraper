@@ -686,6 +686,25 @@ class HousingStore:
             return None
         return int(row["revision"]), json.loads(str(row["definition_json"]))
 
+    async def pending_rematch_generation(self) -> int | None:
+        """Generation awaiting an archive re-match, or None when caught up."""
+        cursor = await self._conn.execute(
+            "SELECT generation, rematched_generation FROM housing_requirements_active WHERE id = 1"
+        )
+        row = await cursor.fetchone()
+        if row is None or int(row[0]) == int(row[1]):
+            return None
+        return int(row[0])
+
+    async def mark_rematched(self, generation: int) -> None:
+        """Record that the archive was re-judged up to this generation."""
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE housing_requirements_active SET rematched_generation = ? WHERE id = 1",
+                (generation,),
+            )
+            await self._conn.commit()
+
     async def requirements_generation(self) -> int:
         """One scalar read that tells the daemon whether the owner edited anything."""
         cursor = await self._conn.execute(

@@ -82,7 +82,66 @@ class HousingWorker:
                 await self._store.set_unit_state(
                     unit.unit_key, UnitState.ERROR, error=type(error).__name__
                 )
+        try:
+            await self._rematch_if_edited()
+        except Exception:
+            logger.exception("Requirements re-match failed")
         return len(units)
+
+    async def _rematch_if_edited(self) -> None:
+        """Re-judge the retained archive after the owner edits requirements.
+
+        Judging is a pure function over facts already paid for, so the sweep
+        is free of model calls. The marker generation is persisted: an edit
+        made while the daemon was down is still noticed on the next boot,
+        and a completed sweep is never repeated. Listings that a LOOSENED
+        requirement newly admits are reported once, as one digest message —
+        not as one alert each, which for a broad edit would be a hundred
+        messages teaching the owner to mute the bot.
+        """
+        generation = await self._store.pending_rematch_generation()
+        if generation is None:
+            return
+        revision, requirements = await self._active_requirements()
+        upgraded: list[tuple[ContentUnit, dict[str, Any], MatchResult]] = []
+        for unit_key in await self._store.units_for_rematch():
+            facts = await self._store.get_facts(unit_key)
+            unit = await self._store.get_unit(unit_key)
+            if facts is None or unit is None:
+                continue
+            previous = await self._store.latest_match(unit_key)
+            previously_rejected = previous is None or (
+                str(previous["verdict"]) == Verdict.HARD_MISS.value
+            )
+            result = match_requirements(facts, requirements)
+            await self._store.record_match(
+                unit_key=unit_key,
+                requirements_revision=revision,
+                verdict=result.verdict,
+                field_verdicts=result.as_dict(),
+            )
+            if result.verdict is not Verdict.HARD_MISS and previously_rejected:
+                upgraded.append((unit, facts, result))
+
+        if upgraded:
+            await self._store.enqueue_alert(
+                # A synthetic key scoped to the revision: re-running the same
+                # sweep after a crash deduplicates instead of re-sending.
+                unit_key=f"rematch:{revision}",
+                chat_id=0,
+                chat_title=None,
+                telegram_msg_id=0,
+                requirements_revision=revision,
+                verdict=Verdict.POSSIBLE,
+                kind=AlertKind.DIGEST,
+                body_html=render_rematch_digest(revision, upgraded),
+            )
+        await self._store.mark_rematched(generation)
+        logger.info(
+            "Re-matched archive at generation %d: %d newly admitted",
+            generation,
+            len(upgraded),
+        )
 
     async def _process(self, unit: ContentUnit) -> None:
         """One advertisement, from assembled text to a queued alert."""
@@ -249,6 +308,37 @@ def render_alert(
     link = _message_link(unit)
     if link:
         lines.append(f'\n<a href="{link}">Открыть в Telegram</a>')
+    return "\n".join(lines)
+
+
+def render_rematch_digest(
+    revision: int,
+    upgraded: list[tuple[ContentUnit, dict[str, Any], MatchResult]],
+    *,
+    shown: int = 10,
+) -> str:
+    """One message for everything a loosened requirement newly admits."""
+    lines = [
+        f"<b>🏠 Требования обновлены (ревизия {revision})</b>",
+        f"Теперь подходят ещё {len(upgraded)} объявлений из архива:",
+    ]
+    for unit, facts, result in upgraded[:shown]:
+        bits = []
+        price = facts.get("monthly_price_thb")
+        if isinstance(price, int):
+            bits.append(f"{price:,} THB".replace(",", " "))
+        bedrooms = facts.get("bedrooms")
+        if isinstance(bedrooms, int):
+            bits.append(f"{bedrooms}BR")
+        area = facts.get("area_raw")
+        if area:
+            bits.append(html.escape(str(area)))
+        bits.append(f"🎯{result.preference_score}%")
+        link = _message_link(unit)
+        head = " · ".join(bits)
+        lines.append(f'• <a href="{link}">{head}</a>' if link else f"• {head}")
+    if len(upgraded) > shown:
+        lines.append(f"…и ещё {len(upgraded) - shown}.")
     return "\n".join(lines)
 
 

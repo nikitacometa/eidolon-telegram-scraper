@@ -190,6 +190,24 @@ class Database:
                 await self.conn.execute("PRAGMA table_info(housing_live_facts)")
             ).fetchall()
         }
+        active_columns = {
+            row[1]
+            for row in await (
+                await self.conn.execute("PRAGMA table_info(housing_requirements_active)")
+            ).fetchall()
+        }
+        if active_columns and "rematched_generation" not in active_columns:
+            await self.conn.execute(
+                "ALTER TABLE housing_requirements_active ADD COLUMN"
+                " rematched_generation INTEGER NOT NULL DEFAULT 0"
+            )
+            # Seed it to the current generation: the past edits were already
+            # measured by hand, and replaying them on the first boot after
+            # this migration would digest two-day-old news.
+            await self.conn.execute(
+                "UPDATE housing_requirements_active SET rematched_generation = generation"
+            )
+            logger.info("Migration: added housing_requirements_active.rematched_generation")
         fact_migrations = {
             "property_type": (
                 "ALTER TABLE housing_live_facts ADD COLUMN property_type TEXT"

@@ -1725,3 +1725,56 @@ def test_a_room_offered_inside_a_house_still_rejects() -> None:
     # A house described by its room count is not a room offer; the guard
     # refuses the fabrication-prone reading.
     assert house_of_rooms is None
+
+
+async def test_a_loosened_requirement_digests_the_newly_admitted(
+    store: HousingStore,
+) -> None:
+    """An edit re-judges the archive without model calls and reports the
+    newly admitted listings once, as one message — not one alert each."""
+    key = await _queue_unit(store, "Сдаётся квартира в кондо, 2 спальни, 30000 бат")
+    worker = HousingWorker(
+        store=store,
+        extractor=FakeExtractor(
+            HousingFacts(
+                is_rental_offer=True,
+                is_vehicle_ad=False,
+                bedrooms=2,
+                monthly_price_thb=30000,
+                property_type="apartment",
+            )
+        ),
+    )
+    await worker.run_once()
+    match = await store.latest_match(key)
+    assert match is not None
+    assert match["verdict"] == Verdict.HARD_MISS.value
+    assert await store.claim_due_alerts(lease_owner="drain") == []
+
+    # The owner decides an apartment is fine after all.
+    revision, _ = (await store.active_requirements()) or (0, {})
+    await store.save_requirements(
+        definition={
+            "bedrooms": {"operator": "at_least", "value": 2},
+            "monthly_rent_thb": {"min": 20000, "max": 40000},
+        },
+        created_by="test",
+        expected_revision=revision,
+    )
+
+    await worker.run_once()
+
+    alerts = await store.claim_due_alerts(lease_owner="test")
+    assert len(alerts) == 1
+    assert alerts[0]["kind"] == AlertKind.DIGEST.value
+    body = str(alerts[0]["body_html"])
+    assert "Теперь подходят ещё 1" in body
+    assert "30 000 THB" in body
+
+    # The sweep is complete and never repeats itself: the generation is
+    # marked, not merely deduplicated away — an unmarked sweep would re-read
+    # the whole archive on every one-second poll forever.
+    assert await store.pending_rematch_generation() is None
+    await store.settle_alert(int(alerts[0]["id"]), delivered=True)
+    await worker.run_once()
+    assert await store.claim_due_alerts(lease_owner="again") == []
