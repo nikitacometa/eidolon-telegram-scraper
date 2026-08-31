@@ -756,8 +756,7 @@ class HousingStore:
                         ),
                     )
                 await self._conn.execute(
-                    "UPDATE housing_requirements_active SET rematched_generation = ?"
-                    " WHERE id = 1",
+                    "UPDATE housing_requirements_active SET rematched_generation = ? WHERE id = 1",
                     (generation,),
                 )
                 await self._conn.commit()

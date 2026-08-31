@@ -1828,3 +1828,36 @@ async def test_an_interrupted_rematch_sweep_loses_nothing(
     alerts = await store.claim_due_alerts(lease_owner="test")
     assert [a["kind"] for a in alerts] == [AlertKind.DIGEST.value]
     assert await store.pending_rematch_generation() is None
+
+
+async def test_old_settled_housing_units_age_out_with_the_retention_window(
+    db: Database, store: HousingStore
+) -> None:
+    """Without housing purge the archive grows forever and every
+    requirements edit re-judges an ever-larger sweep."""
+    old_key = await _queue_unit(store, "Сдаю дом 2 спальни 30000 бат")
+    await store.claim_settled_units()
+    await store.set_unit_state(old_key, UnitState.DONE)
+    async with store._write_lock:
+        await store._conn.execute(
+            "UPDATE housing_live_units SET created_at = datetime('now', '-40 days')"
+            " WHERE unit_key = ?",
+            (old_key,),
+        )
+        await store._conn.commit()
+    fresh_key = unit_key_for(-1001199262612, grouped_id=None, telegram_msg_id=999)
+    await store.record_message(
+        unit_key=fresh_key,
+        chat_id=-1001199262612,
+        grouped_id=None,
+        message_id=2,
+        telegram_msg_id=999,
+        text="Сдаю виллу 35000",
+        has_media=False,
+        telegram_photo_id=None,
+    )
+
+    await db.purge_expired_data(30)
+
+    assert await store.get_unit(old_key) is None
+    assert await store.get_unit(fresh_key) is not None

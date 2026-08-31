@@ -1548,10 +1548,35 @@ class Database:
                 """,
                 (cutoff,),
             )
+            # Housing units age out on the same window. Without this the
+            # advertisement archive grows forever and every requirements
+            # edit re-judges an ever-larger sweep. Terminal states only;
+            # the FK cascades take the members, facts, matches and media
+            # rows along. Alerts have no FK (the rematch digest uses a
+            # synthetic key), so the settled ones are aged out explicitly —
+            # pending ones stay whatever their age.
+            await self.conn.execute(
+                """
+                DELETE FROM housing_live_units
+                WHERE state IN ('done', 'error')
+                  AND datetime(created_at) < datetime('now', ?)
+                """,
+                (cutoff,),
+            )
+            await self.conn.execute(
+                """
+                DELETE FROM housing_alerts
+                WHERE delivery_status IN ('delivered', 'failed')
+                  AND datetime(created_at) < datetime('now', ?)
+                """,
+                (cutoff,),
+            )
             cursor = await self.conn.execute("SELECT COUNT(*) FROM retention_candidates")
             row = await cursor.fetchone()
             candidate_count = int(row[0]) if row is not None else 0
             if candidate_count == 0:
+                # The housing deletions above still commit: they do not ride
+                # on whether any message content aged out this pass.
                 await self.conn.commit()
                 return 0
 
