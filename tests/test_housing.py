@@ -1786,7 +1786,7 @@ async def test_an_interrupted_rematch_sweep_loses_nothing(
     """A death mid-sweep must repeat the whole sweep: verdicts committed
     without their digest would read as 'nothing changed' on the retry and
     the newly admitted listing would never be reported."""
-    key = await _queue_unit(store, "Сдаётся квартира в кондо, 2 спальни, 30000 бат")
+    await _queue_unit(store, "Сдаётся квартира в кондо, 2 спальни, 30000 бат")
     worker = HousingWorker(
         store=store,
         extractor=FakeExtractor(
