@@ -265,15 +265,34 @@ class EidolonTools:
         *,
         bedrooms: int | None = None,
         days: int | None = None,
-        limit: int = 20,
+        limit: int | None = 20,
     ) -> dict[str, Any]:
         from pipeline.housing.rating import rate_listings
 
+        # The ranking must judge by what the owner asks for NOW, not by the
+        # shipped defaults: his active revision lives in the live database.
+        requirements = None
+        with sqlite3.connect(f"file:{self._live_db}?mode=ro", uri=True, timeout=15.0) as conn:
+            row = conn.execute(
+                """
+                SELECT r.definition_json
+                FROM housing_requirements_active a
+                JOIN housing_requirements_revisions r ON r.revision = a.active_revision
+                WHERE a.id = 1
+                """
+            ).fetchone()
+            if row is not None:
+                try:
+                    requirements = json.loads(row[0])
+                except json.JSONDecodeError:
+                    requirements = None
+
         report = rate_listings(
             self._search.conn,
+            requirements=requirements,
             bedrooms=bedrooms,
             days=days,
-            limit=max(1, min(limit, MAX_LIMIT)),
+            limit=max(1, min(limit or 20, MAX_LIMIT)),
         )
         report["note"] = (
             "Ranked over the deduplicated two-year archive. value_discount_pct is the "
@@ -1132,7 +1151,7 @@ WRITE_TOOLS = [
                     "type": ["integer", "null"],
                     "description": "Only listings posted within the last N days.",
                 },
-                "limit": {"type": "integer", "default": 20},
+                "limit": {"type": ["integer", "null"], "default": 20},
             },
         },
     ),

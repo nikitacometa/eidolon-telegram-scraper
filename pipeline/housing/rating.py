@@ -222,10 +222,16 @@ def rate_listings(
         where.append("bedrooms = ?")
         params.append(bedrooms)
     if days is not None:
+        # A negative window would become a future cutoff and silently return
+        # nothing at all.
         where.append("posted_at >= datetime('now', ?)")
-        params.append(f"-{int(days)} days")
+        params.append(f"-{max(0, int(days))} days")
     rows = conn.execute(
         f"""
+        -- The bare MAX() is load-bearing: with exactly one min/max
+        -- aggregate, SQLite documents that the non-aggregated columns come
+        -- from the row that produced the maximum, so each crosspost group
+        -- yields its NEWEST copy (probed, not assumed).
         SELECT *, MAX(posted_at) AS latest_posted_at
         FROM housing_listings
         WHERE {" AND ".join(where)}

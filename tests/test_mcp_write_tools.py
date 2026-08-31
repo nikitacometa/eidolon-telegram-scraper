@@ -214,6 +214,7 @@ class TestToolExposure:
             "queue_chat_join",
             "resume_chat",
             "backfill_chat",
+            "get_housing_deals",
             "get_housing_requirements",
             "preview_housing_requirements",
             "update_housing_requirements",
@@ -596,9 +597,48 @@ def test_the_requirements_tools_are_owner_only() -> None:
     write_names = {tool.name for tool in WRITE_TOOLS}
 
     for name in (
+        "get_housing_deals",
         "get_housing_requirements",
         "preview_housing_requirements",
         "update_housing_requirements",
     ):
         assert name in write_names
         assert name not in read_names
+
+
+async def test_deals_are_judged_by_the_active_revision_not_the_defaults(
+    tools: EidolonTools,
+) -> None:
+    """The owner's live revision decides what a deal is; falling back to the
+    shipped defaults would silently ignore his edits."""
+    with sqlite3.connect(tools._search_db) as conn:
+        for corpus_id, price, ptype in [(1, 8000, "apartment")] + [
+            (100 + i, 30000, "apartment") for i in range(10)
+        ]:
+            conn.execute(
+                "INSERT INTO corpus_messages (corpus_id, source, chat_id,"
+                " telegram_msg_id, text, date, content_hash)"
+                " VALUES (?, 'scout', -100777, ?, 'x', '2026-02-05', ?)",
+                (corpus_id, corpus_id, f"h{corpus_id}"),
+            )
+            conn.execute(
+                "INSERT INTO housing_listings (corpus_id, chat_id, content_hash,"
+                " posted_at, is_rental_offer, is_vehicle_ad, bedrooms,"
+                " monthly_price_thb, property_type, extractor_version)"
+                " VALUES (?, -100777, ?, '2026-02-05', 1, 0, 2, ?, ?, 'housing-text-v2')",
+                (corpus_id, f"h{corpus_id}", price, ptype),
+            )
+        conn.commit()
+
+    # Under the defaults (property_type: house) every apartment is excluded.
+    default_report = await tools.get_housing_deals()
+    assert default_report["listings"] == []
+
+    # The owner's active revision asks only for 2 bedrooms.
+    await tools.update_housing_requirements(
+        definition={"bedrooms": {"operator": "at_least", "value": 2}},
+        created_by="test",
+    )
+    revised_report = await tools.get_housing_deals()
+
+    assert any(item["corpus_id"] == 1 for item in revised_report["listings"])

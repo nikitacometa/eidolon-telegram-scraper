@@ -147,3 +147,31 @@ def test_deals_sort_by_discount_then_quality(conn: sqlite3.Connection) -> None:
 
     ids = [item["corpus_id"] for item in report["listings"][:2]]
     assert ids == [2, 1]
+
+
+def test_dedup_keeps_the_newest_copy_of_a_crosspost(conn: sqlite3.Connection) -> None:
+    """The representative of a hash group must be its newest copy — the
+    bare-MAX() SQLite guarantee this query leans on, pinned here."""
+    _seed_bucket(conn, start_id=100, prices=[30000] * 10)
+    _listing(conn, 1, price=20000, content_hash="same", date="2026-01-01", chat_id=-1)
+    _listing(conn, 2, price=20000, content_hash="same", date="2026-02-20", chat_id=-2)
+
+    report = rate_listings(conn)
+
+    kept = [item for item in report["listings"] if item["monthly_price_thb"] == 20000]
+    assert len(kept) == 1
+    assert kept[0]["corpus_id"] == 2
+    assert kept[0]["posted_at"] == "2026-02-20"
+
+
+def test_custom_requirements_change_the_ranking(conn: sqlite3.Connection) -> None:
+    """The ranking judges by the owner's ACTIVE revision, not the defaults."""
+    _seed_bucket(conn, start_id=100, prices=[30000] * 10)
+    _listing(conn, 1, price=8000, property_type="apartment")
+
+    lenient = rate_listings(
+        conn,
+        requirements={"bedrooms": {"operator": "at_least", "value": 2}},
+    )
+
+    assert any(item["corpus_id"] == 1 for item in lenient["listings"])
