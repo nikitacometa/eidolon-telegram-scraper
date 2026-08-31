@@ -696,6 +696,75 @@ class HousingStore:
             return None
         return int(row[0])
 
+    async def record_rematch(
+        self,
+        *,
+        revision: int,
+        generation: int,
+        matches: list[tuple[str, Verdict, dict[str, Any]]],
+        alert: dict[str, Any] | None,
+    ) -> None:
+        """Commit one whole re-match sweep atomically.
+
+        The verdicts, the digest they justify, and the generation marker land
+        together or not at all. Committed separately, a death between them
+        loses listings for good: a unit whose new verdict is recorded but
+        whose digest never went out reads as "nothing changed" on the retry,
+        and a marked generation is never swept again.
+        """
+        async with self._write_lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for unit_key, verdict, field_verdicts in matches:
+                    await self._conn.execute(
+                        """
+                        INSERT INTO housing_matches (
+                            unit_key, requirements_revision, verdict, field_verdicts_json
+                        )
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(unit_key, requirements_revision) DO UPDATE SET
+                            verdict = excluded.verdict,
+                            field_verdicts_json = excluded.field_verdicts_json,
+                            computed_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            unit_key,
+                            revision,
+                            verdict.value,
+                            json.dumps(field_verdicts, ensure_ascii=False),
+                        ),
+                    )
+                if alert is not None:
+                    await self._conn.execute(
+                        """
+                        INSERT INTO housing_alerts (
+                            unit_key, chat_id, chat_title, telegram_msg_id,
+                            requirements_revision, verdict, kind, body_html
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(unit_key, verdict, kind) DO NOTHING
+                        """,
+                        (
+                            alert["unit_key"],
+                            alert["chat_id"],
+                            alert.get("chat_title"),
+                            alert["telegram_msg_id"],
+                            revision,
+                            Verdict(alert["verdict"]).value,
+                            AlertKind(alert["kind"]).value,
+                            alert["body_html"],
+                        ),
+                    )
+                await self._conn.execute(
+                    "UPDATE housing_requirements_active SET rematched_generation = ?"
+                    " WHERE id = 1",
+                    (generation,),
+                )
+                await self._conn.commit()
+            except BaseException:
+                await self._conn.rollback()
+                raise
+
     async def mark_rematched(self, generation: int) -> None:
         """Record that the archive was re-judged up to this generation."""
         async with self._write_lock:
@@ -762,7 +831,7 @@ class HousingStore:
                 raise
         return revision
 
-    async def units_for_rematch(self, *, limit: int = 500) -> list[str]:
+    async def units_for_rematch(self, *, limit: int | None = None) -> list[str]:
         """Units whose stored facts can be judged again after an edit.
 
         Everything extracted is eligible, with no time window. A requirement
@@ -777,7 +846,10 @@ class HousingStore:
             ORDER BY extracted_at DESC
             LIMIT ?
             """,
-            (limit,),
+            # The retained archive is bounded by the 30-day purge, so an
+            # uncapped read is a few hundred rows; a cap here would let
+            # mark_rematched declare units it never revisited done forever.
+            (-1 if limit is None else limit,),
         )
         return [str(row[0]) for row in await cursor.fetchall()]
 

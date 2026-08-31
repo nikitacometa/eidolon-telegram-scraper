@@ -104,6 +104,7 @@ class HousingWorker:
             return
         revision, requirements = await self._active_requirements()
         upgraded: list[tuple[ContentUnit, dict[str, Any], MatchResult]] = []
+        matches: list[tuple[str, Verdict, dict[str, Any]]] = []
         for unit_key in await self._store.units_for_rematch():
             facts = await self._store.get_facts(unit_key)
             unit = await self._store.get_unit(unit_key)
@@ -114,29 +115,32 @@ class HousingWorker:
                 str(previous["verdict"]) == Verdict.HARD_MISS.value
             )
             result = match_requirements(facts, requirements)
-            await self._store.record_match(
-                unit_key=unit_key,
-                requirements_revision=revision,
-                verdict=result.verdict,
-                field_verdicts=result.as_dict(),
-            )
+            matches.append((unit_key, result.verdict, result.as_dict()))
             if result.verdict is not Verdict.HARD_MISS and previously_rejected:
                 upgraded.append((unit, facts, result))
 
+        alert = None
         if upgraded:
-            await self._store.enqueue_alert(
+            alert = {
                 # A synthetic key scoped to the revision: re-running the same
                 # sweep after a crash deduplicates instead of re-sending.
-                unit_key=f"rematch:{revision}",
-                chat_id=0,
-                chat_title=None,
-                telegram_msg_id=0,
-                requirements_revision=revision,
-                verdict=Verdict.POSSIBLE,
-                kind=AlertKind.DIGEST,
-                body_html=render_rematch_digest(revision, upgraded),
-            )
-        await self._store.mark_rematched(generation)
+                "unit_key": f"rematch:{revision}",
+                "chat_id": 0,
+                "chat_title": None,
+                "telegram_msg_id": 0,
+                "verdict": Verdict.POSSIBLE,
+                "kind": AlertKind.DIGEST,
+                "body_html": render_rematch_digest(revision, upgraded),
+            }
+        # One transaction: the verdicts, the digest, and the generation
+        # marker land together, so a crash mid-sweep repeats the whole sweep
+        # against the still-previous verdicts instead of losing listings.
+        await self._store.record_rematch(
+            revision=revision,
+            generation=generation,
+            matches=matches,
+            alert=alert,
+        )
         logger.info(
             "Re-matched archive at generation %d: %d newly admitted",
             generation,

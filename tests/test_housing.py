@@ -1778,3 +1778,53 @@ async def test_a_loosened_requirement_digests_the_newly_admitted(
     await store.settle_alert(int(alerts[0]["id"]), delivered=True)
     await worker.run_once()
     assert await store.claim_due_alerts(lease_owner="again") == []
+
+
+async def test_an_interrupted_rematch_sweep_loses_nothing(
+    store: HousingStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A death mid-sweep must repeat the whole sweep: verdicts committed
+    without their digest would read as 'nothing changed' on the retry and
+    the newly admitted listing would never be reported."""
+    key = await _queue_unit(store, "Сдаётся квартира в кондо, 2 спальни, 30000 бат")
+    worker = HousingWorker(
+        store=store,
+        extractor=FakeExtractor(
+            HousingFacts(
+                is_rental_offer=True,
+                is_vehicle_ad=False,
+                bedrooms=2,
+                monthly_price_thb=30000,
+                property_type="apartment",
+            )
+        ),
+    )
+    await worker.run_once()
+    revision, _ = (await store.active_requirements()) or (0, {})
+    await store.save_requirements(
+        definition={"bedrooms": {"operator": "at_least", "value": 2}},
+        created_by="test",
+        expected_revision=revision,
+    )
+
+    class Killed(BaseException):
+        pass
+
+    real_execute = store._conn.execute
+
+    async def sabotaged(sql: str, *args: object, **kwargs: object) -> object:
+        if "INSERT INTO housing_alerts" in sql:
+            raise Killed
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(store._conn, "execute", sabotaged)
+    with pytest.raises(Killed):
+        await worker.run_once()
+    monkeypatch.setattr(store._conn, "execute", real_execute)
+
+    # Nothing landed: the sweep is still pending and the retry reports it.
+    assert await store.pending_rematch_generation() is not None
+    await worker.run_once()
+    alerts = await store.claim_due_alerts(lease_owner="test")
+    assert [a["kind"] for a in alerts] == [AlertKind.DIGEST.value]
+    assert await store.pending_rematch_generation() is None
