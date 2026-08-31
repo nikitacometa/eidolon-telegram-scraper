@@ -198,29 +198,40 @@ def televised(
     return None, None
 
 
-# Any way this corpus refers to a dwelling that is NOT a standalone house.
-# Word boundaries matter: Python's \b is Unicode-aware, so the stems hold
-# for Russian too.
+# Any way this corpus refers to a dwelling that is NOT a standalone house,
+# and the house vocabulary itself. Word boundaries matter: Python's \b is
+# Unicode-aware, so the stems hold for Russian too. The bounded \w{0,3}
+# tails keep case endings (дома, доме) while excluding words that merely
+# start the same way (домашний).
 NON_HOUSE_MENTION = re.compile(
     r"\bквартир|\bкондо|\bcondo|\bапарт|\bapartment|\bстуди|\bstudio"
     r"|\bкомнат|\broom\b|\bотел|\bhotel|\bресорт|\bresort|\bгестхаус|\bguest\s*house",
     re.IGNORECASE,
 )
+HOUSE_MENTION = re.compile(
+    r"\bдом\w{0,3}\b|\bвилл|\bvilla|\bбунгало|\bbungalow|\bтаунхаус|\btownhouse"
+    r"|\bhouse\b|\bбичхаус|\bbeach\s*house",
+    re.IGNORECASE,
+)
 
 
 def property_typed(text: str | None, *, claimed: str | None) -> str | None:
-    """Refuse a REJECTING property type the text does not corroborate.
+    """Refuse a REJECTING property type the text does not clearly carry.
 
     Mirror of televised(): the one field where a fabricated answer costs a
     listing. This model measurably reads silence as absence (162 of 194
     "no TV" claims had no textual basis), and a property_type of
     apartment/room/hotel is a hard violation under a house requirement — so
-    a rejecting claim must be backed by the text actually containing that
-    vocabulary. "house" and null pass through: neither can reject anything.
+    a rejecting claim must be backed by the text containing that vocabulary
+    AND not the house vocabulary. Both at once ("дом рядом с кондо", an
+    agency post listing several properties) is exactly the mixed case the
+    model is most likely to mis-key on — measured at 34.9% of this corpus —
+    and there the honest answer is unknown, which can reject nothing.
+    "house" and null pass through: neither can reject anything.
     """
     if claimed not in {"apartment", "room", "hotel"}:
         return claimed
-    if text and NON_HOUSE_MENTION.search(text):
+    if text and NON_HOUSE_MENTION.search(text) and not HOUSE_MENTION.search(text):
         return claimed
     return None
 

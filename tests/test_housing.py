@@ -1696,3 +1696,16 @@ def test_preference_weights_shape_the_score() -> None:
 
     # Only the TV (weight 30 of 100) is confirmed.
     assert result.preference_score == 30
+
+
+def test_a_mixed_vocabulary_listing_cannot_be_rejected_on_its_type() -> None:
+    """34.9% of the corpus mentions both vocabularies in one message — the
+    exact case the model mis-keys on. There the only honest answer is
+    unknown, which can reject nothing."""
+    from pipeline.housing.extractor import property_typed
+
+    mixed = property_typed("Сдаю дом рядом с кондо-комплексом, 2 спальни", claimed="apartment")
+    clean = property_typed("Сдаётся студия в кондо", claimed="apartment")
+
+    assert mixed is None
+    assert clean == "apartment"
