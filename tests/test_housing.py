@@ -61,9 +61,26 @@ def _text_facts(**overrides: object) -> dict[str, object]:
         "tv_present": 1,
         "tv_size_class": "large",
         "tv_source": "text",
+        "property_type": "house",
+        "property_type_source": "text",
+        "terrace": 1,
+        "terrace_source": "text",
+        "private_setting": 1,
+        "nature_setting": 1,
     }
     facts.update(overrides)
     return facts
+
+
+# The pre-preferences shape: bathrooms hard, tv at the top level. Kept as a
+# named fixture because deployed revisions of exactly this shape exist and
+# must keep working.
+LEGACY_REQUIREMENTS: dict[str, object] = {
+    "bedrooms": {"operator": "at_least", "value": 2},
+    "bathrooms": {"operator": "at_least", "value": 2},
+    "tv": {"minimum_class": "large"},
+    "monthly_rent_thb": {"min": 20000, "max": 40000},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +279,7 @@ def test_everything_known_and_satisfied_is_confirmed() -> None:
 
     assert result.verdict is Verdict.CONFIRMED
     assert result.unknown_fields == ()
+    assert result.preference_score == 100
 
 
 def test_an_unstated_bathroom_count_is_possible_not_a_rejection() -> None:
@@ -273,7 +291,7 @@ def test_an_unstated_bathroom_count_is_possible_not_a_rejection() -> None:
     """
     facts = _text_facts(bathrooms=None, bathrooms_source="unknown")
 
-    result = match_requirements(facts, DEFAULT_REQUIREMENTS)
+    result = match_requirements(facts, LEGACY_REQUIREMENTS)
 
     assert result.verdict is Verdict.POSSIBLE
     assert "bathrooms" in result.unknown_fields
@@ -282,8 +300,8 @@ def test_an_unstated_bathroom_count_is_possible_not_a_rejection() -> None:
 def test_a_listing_with_no_photos_and_no_details_still_reaches_the_owner() -> None:
     """ "Фото скину в личку" is a normal listing, not a non-match."""
     facts = _text_facts(
-        bathrooms=None,
-        bathrooms_source="unknown",
+        property_type=None,
+        property_type_source="unknown",
         tv_present=None,
         tv_size_class=None,
         tv_source="unknown",
@@ -292,7 +310,8 @@ def test_a_listing_with_no_photos_and_no_details_still_reaches_the_owner() -> No
     result = match_requirements(facts, DEFAULT_REQUIREMENTS)
 
     assert result.verdict is Verdict.POSSIBLE
-    assert set(result.unknown_fields) == {"bathrooms", "tv"}
+    assert set(result.unknown_fields) == {"property_type"}
+    assert "tv" in result.unknown_preferences
 
 
 def test_a_stated_bedroom_count_below_the_requirement_is_a_hard_miss() -> None:
@@ -312,7 +331,7 @@ def test_a_photograph_showing_fewer_bathrooms_is_a_lower_bound() -> None:
     """
     facts = _text_facts(bathrooms=1, bathrooms_source="vision")
 
-    result = match_requirements(facts, DEFAULT_REQUIREMENTS)
+    result = match_requirements(facts, LEGACY_REQUIREMENTS)
 
     assert result.verdict is Verdict.POSSIBLE
     assert "bathrooms" in result.unknown_fields
@@ -337,38 +356,79 @@ def test_a_missing_price_is_unknown_not_out_of_budget() -> None:
     assert result.verdict is Verdict.POSSIBLE
 
 
-def test_a_television_nobody_mentioned_is_unknown() -> None:
+def test_a_television_nobody_mentioned_is_an_unknown_preference() -> None:
+    """The TV moved to the soft tier: silence neither rejects nor scores."""
     facts = _text_facts(tv_present=None, tv_size_class=None, tv_source="unknown")
 
     result = match_requirements(facts, DEFAULT_REQUIREMENTS)
 
-    assert result.verdict is Verdict.POSSIBLE
-    assert "tv" in result.unknown_fields
+    assert result.verdict is Verdict.CONFIRMED
+    assert "tv" in result.unknown_preferences
+    assert result.preference_score == 70  # terrace 25 + privacy 25 + nature 20
 
 
-def test_a_television_reported_absent_is_a_violation() -> None:
-    """Someone saying there is no TV is evidence, unlike a photo that missed it."""
+def test_a_television_reported_absent_costs_score_not_the_listing() -> None:
+    """Under the old rules a stated "no TV" rejected outright; the owner's
+    television is a wish, not a dealbreaker — it now only loses its points."""
     facts = _text_facts(tv_present=0, tv_size_class="none", tv_source="text")
 
     result = match_requirements(facts, DEFAULT_REQUIREMENTS)
 
-    assert result.verdict is Verdict.HARD_MISS
+    assert result.verdict is Verdict.CONFIRMED
+    tv = [p for p in result.preferences if p.field == "tv"]
+    assert [p.state for p in tv] == [FieldState.VIOLATED]
+    assert result.preference_score == 70
 
 
-def test_a_television_of_unclear_size_is_unknown() -> None:
-    facts = _text_facts(tv_present=1, tv_size_class="unclear", tv_source="vision")
-
-    result = match_requirements(facts, DEFAULT_REQUIREMENTS)
-
-    assert result.verdict is Verdict.POSSIBLE
-
-
-def test_a_small_television_misses_a_large_requirement() -> None:
+def test_a_small_television_scores_nothing_against_a_large_wish() -> None:
     facts = _text_facts(tv_size_class="small", tv_source="text")
 
     result = match_requirements(facts, DEFAULT_REQUIREMENTS)
 
+    assert result.verdict is Verdict.CONFIRMED
+    assert result.preference_score == 70
+
+
+def test_a_stated_apartment_rejects_under_a_house_requirement() -> None:
+    facts = _text_facts(property_type="apartment")
+
+    result = match_requirements(facts, DEFAULT_REQUIREMENTS)
+
     assert result.verdict is Verdict.HARD_MISS
+    verdicts = {f.field: f.state for f in result.fields}
+    assert verdicts["property_type"] is FieldState.VIOLATED
+
+
+def test_a_photograph_can_confirm_a_house_but_never_reject_one() -> None:
+    """A frame of a building says nothing about which unit is offered."""
+    confirmed = match_requirements(
+        _text_facts(property_type="house", property_type_source="vision"),
+        DEFAULT_REQUIREMENTS,
+    )
+    mismatched = match_requirements(
+        _text_facts(property_type="apartment", property_type_source="vision"),
+        DEFAULT_REQUIREMENTS,
+    )
+
+    assert {f.field: f.state for f in confirmed.fields}["property_type"] is (FieldState.SATISFIED)
+    assert {f.field: f.state for f in mismatched.fields}["property_type"] is (FieldState.UNKNOWN)
+
+
+def test_an_old_revision_still_matches_with_its_tv_read_as_a_preference() -> None:
+    """Deployed revisions carry tv at the top level; they must keep working,
+    with the television judged as a wish rather than a dealbreaker."""
+    facts = _text_facts(tv_present=0, tv_size_class="none", tv_source="text")
+    legacy = {
+        "bedrooms": {"operator": "at_least", "value": 2},
+        "tv": {"minimum_class": "large"},
+        "monthly_rent_thb": {"min": 20000, "max": 40000},
+    }
+
+    result = match_requirements(facts, legacy)
+
+    assert result.verdict is Verdict.CONFIRMED
+    assert [p.field for p in result.preferences] == ["tv"]
+    assert result.preference_score == 0
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +453,37 @@ def test_an_inverted_budget_is_refused() -> None:
 
 def test_an_unknown_tv_class_is_refused() -> None:
     with pytest.raises(RequirementsError, match="minimum_class"):
-        validate_requirements({"tv": {"minimum_class": "enormous"}})
+        validate_requirements(
+            {
+                "bedrooms": {"operator": "at_least", "value": 2},
+                "preferences": {"tv": {"minimum_class": "enormous"}},
+            }
+        )
+
+
+def test_a_legacy_revision_validates_into_the_new_shape() -> None:
+    """The deployed revision 2 predates preferences and must stay usable."""
+    cleaned = validate_requirements(
+        {
+            "bedrooms": {"operator": "at_least", "value": 2},
+            "tv": {"minimum_class": "large"},
+            "monthly_rent_thb": {"min": 20000, "max": 40000},
+        }
+    )
+
+    assert "tv" not in cleaned
+    assert cleaned["preferences"]["tv"] == {"minimum_class": "large", "weight": 30}
+
+
+def test_a_preferences_only_document_is_refused() -> None:
+    """With no hard tier every listing is confirmed; that is not a filter."""
+    with pytest.raises(RequirementsError, match="hard criterion"):
+        validate_requirements({"preferences": {"terrace": {"weight": 50}}})
+
+
+def test_an_unknown_property_type_is_refused() -> None:
+    with pytest.raises(RequirementsError, match="property_type"):
+        validate_requirements({"property_type": {"require": "yurt"}})
 
 
 async def test_saving_requirements_appends_a_revision_and_bumps_the_generation(
@@ -481,6 +571,7 @@ async def test_a_matching_listing_produces_one_alert(store: HousingStore) -> Non
                 monthly_price_thb=30000,
                 tv_present=True,
                 tv_size_class="large",
+                property_type="house",
                 evidence_quote="Сдаю дом 2 спальни",
             )
         ),
@@ -565,10 +656,14 @@ async def test_a_listing_missing_two_criteria_is_alerted_as_possible(
 
     alerts = await store.claim_due_alerts(lease_owner="test")
     assert len(alerts) == 1
+    # "дом" in the text is extracted as the property type by the real
+    # extractor; the fake here reports nothing, so the type stays unknown
+    # and the verdict is possible rather than confirmed.
     assert alerts[0]["verdict"] == Verdict.POSSIBLE.value
     body = str(alerts[0]["body_html"])
-    assert "Ванные" in body
-    assert "Телевизор" in body
+    assert "Тип жилья" in body
+    assert "Телевизор" in body.lower() or "телевизор" in body.lower()
+    assert "Хотелки" in body
 
 
 async def test_the_same_verdict_is_never_queued_twice(store: HousingStore) -> None:
@@ -719,8 +814,8 @@ async def test_the_alert_names_every_criterion_including_the_unknown_ones(
     key = await _queue_unit(store, "Сдаю дом 2 спальни 25000 бат")
     unit = (await store.claim_settled_units())[0]
     facts = _text_facts(
-        bathrooms=None,
-        bathrooms_source="unknown",
+        property_type=None,
+        property_type_source="unknown",
         tv_present=None,
         tv_size_class=None,
         tv_source="unknown",
@@ -735,8 +830,10 @@ async def test_the_alert_names_every_criterion_including_the_unknown_ones(
     assert key.startswith("m:")
     assert "Возможно подходит" in body
     assert "✅ Спальни" in body
-    assert "❔ Ванные" in body
-    assert "❔ Телевизор" in body
+    assert "❔ Тип жилья" in body
+    assert "Хотелки 70%" in body
+    assert "❔ телевизор" in body
+    assert "✅ терраса" in body
     assert "25 000 THB/мес" in body
     assert "Шритану" in body
     assert "https://t.me/c/1199262612/100" in body
@@ -795,6 +892,8 @@ async def test_photos_are_requested_only_when_they_could_answer_something(
                 monthly_price_thb=30000,
                 tv_present=True,
                 tv_size_class="large",
+                property_type="house",
+                terrace=True,
             )
         ),
     )
@@ -913,7 +1012,7 @@ def test_a_stated_bathroom_count_is_never_overwritten_by_a_photograph() -> None:
 
     assert merged["bathrooms"] == 1
     assert merged["bathrooms_source"] == "text"
-    assert match_requirements(merged, DEFAULT_REQUIREMENTS).verdict is Verdict.HARD_MISS
+    assert match_requirements(merged, LEGACY_REQUIREMENTS).verdict is Verdict.HARD_MISS
 
 
 def test_a_low_confidence_reading_changes_nothing() -> None:
@@ -943,7 +1042,8 @@ def test_a_television_the_photographs_missed_stays_unknown() -> None:
     merged = reading.merged_into(facts)
 
     assert merged["tv_source"] == "unknown"
-    assert match_requirements(merged, DEFAULT_REQUIREMENTS).verdict is Verdict.POSSIBLE
+    result = match_requirements(merged, DEFAULT_REQUIREMENTS)
+    assert "tv" in result.unknown_preferences
 
 
 def test_a_failed_vision_read_leaves_every_unknown_untouched() -> None:
@@ -1015,6 +1115,7 @@ async def test_photographs_that_complete_the_picture_upgrade_the_verdict(
             bathrooms_visible_min=2,
             tv_size_class="large",
             tv_present=True,
+            property_type_visible="house",
             confidence=0.9,
         )
     )
@@ -1025,6 +1126,8 @@ async def test_photographs_that_complete_the_picture_upgrade_the_verdict(
     assert facts is not None
     assert facts["bathrooms"] == 2
     assert facts["bathrooms_source"] == "vision"
+    assert facts["property_type"] == "house"
+    assert facts["property_type_source"] == "vision"
     alerts = await store.claim_due_alerts(lease_owner="test")
     assert len(alerts) == 1
     assert alerts[0]["kind"] == AlertKind.UPDATE.value
@@ -1299,7 +1402,10 @@ def test_a_claimed_absent_television_is_ignored_when_the_text_never_mentions_one
 
 
 def test_an_absent_television_the_text_actually_states_is_believed() -> None:
-    """A seller who writes that there is no TV is evidence, and does reject."""
+    """A seller who writes that there is no TV is evidence: the claim
+    survives the fabrication guard and marks the preference violated —
+    under EVERY requirements shape, legacy top-level tv included, since a
+    television is a wish now and never rejects."""
     facts = HousingFacts(
         is_rental_offer=True,
         is_vehicle_ad=False,
@@ -1316,7 +1422,11 @@ def test_an_absent_television_the_text_actually_states_is_believed() -> None:
     )
 
     assert row["tv_source"] == "text"
-    assert match_requirements(row, DEFAULT_REQUIREMENTS).verdict is Verdict.HARD_MISS
+    for requirements in (LEGACY_REQUIREMENTS, DEFAULT_REQUIREMENTS):
+        result = match_requirements(row, requirements)
+        assert result.verdict is not Verdict.HARD_MISS
+        tv_states = [p.state for p in result.preferences if p.field == "tv"]
+        assert tv_states == [FieldState.VIOLATED]
 
 
 def test_a_television_the_text_describes_survives_the_guard() -> None:
@@ -1413,6 +1523,7 @@ async def test_vision_status_stays_pending_until_the_alert_is_queued(
             bathrooms_visible_min=2,
             tv_size_class="large",
             tv_present=True,
+            property_type_visible="house",
             confidence=0.9,
         )
     )
@@ -1525,6 +1636,7 @@ async def test_a_vision_verdict_and_its_alert_land_together(
             bathrooms_visible_min=2,
             tv_size_class="large",
             tv_present=True,
+            property_type_visible="house",
             confidence=0.9,
         )
     )
@@ -1538,3 +1650,49 @@ async def test_a_vision_verdict_and_its_alert_land_together(
     assert match is not None
     assert match["verdict"] == Verdict.POSSIBLE.value
     assert key in await store.units_awaiting_vision()
+
+
+def test_a_fabricated_apartment_claim_is_refused_by_the_guard() -> None:
+    """The model's measured failure mode, ported to the one new field that
+    can reject: a property type of apartment/room/hotel must be backed by
+    the text actually containing that vocabulary."""
+    from pipeline.housing.extractor import property_typed
+
+    fabricated = property_typed("Сдаю жильё 2 спальни 30000 бат", claimed="apartment")
+    corroborated = property_typed("Сдаётся квартира в кондо, 2 спальни", claimed="apartment")
+    house = property_typed("Сдаю жильё у моря", claimed="house")
+
+    assert fabricated is None
+    assert corroborated == "apartment"
+    # "house" cannot reject anything, so it passes without corroboration.
+    assert house == "house"
+
+
+def test_the_guard_reaches_the_stored_row() -> None:
+    """as_row is where the guard must fire — a guard nobody calls is prose."""
+    facts = HousingFacts(
+        is_rental_offer=True,
+        is_vehicle_ad=False,
+        bedrooms=2,
+        property_type="apartment",
+    )
+
+    row = facts.as_row(unit_version=1, source_text="Сдаю жильё 2 спальни 30000 бат")
+
+    assert row["property_type"] is None
+    assert row["property_type_source"] == "unknown"
+
+
+def test_preference_weights_shape_the_score() -> None:
+    """The score is the weighted share of CONFIRMED preferences."""
+    facts = _text_facts(
+        terrace=None,
+        terrace_source="unknown",
+        private_setting=None,
+        nature_setting=None,
+    )
+
+    result = match_requirements(facts, DEFAULT_REQUIREMENTS)
+
+    # Only the TV (weight 30 of 100) is confirmed.
+    assert result.preference_score == 30

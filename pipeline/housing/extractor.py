@@ -24,7 +24,7 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-EXTRACTOR_VERSION = "housing-text-v1"
+EXTRACTOR_VERSION = "housing-text-v2"
 
 SYSTEM_PROMPT = """\
 You read classified advertisements from Telegram chats on Koh Phangan, Thailand,
@@ -67,6 +67,29 @@ Then the property itself:
   BOTH fields are null — not false, not "none". Silence is not a statement
   that the property has no television, and "none" is reserved for an
   advertisement that actually says so.
+- property_type: what kind of dwelling is OFFERED, judged only from explicit
+  words. "house" for a standalone building of its own: дом, вилла, villa,
+  бунгало, bungalow, таунхаус, beach house. "apartment" for a unit inside a
+  shared building: квартира, кондо, condo, апартаменты, apartment, студия,
+  studio. "room" for a room in someone else's space: комната, room in a
+  shared house. "hotel" for nightly-style stays: отель, hotel, resort room,
+  гестхаус room. Many messages mention both vocabularies ("дом рядом с
+  кондо", an agency listing several properties) — classify the unit being
+  offered, and when that is genuinely ambiguous answer null. Null, not a
+  guess, is also the answer when no type word appears at all.
+- terrace: true when a terrace, balcony or veranda is mentioned (терраса,
+  балкон, веранда). Null otherwise — never false: nobody advertises the
+  absence of a terrace, so silence is not a statement.
+- private_setting: true when the text claims seclusion or no neighbours —
+  "без соседей", "уединённый", "отдельный дом на участке", "private". A mere
+  MENTION of neighbours is not a claim of privacy. Null otherwise, never
+  false.
+- nature_setting: true when the text places the property in greenery —
+  сад, джунгли, garden, jungle, «в зелени», tropical surroundings, у леса.
+  Null otherwise, never false.
+- amenities: for each of pool, aircon, kitchen, wifi, sea_view, parking,
+  hot_water, washing_machine: true when the text mentions it, null when it
+  does not. Never false.
 - area_raw: the beach, village or area named, verbatim, if any.
 - evidence_quote: the verbatim fragment of the message that carries the offer.
 """
@@ -84,6 +107,11 @@ class HousingFacts:
     price_note: str | None = None
     tv_present: bool | None = None
     tv_size_class: str | None = None
+    property_type: str | None = None
+    terrace: bool | None = None
+    private_setting: bool | None = None
+    nature_setting: bool | None = None
+    amenities: dict[str, bool | None] | None = None
     area_raw: str | None = None
     evidence_quote: str | None = None
     error: str | None = None
@@ -110,6 +138,8 @@ class HousingFacts:
         tv_present, tv_size_class = televised(
             source_text, present=self.tv_present, size_class=self.tv_size_class
         )
+        property_type = property_typed(source_text, claimed=self.property_type)
+        amenities = {name: True for name, value in (self.amenities or {}).items() if value is True}
         return {
             "unit_version": unit_version,
             "is_rental_offer": _as_int(self.is_rental_offer),
@@ -123,6 +153,13 @@ class HousingFacts:
             "tv_present": _as_int(tv_present),
             "tv_size_class": tv_size_class,
             "tv_source": "text" if (tv_present is not None or tv_size_class) else "unknown",
+            "property_type": property_type,
+            "property_type_source": "text" if property_type is not None else "unknown",
+            "terrace": _as_int(self.terrace) if self.terrace else None,
+            "terrace_source": "text" if self.terrace else "unknown",
+            "private_setting": _as_int(self.private_setting) if self.private_setting else None,
+            "nature_setting": _as_int(self.nature_setting) if self.nature_setting else None,
+            "amenities_json": json.dumps(amenities, ensure_ascii=False) if amenities else None,
             "area_raw": self.area_raw,
             "evidence_quote": self.evidence_quote,
             "vision_status": "not_attempted",
@@ -161,6 +198,33 @@ def televised(
     return None, None
 
 
+# Any way this corpus refers to a dwelling that is NOT a standalone house.
+# Word boundaries matter: Python's \b is Unicode-aware, so the stems hold
+# for Russian too.
+NON_HOUSE_MENTION = re.compile(
+    r"\bквартир|\bкондо|\bcondo|\bапарт|\bapartment|\bстуди|\bstudio"
+    r"|\bкомнат|\broom\b|\bотел|\bhotel|\bресорт|\bresort|\bгестхаус|\bguest\s*house",
+    re.IGNORECASE,
+)
+
+
+def property_typed(text: str | None, *, claimed: str | None) -> str | None:
+    """Refuse a REJECTING property type the text does not corroborate.
+
+    Mirror of televised(): the one field where a fabricated answer costs a
+    listing. This model measurably reads silence as absence (162 of 194
+    "no TV" claims had no textual basis), and a property_type of
+    apartment/room/hotel is a hard violation under a house requirement — so
+    a rejecting claim must be backed by the text actually containing that
+    vocabulary. "house" and null pass through: neither can reject anything.
+    """
+    if claimed not in {"apartment", "room", "hotel"}:
+        return claimed
+    if text and NON_HOUSE_MENTION.search(text):
+        return claimed
+    return None
+
+
 RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -175,6 +239,40 @@ RESPONSE_SCHEMA: dict[str, Any] = {
             "type": ["string", "null"],
             "enum": ["none", "small", "medium", "large", "unclear", None],
         },
+        "property_type": {
+            "type": ["string", "null"],
+            "enum": ["house", "apartment", "room", "hotel", None],
+        },
+        "terrace": {"type": ["boolean", "null"]},
+        "private_setting": {"type": ["boolean", "null"]},
+        "nature_setting": {"type": ["boolean", "null"]},
+        "amenities": {
+            "type": "object",
+            "properties": {
+                name: {"type": ["boolean", "null"]}
+                for name in (
+                    "pool",
+                    "aircon",
+                    "kitchen",
+                    "wifi",
+                    "sea_view",
+                    "parking",
+                    "hot_water",
+                    "washing_machine",
+                )
+            },
+            "required": [
+                "pool",
+                "aircon",
+                "kitchen",
+                "wifi",
+                "sea_view",
+                "parking",
+                "hot_water",
+                "washing_machine",
+            ],
+            "additionalProperties": False,
+        },
         "area_raw": {"type": ["string", "null"]},
         "evidence_quote": {"type": ["string", "null"]},
     },
@@ -187,6 +285,11 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "price_note",
         "tv_present",
         "tv_size_class",
+        "property_type",
+        "terrace",
+        "private_setting",
+        "nature_setting",
+        "amenities",
         "area_raw",
         "evidence_quote",
     ],
@@ -250,6 +353,20 @@ def _facts_from_payload(payload: dict[str, Any]) -> HousingFacts:
     size_class = filtered.get("tv_size_class")
     if size_class not in {None, "none", "small", "medium", "large", "unclear"}:
         filtered["tv_size_class"] = "unclear"
+    if filtered.get("property_type") not in {None, "house", "apartment", "room", "hotel"}:
+        filtered["property_type"] = None
+    for flag in ("terrace", "private_setting", "nature_setting"):
+        if not isinstance(filtered.get(flag), bool | type(None)):
+            filtered[flag] = None
+    amenities = filtered.get("amenities")
+    if isinstance(amenities, dict):
+        filtered["amenities"] = {
+            str(name): value
+            for name, value in amenities.items()
+            if isinstance(value, bool | type(None))
+        }
+    else:
+        filtered["amenities"] = None
     for count in ("bedrooms", "bathrooms", "monthly_price_thb"):
         value = filtered.get(count)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

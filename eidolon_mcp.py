@@ -1090,8 +1090,10 @@ WRITE_TOOLS = [
     Tool(
         name="get_housing_requirements",
         description=(
-            "What the Phangan housing filter is currently looking for: bedrooms, "
-            "bathrooms, television size and the monthly rent window, plus the revision "
+            "What the Phangan housing filter is currently looking for. Hard criteria "
+            "(bedrooms, monthly rent window, property type — a confirmed violation "
+            "rejects the listing) plus soft preferences (television, terrace, privacy, "
+            "nature setting — weighted into a score, never rejecting), and the revision "
             "number needed to change them safely."
         ),
         inputSchema={"type": "object", "properties": {}},
@@ -1110,10 +1112,17 @@ WRITE_TOOLS = [
                     "type": "object",
                     "description": (
                         'Full requirements document, e.g. {"bedrooms": {"operator": '
-                        '"at_least", "value": 2}, "bathrooms": {"operator": '
-                        '"at_least", "value": 2}, "tv": {"minimum_class": '
-                        '"large"}, "monthly_rent_thb": {"min": 20000, "max": '
-                        "40000}}. Supported keys: bedrooms, bathrooms, tv, monthly_rent_thb."
+                        '"at_least", "value": 2}, "monthly_rent_thb": {"min": 20000, '
+                        '"max": 40000}, "property_type": {"require": "house"}, '
+                        '"preferences": {"tv": {"minimum_class": "large", "weight": 30}, '
+                        '"terrace": {"weight": 25}, "private_setting": {"weight": 25}, '
+                        '"nature_setting": {"weight": 20}}}. Hard keys (a confirmed '
+                        "violation rejects): bedrooms, bathrooms, monthly_rent_thb, "
+                        'property_type (require one of "house", "apartment", "room", '
+                        '"hotel"). Soft keys under "preferences" (never reject, feed a '
+                        "weighted 0-100 score): tv, terrace, private_setting, "
+                        "nature_setting. A top-level tv from an old revision is read as "
+                        "a preference automatically."
                     ),
                 }
             },

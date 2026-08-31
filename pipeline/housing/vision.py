@@ -30,7 +30,7 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-VISION_VERSION = "housing-vision-v1"
+VISION_VERSION = "housing-vision-v2"
 # More frames than this add tokens without adding rooms: an album of a house
 # repeats angles long before it runs out of bathrooms.
 MAX_IMAGES = 6
@@ -53,6 +53,13 @@ Rules that matter more than completeness:
   null — never false.
 - tv_size_class: "large" only when the scale against furniture or a wall makes
   that credible. Otherwise "unclear". Never estimate inches.
+- property_type_visible: "house" ONLY when the frames clearly show a
+  standalone single-family building offered as a whole — its own walls, its
+  own entrance, no shared corridor. Anything else — an apartment interior,
+  a corridor, a high-rise, or simple uncertainty — is null. Photographs can
+  confirm a house; they can never prove the offer is NOT one.
+- terrace_visible: true only when a terrace, balcony or veranda belonging to
+  the dwelling is clearly visible. Null otherwise — never false.
 - photos_show_this_listing: false when the images are logos, screenshots,
   price cards, maps or memes rather than a property.
 - confidence: your own honest reading of how much these frames support the
@@ -73,6 +80,11 @@ RESPONSE_SCHEMA: dict[str, Any] = {
             "enum": ["none", "small", "medium", "large", "unclear", None],
         },
         "tv_evidence": {"type": ["string", "null"]},
+        "property_type_visible": {
+            "type": ["string", "null"],
+            "enum": ["house", None],
+        },
+        "terrace_visible": {"type": ["boolean", "null"]},
         "photos_show_this_listing": {"type": "boolean"},
         "confidence": {"type": "number"},
     },
@@ -82,6 +94,8 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "tv_present",
         "tv_size_class",
         "tv_evidence",
+        "property_type_visible",
+        "terrace_visible",
         "photos_show_this_listing",
         "confidence",
     ],
@@ -103,6 +117,8 @@ class VisionReading:
     tv_present: bool | None = None
     tv_size_class: str | None = None
     tv_evidence: str | None = None
+    property_type_visible: str | None = None
+    terrace_visible: bool | None = None
     photos_show_this_listing: bool = True
     confidence: float = 0.0
     error: str | None = None
@@ -155,6 +171,16 @@ class VisionReading:
             # nothing about the rooms outside it. The text extractor's
             # measured fabrication of absences (162 of 194 "no TV" claims had
             # no textual basis) is the same failure mode this refuses.
+
+        # The same one-sidedness for the house question and the terrace:
+        # frames can confirm either, and can never establish an absence, so
+        # only the confirming values ever merge.
+        if facts.get("property_type_source") != "text" and self.property_type_visible == "house":
+            merged["property_type"] = "house"
+            merged["property_type_source"] = "vision"
+        if facts.get("terrace_source") != "text" and self.terrace_visible is True:
+            merged["terrace"] = 1
+            merged["terrace_source"] = "vision"
         return merged
 
 

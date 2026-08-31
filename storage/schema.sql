@@ -246,6 +246,18 @@ CREATE TABLE IF NOT EXISTS housing_live_facts (
     tv_present INTEGER,
     tv_size_class TEXT CHECK(tv_size_class IN ('none', 'small', 'medium', 'large', 'unclear')),
     tv_source TEXT CHECK(tv_source IN ('text', 'vision', 'unknown')),
+    property_type TEXT CHECK(property_type IN ('house', 'apartment', 'room', 'hotel')),
+    property_type_source TEXT CHECK(property_type_source IN ('text', 'vision', 'unknown')),
+    -- Preference claims are one-sided: a listing either claims the thing or
+    -- says nothing, so these are 1 or NULL, never 0 — nobody advertises the
+    -- absence of a terrace, and a fabricated absence is the failure mode the
+    -- extractor is guarded against.
+    terrace INTEGER,
+    terrace_source TEXT CHECK(terrace_source IN ('text', 'vision', 'unknown')),
+    private_setting INTEGER,
+    nature_setting INTEGER,
+    -- {"pool": true, ...}: only confirmed amenities are stored.
+    amenities_json TEXT,
     area_raw TEXT,
     evidence_quote TEXT,
     vision_status TEXT NOT NULL DEFAULT 'not_attempted'

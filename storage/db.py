@@ -184,6 +184,36 @@ class Database:
                 " sweep_attempts INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("Migration: added housing_live_units.sweep_attempts")
+        fact_columns = {
+            row[1]
+            for row in await (
+                await self.conn.execute("PRAGMA table_info(housing_live_facts)")
+            ).fetchall()
+        }
+        fact_migrations = {
+            "property_type": (
+                "ALTER TABLE housing_live_facts ADD COLUMN property_type TEXT"
+                " CHECK(property_type IN ('house', 'apartment', 'room', 'hotel'))"
+            ),
+            "property_type_source": (
+                "ALTER TABLE housing_live_facts ADD COLUMN property_type_source TEXT"
+                " CHECK(property_type_source IN ('text', 'vision', 'unknown'))"
+            ),
+            "terrace": "ALTER TABLE housing_live_facts ADD COLUMN terrace INTEGER",
+            "terrace_source": (
+                "ALTER TABLE housing_live_facts ADD COLUMN terrace_source TEXT"
+                " CHECK(terrace_source IN ('text', 'vision', 'unknown'))"
+            ),
+            "private_setting": (
+                "ALTER TABLE housing_live_facts ADD COLUMN private_setting INTEGER"
+            ),
+            "nature_setting": ("ALTER TABLE housing_live_facts ADD COLUMN nature_setting INTEGER"),
+            "amenities_json": "ALTER TABLE housing_live_facts ADD COLUMN amenities_json TEXT",
+        }
+        for column, statement in fact_migrations.items():
+            if fact_columns and column not in fact_columns:
+                await self.conn.execute(statement)
+                logger.info("Migration: added housing_live_facts.%s", column)
 
         cursor = await self.conn.execute("PRAGMA table_info(alerts)")
         alert_columns = {row[1] for row in await cursor.fetchall()}

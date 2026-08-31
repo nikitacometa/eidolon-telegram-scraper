@@ -137,8 +137,16 @@ class HousingWorker:
         await self._store.set_unit_state(unit.unit_key, UnitState.DONE)
 
     async def _request_photographs(self, unit: ContentUnit, result: MatchResult) -> None:
-        """Queue this unit's photographs when they could answer an open question."""
-        answerable = {"bathrooms", "tv"} & set(result.unknown_fields)
+        """Queue this unit's photographs when they could answer an open question.
+
+        Photographs can answer a hard question (a standalone house is
+        recognisable, bathrooms can be counted as a lower bound) and two of
+        the preferences (a television, a terrace). Anything else in the
+        pictures is not worth the download budget.
+        """
+        answerable = ({"bathrooms", "property_type"} & set(result.unknown_fields)) | (
+            {"tv", "terrace"} & set(result.unknown_preferences)
+        )
         if not answerable:
             return
         photos = [
@@ -223,6 +231,13 @@ def render_alert(
     for field in result.fields:
         lines.append(f"{icons[field.state]} {_label(field.field)}: {html.escape(field.detail)}")
 
+    if result.preferences:
+        marks = []
+        for pref in result.preferences:
+            mark = icons[pref.state]
+            marks.append(f"{mark} {_label(pref.field).lower()}")
+        lines.append(f"🎯 Хотелки {result.preference_score}%: " + ", ".join(marks))
+
     area = facts.get("area_raw")
     if area:
         lines.append(f"📍 {html.escape(str(area))}")
@@ -243,6 +258,10 @@ def _label(field: str) -> str:
         "bathrooms": "Ванные",
         "tv": "Телевизор",
         "monthly_rent_thb": "Цена",
+        "property_type": "Тип жилья",
+        "terrace": "Терраса",
+        "private_setting": "Приватность",
+        "nature_setting": "Природа",
     }.get(field, field)
 
 
