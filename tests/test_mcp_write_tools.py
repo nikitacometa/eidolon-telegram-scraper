@@ -214,7 +214,6 @@ class TestToolExposure:
             "queue_chat_join",
             "resume_chat",
             "backfill_chat",
-            "get_housing_deals",
             "get_housing_requirements",
             "preview_housing_requirements",
             "update_housing_requirements",
@@ -597,7 +596,6 @@ def test_the_requirements_tools_are_owner_only() -> None:
     write_names = {tool.name for tool in WRITE_TOOLS}
 
     for name in (
-        "get_housing_deals",
         "get_housing_requirements",
         "preview_housing_requirements",
         "update_housing_requirements",
