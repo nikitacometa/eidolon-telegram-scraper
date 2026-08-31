@@ -20,8 +20,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sqlite3
 import logging
+import sqlite3
 import sys
 
 from config.settings import settings
