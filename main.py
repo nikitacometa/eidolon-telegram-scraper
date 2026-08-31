@@ -163,6 +163,7 @@ class Eidolon:
             crawler=self.crawler,
             resolve_entity=self._named_entity,
             on_joined=self.reload_observation,
+            dialog_index=self._dialog_index,
         )
         self.discovery = DiscoveryWorker(
             scout=self.scout,
@@ -498,6 +499,34 @@ class Eidolon:
         except (ValueError, TypeError):
             return None
         return peer
+
+    async def _dialog_index(self) -> dict[str, int]:
+        """Map every dialog's username(s) to its chat id, for reconciliation.
+
+        The dialog list is ground truth for membership: whatever the join
+        queue believes, a chat we can read is in here. Reading it costs no
+        governed budget — it is the account's own folder.
+        """
+        from telethon import utils as telethon_utils
+
+        index: dict[str, int] = {}
+        async for dialog in self.client.iter_dialogs():
+            entity = dialog.entity
+            try:
+                peer_id = int(telethon_utils.get_peer_id(entity))
+            except (TypeError, ValueError):
+                continue
+            names = []
+            username = getattr(entity, "username", None)
+            if username:
+                names.append(str(username))
+            for extra in getattr(entity, "usernames", None) or ():
+                extra_name = getattr(extra, "username", None)
+                if extra_name:
+                    names.append(str(extra_name))
+            for name in names:
+                index[name.lower()] = peer_id
+        return index
 
     async def _named_entity(self, reference: str) -> object | None:
         """Resolve a public @username into an entity for the join queue."""

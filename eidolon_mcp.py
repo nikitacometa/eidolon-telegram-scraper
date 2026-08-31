@@ -747,6 +747,29 @@ class EidolonTools:
             ).fetchone()
             if existing:
                 state, joined_chat_id, bound = existing
+                if state in {"failed", "skipped"}:
+                    # A repeat over a terminal failure is a fresh instruction,
+                    # not a duplicate: revive the row. The attempt counter is
+                    # bumped so the retry runs under its own idempotency key
+                    # instead of replaying the failed reservation.
+                    conn.execute(
+                        "UPDATE join_queue SET state = 'pending',"
+                        " attempts = attempts + 1, last_error = NULL,"
+                        " not_before = NULL,"
+                        " label = COALESCE(?, label),"
+                        " watcher_name = COALESCE(?, watcher_name),"
+                        " target_days = MAX(target_days, ?),"
+                        " updated_at = CURRENT_TIMESTAMP WHERE chat_ref = ?",
+                        (label, watcher_name, target_days, ref),
+                    )
+                    conn.commit()
+                    return {
+                        "chat_ref": ref,
+                        "queued": True,
+                        "retried_after": state,
+                        "watcher_name": watcher_name or bound,
+                        "note": "Earlier attempt failed; re-queued for a fresh try.",
+                    }
                 reply: dict[str, Any] = {
                     "chat_ref": ref,
                     "queued": False,

@@ -981,3 +981,18 @@ async def test_rebuilt_ledger_keeps_its_budget_index(tmp_path: Path) -> None:
         assert indexed[0] == "telegram_actions"
     finally:
         await database.close()
+
+
+async def test_discovery_stores_are_credited_to_the_archive_counter(
+    scout: ScoutDatabase,
+) -> None:
+    """The discovery crawl fills the same archive as the backfill worker;
+    without crediting the counter it undercounted by 8,099 rows (measured)."""
+    await scout.add_backfill_target(chat_id=-1001, label="x", target_days=90)
+
+    await scout.credit_archived_messages(-1001, 25)
+    # A chat nobody asked to archive has nothing to credit — silent no-op.
+    await scout.credit_archived_messages(-9999, 10)
+
+    targets = await scout.backfill_targets()
+    assert [(t.chat_id, t.messages_stored) for t in targets] == [(-1001, 25)]

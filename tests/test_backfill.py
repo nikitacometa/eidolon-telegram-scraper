@@ -360,3 +360,21 @@ async def test_backfilled_messages_carry_their_senders_name(scout: ScoutDatabase
     assert names[500] == "@anya (Аня Организатор)"
     # No first or last name: the username is the only thing left to show.
     assert names[501] == "@quiet_one"
+
+
+def test_a_page_past_the_horizon_is_complete_not_exhausted() -> None:
+    """Telegram had more history; we stopped wanting it. Raising target_days
+    later must be able to resume, which EXHAUSTED forbids."""
+    from pipeline.backfill import _finished_state
+    from pipeline.recon_models import BackfillState, BackfillTarget
+
+    target = BackfillTarget(chat_id=-1001, label="x", target_days=90)
+
+    # The boundary case: every message on the page fell past the cutoff, so
+    # there are no survivors and no oldest id — indistinguishable from an
+    # empty page except for the crawler's explicit flag.
+    past_horizon = _finished_state(target, True, None, True)
+    truly_empty = _finished_state(target, True, None, False)
+
+    assert past_horizon is BackfillState.COMPLETE
+    assert truly_empty is BackfillState.EXHAUSTED

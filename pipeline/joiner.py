@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 from pipeline.crawler import TelegramCrawler
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_POLL_SECONDS = 300.0
 # A refused join is usually the hourly budget, so wait out roughly that long.
 BUDGET_BACKOFF_SECONDS = 20 * 60
+# How often the reconciliation pass compares the queue's unresolved rows
+# (admin-approval requests, interrupted joins) against the live dialog list.
+RECONCILE_SECONDS = 60 * 60
+# An unanswered invite request is re-checked at most this often: the check
+# spends the invite_check budget and admins answer on human timescales.
+INVITE_RECHECK_SECONDS = 6 * 60 * 60
 
 
 class JoinWorker:
@@ -43,6 +50,7 @@ class JoinWorker:
         resolve_entity: Callable[[str], Awaitable[object | None]],
         on_joined: Callable[[], Awaitable[None]] | None = None,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
+        dialog_index: Callable[[], Awaitable[dict[str, int]]] | None = None,
     ) -> None:
         self._scout = scout
         self._db = db
@@ -50,6 +58,8 @@ class JoinWorker:
         self._resolve_entity = resolve_entity
         self._on_joined = on_joined
         self._poll_seconds = poll_seconds
+        self._dialog_index = dialog_index
+        self._last_reconcile = 0.0
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         """Work the queue until asked to stop."""
@@ -62,6 +72,14 @@ class JoinWorker:
             except Exception:
                 # A join problem must never take the monitor down with it.
                 logger.exception("Join queue cycle failed")
+            try:
+                if time.monotonic() - self._last_reconcile >= RECONCILE_SECONDS:
+                    self._last_reconcile = time.monotonic()
+                    await self.reconcile()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Join reconciliation failed")
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=self._poll_seconds)
             except TimeoutError:
@@ -82,6 +100,7 @@ class JoinWorker:
             result = await self._crawler.join_invite(
                 invite_hash=secret,
                 chat_ref=queued.chat_ref,
+                attempt=queued.attempts,
             )
         else:
             entity = await self._resolve_entity(queued.chat_ref)
@@ -96,6 +115,7 @@ class JoinWorker:
             result = await self._crawler.join(
                 channel=entity,
                 chat_ref=queued.chat_ref,
+                attempt=queued.attempts,
             )
 
         if result.status in {ActionStatus.DENIED, ActionStatus.FLOOD_WAIT}:
@@ -103,6 +123,9 @@ class JoinWorker:
                 queued.chat_ref,
                 seconds=result.retry_after_seconds or BUDGET_BACKOFF_SECONDS,
                 error=result.error_code or result.status.value,
+                # A budget denial never reached Telegram; a FloodWait did,
+                # and that attempt is spent — the retry needs a fresh key.
+                count_attempt=result.status is ActionStatus.FLOOD_WAIT,
             )
             return False
         if result.status is ActionStatus.HALTED:
@@ -110,16 +133,25 @@ class JoinWorker:
                 queued.chat_ref,
                 seconds=6 * 60 * 60,
                 error=result.error_code or "halted",
+                # denial is set when the halt came from the reservation gate
+                # (nothing sent); absent, the halt came out of a real call.
+                count_attempt=result.denial is None,
             )
             logger.error("Join queue halted on %s", queued.chat_ref)
             return False
         if result.status is ActionStatus.REPLAYED:
-            # Already attempted in an earlier life of the process; the real
-            # membership has to be checked by hand rather than guessed at.
-            await self._scout.settle_queued_join(
+            # An earlier life of the process died with this join in flight,
+            # so only Telegram knows whether it went through. Settling FAILED
+            # here would bury a chat we may in fact be a member of; parking
+            # the row for the reconciliation pass lets the dialog list decide.
+            await self._scout.defer_queued_join(
                 queued.chat_ref,
-                state=JoinQueueState.FAILED,
+                seconds=RECONCILE_SECONDS,
                 error="already_attempted",
+            )
+            logger.warning(
+                "Join for %s was interrupted mid-flight; awaiting reconciliation",
+                queued.chat_ref,
             )
             return False
 
@@ -156,6 +188,68 @@ class JoinWorker:
 
         await self._activate(queued, chat_id)
         return True
+
+    async def reconcile(self) -> int:
+        """Resolve the joins whose real outcome only Telegram knows.
+
+        Admin-approval requests and interrupted joins both end here. The
+        dialog list is ground truth for membership: a request an admin
+        approved, and a join whose process died after the call went through,
+        both show up as a dialog. Returns how many rows were resolved.
+        """
+        rows = await self._scout.joins_awaiting_reconciliation()
+        if not rows or self._dialog_index is None:
+            return 0
+        dialogs = await self._dialog_index()
+        resolved = 0
+        for queued in rows:
+            secret = invite_hash(queued.chat_ref)
+            if secret is None:
+                chat_id = dialogs.get(queued.chat_ref.lower())
+                if chat_id is not None:
+                    await self._activate(queued, chat_id)
+                    resolved += 1
+                elif queued.last_error == "already_attempted":
+                    # Positively absent from the dialogs: the interrupted
+                    # call evidently never went through, so a retry under a
+                    # fresh key is safe. (A retry that races a slow approval
+                    # merely gets UserAlreadyParticipant, which is MEMBER.)
+                    await self._scout.requeue_join_attempt(queued.chat_ref)
+                    resolved += 1
+                continue
+            result = await self._crawler.check_invite(
+                invite_hash=secret,
+                chat_ref=queued.chat_ref,
+                attempt=queued.attempts,
+            )
+            outcome = result.value if result.ok else None
+            if outcome is not None and outcome.membership is ChatMembership.MEMBER:
+                chat_id = (
+                    await self._chat_id_of(outcome.chat) if outcome.chat is not None else None
+                )
+                if chat_id is not None:
+                    await self._activate(queued, chat_id)
+                    resolved += 1
+                    continue
+            if outcome is not None and outcome.membership is ChatMembership.FAILED:
+                await self._scout.settle_queued_join(
+                    queued.chat_ref,
+                    state=JoinQueueState.FAILED,
+                    error=outcome.error_code or "invite_invalid",
+                )
+                resolved += 1
+                continue
+            # Still unanswered; ask again no sooner than the recheck window,
+            # and spend the attempt so the next check gets its own key.
+            await self._scout.defer_queued_join(
+                queued.chat_ref,
+                seconds=INVITE_RECHECK_SECONDS,
+                error=queued.last_error,
+                count_attempt=result.ok,
+            )
+        if resolved:
+            logger.info("Join reconciliation resolved %d row(s)", resolved)
+        return resolved
 
     async def _activate(self, queued: QueuedJoin, chat_id: int) -> None:
         """Turn a fresh membership into monitoring and an archive target."""

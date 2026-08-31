@@ -60,6 +60,10 @@ class HistoryPage:
     links: tuple[ChatLink, ...]
     next_offset_id: int | None
     exhausted: bool
+    # True when the walk crossed the requested lookback horizon: Telegram had
+    # more history, we no longer wanted it. Distinguishes COMPLETE from
+    # EXHAUSTED when a page ends exactly on the horizon and has no survivors.
+    crossed_cutoff: bool = False
 
 
 class TelegramCrawler:
@@ -76,6 +80,7 @@ class TelegramCrawler:
         chat_ref: str,
         job_id: str | None = None,
         candidate_id: int | None = None,
+        attempt: int = 0,
     ) -> ActionResult[JoinOutcome]:
         """Attempt to join one public chat.
 
@@ -100,7 +105,7 @@ class TelegramCrawler:
 
         result: ActionResult[JoinOutcome] = await self._governor.run(
             ActionKind.JOIN,
-            f"{job_id or 'queue'}:join:{chat_ref}",
+            f"{job_id or 'queue'}:join:{chat_ref}:{attempt}",
             call,
             job_id=job_id,
             candidate_id=candidate_id,
@@ -117,11 +122,48 @@ class TelegramCrawler:
             )
         return result
 
+    async def check_invite(
+        self,
+        *,
+        invite_hash: str,
+        chat_ref: str,
+        attempt: int = 0,
+    ) -> ActionResult[JoinOutcome]:
+        """Ask whether a pending invite request has since been approved.
+
+        CheckChatInvite never joins anything: on an approved membership it
+        answers ChatInviteAlready with the chat, otherwise it describes the
+        invite. Spends the invite_check budget, which exists exactly for
+        this kind of look."""
+
+        async def call() -> JoinOutcome:
+            try:
+                invite = await self._client(CheckChatInviteRequest(hash=invite_hash))  # type: ignore[operator]
+            except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+                return JoinOutcome(membership=ChatMembership.FAILED, error_code="invite_invalid")
+            chat = getattr(invite, "chat", None)
+            if chat is not None and not getattr(invite, "request_needed", False):
+                # ChatInviteAlready carries the chat and only comes back to
+                # a member; a plain ChatInvite for a public preview keeps
+                # request_needed/False semantics apart via the chat check
+                # below.
+                already = type(invite).__name__ == "ChatInviteAlready"
+                if already:
+                    return JoinOutcome(membership=ChatMembership.MEMBER, chat=chat)
+            return JoinOutcome(membership=ChatMembership.REQUESTED)
+
+        return await self._governor.run(
+            ActionKind.INVITE_CHECK,
+            f"reconcile:invite:{chat_ref}:{attempt}",
+            call,
+        )
+
     async def join_invite(
         self,
         *,
         invite_hash: str,
         chat_ref: str,
+        attempt: int = 0,
     ) -> ActionResult[JoinOutcome]:
         """Join one chat through its invite link.
 
@@ -158,7 +200,7 @@ class TelegramCrawler:
 
         result: ActionResult[JoinOutcome] = await self._governor.run(
             ActionKind.JOIN,
-            f"queue:join:{chat_ref}",
+            f"queue:join:{chat_ref}:{attempt}",
             call,
         )
         if result.status is ActionStatus.REJECTED:
@@ -285,6 +327,7 @@ class TelegramCrawler:
             # 6939 while marking it complete. Crossing the lookback window is
             # the other ending: there is more, we no longer want it.
             exhausted=not raw or crossed_cutoff,
+            crossed_cutoff=crossed_cutoff,
         )
 
 

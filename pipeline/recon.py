@@ -339,7 +339,13 @@ class ReconRunner:
                 break
 
             page = result.value
-            stored += await self._scout.store_messages(list(page.messages))
+            page_stored = await self._scout.store_messages(list(page.messages))
+            stored += page_stored
+            # The discovery crawl fills the same archive the backfill worker
+            # does; without crediting the per-chat counter here it undercounts
+            # by everything this path stored (measured: 8,099 rows across 22
+            # chats), and anyone reading it plans against the wrong number.
+            await self._scout.credit_archived_messages(chat_id, page_stored)
             if wave + 1 < job.max_waves:
                 await self._queue_links(job, page.links, wave + 1)
             if page.exhausted or page.next_offset_id is None:

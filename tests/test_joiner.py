@@ -352,3 +352,176 @@ async def test_an_invite_awaiting_approval_is_not_membership(
 
     assert (await scout.join_queue())[0].state is JoinQueueState.REQUESTED
     assert await db.observation_snapshot() == {}
+
+
+def _worker_with_dialogs(
+    scout: ScoutDatabase,
+    db: Database,
+    client: object,
+    dialogs: dict[str, int],
+    *,
+    entity: object | None = CHANNEL,
+) -> JoinWorker:
+    # No pacing: these tests exercise outcome handling, not the budget.
+    governor = TelegramActionGovernor(
+        scout=scout,
+        policy={ActionKind.JOIN: BudgetRule(), ActionKind.INVITE_CHECK: BudgetRule()},
+    )
+
+    async def resolve(ref: str) -> object | None:
+        return entity
+
+    async def dialog_index() -> dict[str, int]:
+        return dialogs
+
+    return JoinWorker(
+        scout=scout,
+        db=db,
+        crawler=TelegramCrawler(client=client, governor=governor),
+        resolve_entity=resolve,
+        poll_seconds=0.01,
+        dialog_index=dialog_index,
+    )
+
+
+async def test_an_interrupted_join_is_reconciled_not_buried(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A process death mid-join leaves an unsettled reservation. The retry
+    must not settle FAILED blindly: the dialog list knows the truth."""
+    await scout.enqueue_join(chat_ref="@danangevents", watcher_name=None)
+    # The first life reserved the slot and died before Telegram answered.
+    await scout.reserve_action(
+        account_id="owner-primary",
+        kind=ActionKind.JOIN,
+        idempotency_key="queue:join:danangevents:0",
+    )
+
+    client = FakeJoins()
+    worker = _worker_with_dialogs(scout, db, client, {"danangevents": CHAT_ID})
+    assert await worker.run_once() is False
+    queue = await scout.join_queue()
+    # Not FAILED: parked for reconciliation.
+    assert queue[0].state is JoinQueueState.PENDING
+    assert queue[0].last_error == "already_attempted"
+    assert client.joined == []
+
+    # Reconciliation finds the chat among the dialogs: the join DID land.
+    async with scout.conn.execute(
+        "UPDATE join_queue SET not_before = NULL WHERE chat_ref = 'danangevents'"
+    ):
+        pass
+    await scout.conn.commit()
+    resolved = await worker.reconcile()
+
+    assert resolved == 1
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.JOINED
+    assert queue[0].joined_chat_id == CHAT_ID
+
+
+async def test_an_interrupted_join_absent_from_dialogs_is_retried_fresh(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """Positively absent from the dialogs means the call never went through;
+    the retry runs under a fresh idempotency key and actually joins."""
+    await scout.enqueue_join(chat_ref="@danangevents")
+    await scout.reserve_action(
+        account_id="owner-primary",
+        kind=ActionKind.JOIN,
+        idempotency_key="queue:join:danangevents:0",
+    )
+
+    client = FakeJoins()
+    worker = _worker_with_dialogs(scout, db, client, {})
+    assert await worker.run_once() is False
+
+    async with scout.conn.execute(
+        "UPDATE join_queue SET not_before = NULL WHERE chat_ref = 'danangevents'"
+    ):
+        pass
+    await scout.conn.commit()
+    assert await worker.reconcile() == 1
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.PENDING
+    assert queue[0].attempts == 1
+
+    # The fresh attempt uses a new key and reaches Telegram this time.
+    assert await worker.run_once() is True
+    assert client.joined == ["danangevents"]
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.JOINED
+
+
+async def test_an_approved_admin_request_is_activated_by_reconciliation(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """An admin approving a week-old request must not go unnoticed forever."""
+    client = FakeJoins(error=errors.InviteRequestSentError)
+    worker = _worker_with_dialogs(scout, db, client, {"danangevents": CHAT_ID})
+    await scout.enqueue_join(chat_ref="@danangevents", watcher_name="danang-signal")
+    assert await worker.run_once() is True
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.REQUESTED
+
+    resolved = await worker.reconcile()
+
+    assert resolved == 1
+    queue = await scout.join_queue()
+    assert queue[0].state is JoinQueueState.JOINED
+    snapshot = await db.observation_snapshot()
+    assert snapshot[CHAT_ID].mode is ObservationMode.MONITOR
+
+
+async def test_a_flood_wait_spends_the_attempt_so_the_retry_is_real(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A FloodWait reached Telegram; retrying under the same key would replay
+    the settled reservation and wedge the row forever."""
+
+    class FloodThenJoin:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.joined: list[str] = []
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, JoinChannelRequest)
+            self.calls += 1
+            if self.calls == 1:
+                raise errors.FloodWaitError(request=None, capture=1)
+            self.joined.append(str(getattr(request.channel, "username", request.channel)))
+            return SimpleNamespace(chats=[], users=[])
+
+    client = FloodThenJoin()
+    worker = _worker_with_dialogs(scout, db, client, {})
+    await scout.enqueue_join(chat_ref="@danangevents")
+
+    assert await worker.run_once() is False
+    queue = await scout.join_queue()
+    assert queue[0].attempts == 1
+
+    async with scout.conn.execute(
+        "UPDATE join_queue SET not_before = NULL WHERE chat_ref = 'danangevents'"
+    ):
+        pass
+    # The flood cooldown has since expired.
+    await scout.conn.execute("DELETE FROM account_cooldowns")
+    await scout.conn.commit()
+
+    assert await worker.run_once() is True
+    assert client.joined == ["danangevents"]
+
+
+async def test_requeueing_a_failed_chat_revives_it(scout: ScoutDatabase) -> None:
+    """A terminal failure plus a fresh instruction is a retry, not a no-op."""
+    await scout.enqueue_join(chat_ref="@danangevents")
+    await scout.settle_queued_join(
+        "danangevents", state=JoinQueueState.FAILED, error="unresolvable"
+    )
+
+    await scout.enqueue_join(chat_ref="@danangevents")
+
+    queued = await scout.next_queued_join()
+    assert queued is not None
+    assert queued.state is JoinQueueState.PENDING
+    assert queued.attempts == 2  # settle counted one, the revival bumped past it

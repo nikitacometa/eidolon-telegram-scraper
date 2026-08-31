@@ -119,7 +119,7 @@ class BackfillWorker:
         stored = await self._scout.store_messages(list(page.messages))
         oldest = page.next_offset_id
         oldest_date = page.messages[-1].date if page.messages else None
-        finished = _finished_state(target, page.exhausted, oldest)
+        finished = _finished_state(target, page.exhausted, oldest, page.crossed_cutoff)
 
         await self._scout.record_backfill_page(
             target.chat_id,
@@ -143,13 +143,21 @@ def _finished_state(
     target: BackfillTarget,
     exhausted: bool,
     oldest: int | None,
+    crossed_cutoff: bool,
 ) -> BackfillState | None:
-    """Decide whether this target still has history worth asking for."""
+    """Decide whether this target still has history worth asking for.
+
+    COMPLETE means the walk crossed the requested horizon — Telegram had
+    more, we no longer wanted it — and raising target_days later can resume.
+    EXHAUSTED means Telegram itself ran out. The tell-apart cannot be
+    "did the page have survivors": a page that lands entirely past the
+    horizon filters down to nothing and looks exactly like an empty one, so
+    the crawler reports crossing the cutoff explicitly.
+    """
     if not exhausted and oldest is not None:
         return None
-    # A short page means either the chat ran out of history or the walk
-    # crossed the requested horizon. Both end the target; only the reason
-    # differs, and the distinction matters when raising the horizon later.
+    if crossed_cutoff:
+        return BackfillState.COMPLETE
     if oldest is None:
         return BackfillState.EXHAUSTED
     return BackfillState.COMPLETE

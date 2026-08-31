@@ -1278,8 +1278,12 @@ class ScoutDatabase:
     ) -> None:
         """Queue a public chat to be joined when the budget allows.
 
-        Re-queueing a chat that was already joined does nothing: the queue is
-        an intent to join once, not a standing instruction to keep trying.
+        Re-queueing a chat that was already joined, or whose request awaits an
+        admin, does nothing: the queue is an intent to join once. Re-queueing
+        one whose earlier attempt FAILED is a fresh instruction and revives
+        the row — without this, a failed chat_ref was a silent no-op through
+        every interface and could never be retried at all. The attempt counter
+        is bumped so the retry runs under a fresh idempotency key.
         """
         normalized = normalize_username(chat_ref)
         if not normalized:
@@ -1293,6 +1297,15 @@ class ScoutDatabase:
                     label = COALESCE(excluded.label, join_queue.label),
                     watcher_name = COALESCE(excluded.watcher_name, join_queue.watcher_name),
                     target_days = MAX(join_queue.target_days, excluded.target_days),
+                    state = CASE WHEN join_queue.state IN ('failed', 'skipped')
+                                 THEN 'pending' ELSE join_queue.state END,
+                    attempts = CASE WHEN join_queue.state IN ('failed', 'skipped')
+                                    THEN join_queue.attempts + 1
+                                    ELSE join_queue.attempts END,
+                    not_before = CASE WHEN join_queue.state IN ('failed', 'skipped')
+                                      THEN NULL ELSE join_queue.not_before END,
+                    last_error = CASE WHEN join_queue.state IN ('failed', 'skipped')
+                                      THEN NULL ELSE join_queue.last_error END,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (normalized, label, watcher_name, target_days),
@@ -1344,11 +1357,15 @@ class ScoutDatabase:
         *,
         seconds: int,
         error: str | None = None,
+        count_attempt: bool = False,
     ) -> None:
-        """Push a join back without counting it as an attempt.
+        """Push a join back, counting it as an attempt only when one was made.
 
         Being refused by the budget is not a failed join: nothing reached
-        Telegram, so the chat keeps its place in the queue.
+        Telegram, so the chat keeps its place in the queue and its attempt
+        counter. A FloodWait DID reach Telegram — that attempt is spent, and
+        counting it moves the retry onto a fresh idempotency key; without the
+        bump the retry replays the settled reservation and the row wedges.
         """
         async with self._write_lock:
             await self.conn.execute(
@@ -1356,10 +1373,61 @@ class ScoutDatabase:
                 UPDATE join_queue
                 SET not_before = datetime('now', ?),
                     last_error = ?,
+                    attempts = attempts + ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE chat_ref = ?
                 """,
-                (f"+{max(seconds, 1)} seconds", error, normalize_username(chat_ref)),
+                (
+                    f"+{max(seconds, 1)} seconds",
+                    error,
+                    1 if count_attempt else 0,
+                    normalize_username(chat_ref),
+                ),
+            )
+            await self.conn.commit()
+
+    async def joins_awaiting_reconciliation(self) -> list[QueuedJoin]:
+        """Joins whose real outcome only Telegram knows.
+
+        Two shapes land here: a request an admin may since have approved
+        (state 'requested'), and a join whose process died mid-call, leaving
+        an unsettled reservation behind ('pending' with already_attempted).
+        Neither is ever re-checked by the join path itself — next_queued_join
+        deliberately refuses the second — so a periodic reconciliation pass
+        reads this list and compares it against the account's live dialogs.
+        """
+        async with self.conn.execute(
+            """
+            SELECT * FROM join_queue
+            WHERE (state = 'requested'
+                   OR (state = 'pending' AND last_error = 'already_attempted'))
+              AND (not_before IS NULL OR datetime(not_before) <= CURRENT_TIMESTAMP)
+            ORDER BY updated_at
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_queued_join_from_row(row) for row in rows]
+
+    async def requeue_join_attempt(self, chat_ref: str) -> None:
+        """Return a wedged join to the queue under a fresh attempt number.
+
+        Called when reconciliation has positively established that the
+        account is NOT a member — the interrupted attempt evidently never
+        went through, so trying again is safe, and the bumped counter gives
+        the retry an idempotency key of its own.
+        """
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE join_queue
+                SET state = 'pending',
+                    attempts = attempts + 1,
+                    last_error = 'reconciled_not_member',
+                    not_before = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_ref = ?
+                """,
+                (normalize_username(chat_ref),),
             )
             await self.conn.commit()
 
@@ -1428,6 +1496,27 @@ class ScoutDatabase:
         ) as cursor:
             row = await cursor.fetchone()
         return _backfill_from_row(row) if row is not None else None
+
+    async def credit_archived_messages(self, chat_id: int, count: int) -> None:
+        """Add discovery-phase stores to the per-chat archive counter.
+
+        A silent no-op for a chat with no backfill target: the counter
+        belongs to the target row, and a discovery crawl over a chat nobody
+        asked to archive has nothing to credit.
+        """
+        if count <= 0:
+            return
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                UPDATE backfill_targets
+                SET messages_stored = messages_stored + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+                """,
+                (count, chat_id),
+            )
+            await self.conn.commit()
 
     async def record_backfill_page(
         self,
