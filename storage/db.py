@@ -172,6 +172,18 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_messages_grouped "
             "ON messages(chat_id, grouped_id) WHERE grouped_id IS NOT NULL"
         )
+        unit_columns = {
+            row[1]
+            for row in await (
+                await self.conn.execute("PRAGMA table_info(housing_live_units)")
+            ).fetchall()
+        }
+        if unit_columns and "sweep_attempts" not in unit_columns:
+            await self.conn.execute(
+                "ALTER TABLE housing_live_units ADD COLUMN"
+                " sweep_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Migration: added housing_live_units.sweep_attempts")
 
         cursor = await self.conn.execute("PRAGMA table_info(alerts)")
         alert_columns = {row[1] for row in await cursor.fetchall()}

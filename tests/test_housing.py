@@ -1328,3 +1328,162 @@ def test_a_television_the_text_describes_survives_the_guard() -> None:
 
     assert row["tv_size_class"] == "large"
     assert row["tv_source"] == "text"
+
+
+async def test_a_unit_abandoned_mid_processing_is_swept_again(store: HousingStore) -> None:
+    """A daemon killed mid-_process leaves a unit in an intermediate state;
+    the sweep must reclaim it instead of leaving it stuck forever."""
+    key = await _queue_unit(store, "Сдаю дом 2 спальни 30000 бат")
+    claimed = await store.claim_settled_units()
+    assert [unit.unit_key for unit in claimed] == [key]
+    # Simulate a crash right after the state moved to 'extracting'.
+    await store.set_unit_state(key, UnitState.EXTRACTING)
+
+    # Fresh abandonment is not stale yet: nothing to reclaim.
+    assert await store.claim_settled_units() == []
+
+    async with store._write_lock:
+        await store._conn.execute(
+            "UPDATE housing_live_units SET updated_at = datetime('now', '-16 minutes')"
+            " WHERE unit_key = ?",
+            (key,),
+        )
+        await store._conn.commit()
+
+    reclaimed = await store.claim_settled_units()
+    assert [unit.unit_key for unit in reclaimed] == [key]
+
+
+async def test_a_poisoned_unit_is_retried_a_bounded_number_of_times(
+    store: HousingStore,
+) -> None:
+    """One advertisement that keeps failing must not burn a model call per
+    sweep forever."""
+    key = await _queue_unit(store, "Сдаю дом 2 спальни 30000 бат")
+    await store.claim_settled_units()
+    for _ in range(store.MAX_SWEEP_ATTEMPTS):
+        await store.set_unit_state(key, UnitState.ERROR, error="Boom")
+        async with store._write_lock:
+            await store._conn.execute(
+                "UPDATE housing_live_units SET updated_at = datetime('now', '-16 minutes')"
+                " WHERE unit_key = ?",
+                (key,),
+            )
+            await store._conn.commit()
+        await store.claim_settled_units()
+
+    await store.set_unit_state(key, UnitState.ERROR, error="Boom")
+    async with store._write_lock:
+        await store._conn.execute(
+            "UPDATE housing_live_units SET updated_at = datetime('now', '-16 minutes')"
+            " WHERE unit_key = ?",
+            (key,),
+        )
+        await store._conn.commit()
+
+    assert await store.claim_settled_units() == []
+
+
+async def test_vision_status_stays_pending_until_the_alert_is_queued(
+    store: HousingStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between the vision read and the alert must leave the unit
+    eligible for another read, not stranded 'done' with a stale verdict."""
+    key = await _unit_with_photo(
+        store,
+        tmp_path,
+        HousingFacts(
+            is_rental_offer=True,
+            is_vehicle_ad=False,
+            bedrooms=2,
+            monthly_price_thb=30000,
+        ),
+    )
+    await store.claim_due_alerts(lease_owner="drain")
+
+    class Killed(BaseException):
+        """A process death, which no except-Exception handler sees."""
+
+    async def crash(**kwargs: object) -> None:
+        raise Killed
+
+    monkeypatch.setattr(store, "enqueue_alert", crash)
+    vision = FakeVision(
+        VisionReading(
+            bathrooms_visible_min=2,
+            tv_size_class="large",
+            tv_present=True,
+            confidence=0.9,
+        )
+    )
+    with pytest.raises(Killed):
+        await HousingVisionWorker(store=store, extractor=vision).run_once()
+
+    facts = await store.get_facts(key)
+    assert facts is not None
+    assert facts["vision_status"] == "pending"
+    # The unit must still be eligible for another read after a restart;
+    # 'done' with no alert queued is the stranded state this prevents.
+    assert key in await store.units_awaiting_vision()
+
+
+async def test_a_claim_alone_does_not_consume_a_delivery_attempt(
+    store: HousingStore,
+) -> None:
+    """Claiming is a lease; only a completed delivery attempt counts against
+    the retry budget."""
+    key = await _queue_unit(store, "Сдаю дом 2 спальни 30000 бат")
+    await store.enqueue_alert(
+        unit_key=key,
+        chat_id=-1001199262612,
+        chat_title=None,
+        telegram_msg_id=100,
+        requirements_revision=1,
+        verdict=Verdict.POSSIBLE,
+        kind=AlertKind.LIVE,
+        body_html="<b>x</b>",
+    )
+
+    first = await store.claim_due_alerts(lease_owner="one", lease_seconds=0)
+    assert first[0]["attempts"] == 0
+    second = await store.claim_due_alerts(lease_owner="two", lease_seconds=0)
+    assert second[0]["attempts"] == 0
+
+    await store.settle_alert(int(second[0]["id"]), delivered=False, retry_in_seconds=0)
+    third = await store.claim_due_alerts(lease_owner="three", lease_seconds=0)
+    assert third[0]["attempts"] == 1
+
+
+async def test_photo_requests_are_capped_at_what_vision_reads(store: HousingStore) -> None:
+    """Downloading a fifteen-photo album spends budget on frames vision
+    will never look at."""
+    chat_id = -1001199262612
+    await store.set_chat_kind(chat_id, "dedicated_housing")
+    key = unit_key_for(chat_id, grouped_id=555, telegram_msg_id=200)
+    for i in range(10):
+        await store.record_message(
+            unit_key=key,
+            chat_id=chat_id,
+            grouped_id=555,
+            message_id=i + 1,
+            telegram_msg_id=200 + i,
+            text="Сдаю дом 2 спальни 30000 бат" if i == 0 else None,
+            has_media=True,
+            telegram_photo_id=9000 + i,
+        )
+    worker = HousingWorker(
+        store=store,
+        extractor=FakeExtractor(
+            HousingFacts(is_rental_offer=True, is_vehicle_ad=False, bedrooms=2,
+                         monthly_price_thb=30000)
+        ),
+    )
+    await worker.run_once()
+
+    async with store._write_lock:
+        cursor = await store._conn.execute(
+            "SELECT COUNT(*) FROM housing_media WHERE unit_key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] == 6

@@ -205,6 +205,10 @@ CREATE TABLE IF NOT EXISTS housing_live_units (
         CHECK(state IN ('assembling', 'ready', 'extracting', 'extracted',
                         'matching', 'done', 'error')),
     settle_after TIMESTAMP NOT NULL,
+    -- How many times a sweep has claimed this unit. Bounds the retries of a
+    -- unit that a died worker abandoned mid-state, so a poisoned row cannot
+    -- burn one model call per sweep forever.
+    sweep_attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP

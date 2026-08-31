@@ -27,6 +27,7 @@ from pipeline.housing.requirements import (
     MatchResult,
     match_requirements,
 )
+from pipeline.housing.vision import MAX_IMAGES as VISION_MAX_IMAGES
 from storage.housing import AlertKind, ContentUnit, HousingStore, UnitState, Verdict
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,10 @@ class HousingWorker:
         ]
         if not photos:
             return
+        # Vision reads at most VISION_MAX_IMAGES frames; downloading a
+        # fifteen-photo album spends download budget on frames nobody will
+        # ever look at.
+        photos = photos[:VISION_MAX_IMAGES]
         queued = await self._store.enqueue_media(
             unit_key=unit.unit_key,
             chat_id=unit.chat_id,
@@ -310,7 +315,9 @@ class HousingAlertDelivery:
                 await self._store.settle_alert(alert_id, delivered=True)
                 sent += 1
                 continue
-            attempts = int(alert["attempts"])
+            # The stored counter holds completed attempts (settle_alert
+            # increments it); the delivery that just failed makes one more.
+            attempts = int(alert["attempts"]) + 1
             if not result.retryable or attempts >= self._max_attempts:
                 # Stop retrying, but keep the row: a failed alert is a listing
                 # the owner never saw, and that has to stay visible rather than
@@ -399,10 +406,23 @@ class HousingVisionWorker:
 
         reading = await self._extractor.read(paths, listing_text=unit.assembled_text)
         merged = reading.merged_into(facts)
+        # The final status ('done'/'error') is committed only after the
+        # re-match and any alert are safely recorded. Committing it first
+        # would remove the unit from units_awaiting_vision, so a crash
+        # between the writes would strand it with a stale verdict and no
+        # alert, forever. Until then the row stays 'pending': a crash
+        # anywhere below merely repeats the (idempotent) read next cycle.
+        final_status = merged["vision_status"]
+        merged["vision_status"] = "pending"
         await self._store.record_facts(unit_key, merged)
+
+        async def finalize() -> None:
+            merged["vision_status"] = final_status
+            await self._store.record_facts(unit_key, merged)
 
         active = await self._store.active_requirements()
         if active is None:
+            await finalize()
             return
         revision, requirements = active
         result = match_requirements(merged, requirements)
@@ -417,6 +437,7 @@ class HousingVisionWorker:
             # The photographs added detail but changed nothing the owner has
             # to act on. Sending the same verdict twice trains him to ignore
             # these messages, which is how a working filter becomes useless.
+            await finalize()
             return
 
         if result.verdict is Verdict.HARD_MISS:
@@ -441,6 +462,7 @@ class HousingVisionWorker:
             body_html=body,
             photo_paths=paths[:3] if result.verdict is not Verdict.HARD_MISS else None,
         )
+        await finalize()
 
 
 def _photo_paths(raw: Any) -> list[str]:

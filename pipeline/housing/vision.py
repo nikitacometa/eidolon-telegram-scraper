@@ -47,9 +47,10 @@ Rules that matter more than completeness:
   you, so a low number never means the property has few. If two photographs
   could be the same bathroom from another angle, count them once and say so in
   the evidence.
-- tv_present: report false only when a living space is clearly shown and
-  plainly has no television. A photograph that simply does not show one is not
-  evidence of absence — report tv_present as null in that case.
+- tv_present: photographs can only ever CONFIRM a television, never deny one.
+  A frame without a television says nothing about the rooms outside it, so
+  the only honest negative is null. Report true when you see one; otherwise
+  null — never false.
 - tv_size_class: "large" only when the scale against furniture or a wall makes
   that credible. Otherwise "unclear". Never estimate inches.
 - photos_show_this_listing: false when the images are logos, screenshots,
@@ -148,9 +149,12 @@ class VisionReading:
                 merged["tv_present"] = 1
                 merged["tv_size_class"] = "unclear"
                 merged["tv_source"] = "vision"
-            # A television the photographs failed to show stays unknown: the
-            # model is instructed to answer null there, and turning that into
-            # "no television" would reject the listing on an empty frame.
+            # A negative reading (tv_present=False / 'none') is deliberately
+            # dropped, and the prompt forbids producing one: a photograph can
+            # only confirm a television, never deny one — the frame says
+            # nothing about the rooms outside it. The text extractor's
+            # measured fabrication of absences (162 of 194 "no TV" claims had
+            # no textual basis) is the same failure mode this refuses.
         return merged
 
 

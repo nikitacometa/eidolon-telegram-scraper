@@ -243,11 +243,27 @@ class HousingStore:
                 await self._conn.rollback()
                 raise
 
+    # How long a unit may sit in a mid-processing state before a sweep
+    # concludes the worker that owned it died. Processing a unit takes
+    # seconds; fifteen minutes is not a race with a slow LLM call.
+    STALE_UNIT_MINUTES = 15
+    # A unit that keeps failing is retried this many times and then left
+    # alone, so one poisoned advertisement cannot burn an LLM call per sweep
+    # forever.
+    MAX_SWEEP_ATTEMPTS = 5
+
     async def claim_settled_units(self, *, limit: int = 20) -> list[ContentUnit]:
-        """Take ownership of every unit whose quiet window has closed.
+        """Take ownership of work: settled units, plus abandoned ones.
 
         Claiming moves the row out of ``assembling`` in the same transaction as
         the read, so two sweeps cannot both work the same advertisement.
+
+        A unit stuck in any non-terminal state (``ready``/``extracting``/
+        ``extracted``/``matching``/``error``) is work a previous cycle started
+        and never finished — the daemon was killed mid-flight, or the cycle
+        errored. Re-processing from the top is safe: facts and matches are
+        upserts and alerts deduplicate, so the only cost of a retry is the
+        repeated model call.
         """
         async with self._write_lock:
             await self._conn.execute("BEGIN IMMEDIATE")
@@ -255,18 +271,28 @@ class HousingStore:
                 cursor = await self._conn.execute(
                     """
                     SELECT unit_key FROM housing_live_units
-                    WHERE state = 'assembling'
-                      AND datetime(settle_after) <= CURRENT_TIMESTAMP
+                    WHERE (state = 'assembling'
+                           AND datetime(settle_after) <= CURRENT_TIMESTAMP)
+                       OR (state IN ('ready', 'extracting', 'extracted',
+                                     'matching', 'error')
+                           AND datetime(updated_at)
+                               <= datetime('now', ?)
+                           AND sweep_attempts < ?)
                     ORDER BY settle_after
                     LIMIT ?
                     """,
-                    (limit,),
+                    (
+                        f"-{self.STALE_UNIT_MINUTES} minutes",
+                        self.MAX_SWEEP_ATTEMPTS,
+                        limit,
+                    ),
                 )
                 keys = [str(row[0]) for row in await cursor.fetchall()]
                 if keys:
                     placeholders = ",".join("?" * len(keys))
                     await self._conn.execute(
                         f"UPDATE housing_live_units SET state = 'ready',"  # noqa: S608 - fixed placeholders
+                        f" sweep_attempts = sweep_attempts + 1,"
                         f" updated_at = CURRENT_TIMESTAMP WHERE unit_key IN ({placeholders})",
                         keys,
                     )
@@ -497,12 +523,16 @@ class HousingStore:
                 ids = [int(row[0]) for row in await cursor.fetchall()]
                 if ids:
                     placeholders = ",".join("?" * len(ids))
+                    # attempts is NOT incremented here: a claim is a lease,
+                    # not a delivery attempt. A crash between claiming and
+                    # calling Telegram would otherwise burn retry budget on
+                    # sends that never happened; settle_alert counts the
+                    # attempts that actually completed.
                     await self._conn.execute(
                         f"""
                         UPDATE housing_alerts
                         SET claimed_until = datetime(CURRENT_TIMESTAMP, ?),
-                            lease_owner = ?,
-                            attempts = attempts + 1
+                            lease_owner = ?
                         WHERE id IN ({placeholders})
                         """,  # noqa: S608 - placeholders are generated, values are bound
                         [f"+{lease_seconds} seconds", lease_owner, *ids],
@@ -533,6 +563,7 @@ class HousingStore:
             if delivered:
                 await self._conn.execute(
                     "UPDATE housing_alerts SET delivery_status = 'delivered',"
+                    " attempts = attempts + 1,"
                     " delivered_at = CURRENT_TIMESTAMP, claimed_until = NULL,"
                     " lease_owner = NULL, last_error = NULL WHERE id = ?",
                     (alert_id,),
@@ -540,12 +571,14 @@ class HousingStore:
             elif retry_in_seconds is None:
                 await self._conn.execute(
                     "UPDATE housing_alerts SET delivery_status = 'failed',"
+                    " attempts = attempts + 1,"
                     " claimed_until = NULL, lease_owner = NULL, last_error = ? WHERE id = ?",
                     (error, alert_id),
                 )
             else:
                 await self._conn.execute(
                     "UPDATE housing_alerts SET delivery_status = 'pending',"
+                    " attempts = attempts + 1,"
                     " next_attempt_at = datetime(CURRENT_TIMESTAMP, ?),"
                     " claimed_until = NULL, lease_owner = NULL, last_error = ? WHERE id = ?",
                     (f"+{retry_in_seconds} seconds", error, alert_id),
