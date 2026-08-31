@@ -355,6 +355,13 @@ CREATE TABLE IF NOT EXISTS housing_listings (
     price_note TEXT,
     tv_present INTEGER,
     tv_size_class TEXT,
+    property_type TEXT CHECK(property_type IN ('house', 'apartment', 'room', 'hotel')),
+    -- Preference claims are one-sided (claimed or silent), so 1 or NULL.
+    terrace INTEGER,
+    private_setting INTEGER,
+    nature_setting INTEGER,
+    -- {"pool": true, ...}: only confirmed amenities are stored.
+    amenities_json TEXT,
     area_raw TEXT,
     evidence_quote TEXT,
     extractor_version TEXT NOT NULL,

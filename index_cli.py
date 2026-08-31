@@ -91,8 +91,9 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.command == "housing-extract":
             extractor = ListingExtractor(search.conn)
             seeded = extractor.seed(args.chat_id or [])
+            reseeded = extractor.reseed_stale() if args.reseed_stale else 0
             run = await extractor.run(limit=args.limit)
-            print(json.dumps({"seeded": seeded, **run.as_dict()}, indent=2))
+            print(json.dumps({"seeded": seeded, "reseeded": reseeded, **run.as_dict()}, indent=2))
             return 0
 
         if args.command == "housing-trend":
@@ -224,6 +225,11 @@ def main() -> int:
         help="seed this chat's archive as pending (repeatable)",
     )
     p_housing.add_argument("--limit", type=int, default=500)
+    p_housing.add_argument(
+        "--reseed-stale",
+        action="store_true",
+        help="re-queue listings extracted under an older extractor version",
+    )
 
     p_trend = sub.add_parser("housing-trend", help="price series over extracted listings")
     p_trend.add_argument("--period", choices=["month", "quarter"], default="month")

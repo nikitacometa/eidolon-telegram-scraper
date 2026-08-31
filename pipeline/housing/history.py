@@ -28,7 +28,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.settings import settings
-from pipeline.housing.extractor import EXTRACTOR_VERSION, SYSTEM_PROMPT, televised
+from pipeline.housing.extractor import (
+    EXTRACTOR_VERSION,
+    SYSTEM_PROMPT,
+    property_typed,
+    televised,
+)
 from pipeline.housing.gate import could_be_housing
 
 logger = logging.getLogger(__name__)
@@ -68,6 +73,40 @@ BATCH_SCHEMA: dict[str, Any] = {
                         "type": ["string", "null"],
                         "enum": ["none", "small", "medium", "large", "unclear", None],
                     },
+                    "property_type": {
+                        "type": ["string", "null"],
+                        "enum": ["house", "apartment", "room", "hotel", None],
+                    },
+                    "terrace": {"type": ["boolean", "null"]},
+                    "private_setting": {"type": ["boolean", "null"]},
+                    "nature_setting": {"type": ["boolean", "null"]},
+                    "amenities": {
+                        "type": "object",
+                        "properties": {
+                            name: {"type": ["boolean", "null"]}
+                            for name in (
+                                "pool",
+                                "aircon",
+                                "kitchen",
+                                "wifi",
+                                "sea_view",
+                                "parking",
+                                "hot_water",
+                                "washing_machine",
+                            )
+                        },
+                        "required": [
+                            "pool",
+                            "aircon",
+                            "kitchen",
+                            "wifi",
+                            "sea_view",
+                            "parking",
+                            "hot_water",
+                            "washing_machine",
+                        ],
+                        "additionalProperties": False,
+                    },
                     "area_raw": {"type": ["string", "null"]},
                     "evidence_quote": {"type": ["string", "null"]},
                 },
@@ -81,6 +120,11 @@ BATCH_SCHEMA: dict[str, Any] = {
                     "price_note",
                     "tv_present",
                     "tv_size_class",
+                    "property_type",
+                    "terrace",
+                    "private_setting",
+                    "nature_setting",
+                    "amenities",
                     "area_raw",
                     "evidence_quote",
                 ],
@@ -166,6 +210,31 @@ class ListingExtractor:
         self._conn.commit()
         return cursor.rowcount or 0
 
+    def reseed_stale(self) -> int:
+        """Return listings extracted under an older prompt to the queue.
+
+        seed() alone cannot do this: its ON CONFLICT DO NOTHING is what makes
+        repeated seeding idempotent, and it deliberately never touches a row
+        that was already worked. A version bump is the one case where worked
+        rows must be worked again — the extracted ones, whose stored shape is
+        now missing fields, and the errored ones, which cost nothing to
+        retry. not_housing and gated verdicts stand: the classification of
+        "is this a listing at all" did not change between versions.
+        """
+        cursor = self._conn.execute(
+            """
+            UPDATE housing_listing_state
+            SET status = 'pending', error = NULL, extractor_version = ?
+            WHERE status = 'error'
+               OR (status = 'extracted' AND corpus_id IN (
+                       SELECT corpus_id FROM housing_listings
+                       WHERE extractor_version != ?))
+            """,
+            (EXTRACTOR_VERSION, EXTRACTOR_VERSION),
+        )
+        self._conn.commit()
+        return cursor.rowcount or 0
+
     async def run(self, *, limit: int = 500) -> ExtractionRun:
         """Extract up to ``limit`` pending messages, oldest first."""
         rows = self._conn.execute(
@@ -191,9 +260,25 @@ class ListingExtractor:
             self._settle(int(row["corpus_id"]), "gated")
         self._conn.commit()
 
+        # A crosspost — the same advertisement in several chats — shares its
+        # content_hash, and 22.2% of this corpus is crossposts. One model
+        # call per distinct text; the duplicates copy the representative's
+        # answer afterwards.
+        uniques: list[sqlite3.Row] = []
+        duplicates: list[sqlite3.Row] = []
+        seen_hashes: set[str] = set()
+        for row in candidates:
+            content_hash = row["content_hash"]
+            if content_hash and content_hash in seen_hashes:
+                duplicates.append(row)
+                continue
+            if content_hash:
+                seen_hashes.add(str(content_hash))
+            uniques.append(row)
+
         packs = [
-            candidates[index : index + self._pack_size]
-            for index in range(0, len(candidates), self._pack_size)
+            uniques[index : index + self._pack_size]
+            for index in range(0, len(uniques), self._pack_size)
         ]
         semaphore = asyncio.Semaphore(self._concurrency)
 
@@ -201,19 +286,23 @@ class ListingExtractor:
             async with semaphore:
                 return pack, await self._extract_pack(pack)
 
-        results = await asyncio.gather(*(one(pack) for pack in packs), return_exceptions=True)
-
         extracted = listings = errors = 0
-        for outcome in results:
-            if isinstance(outcome, BaseException):
-                logger.warning("Listing pack failed: %s", outcome)
+        judged_hashes: set[str] = set()
+        # Settled and committed one pack at a time: a run interrupted at pack
+        # nine keeps packs one through eight, instead of re-paying for all of
+        # them the way a single commit at the end would.
+        for finished in asyncio.as_completed([one(pack) for pack in packs]):
+            try:
+                pack, answers = await finished
+            except Exception as error:
+                logger.warning("Listing pack failed: %s", error)
                 errors += 1
                 continue
-            pack, answers = outcome
             if answers is None:
                 for row in pack:
                     self._settle(int(row["corpus_id"]), "error", error="pack_failed")
                 errors += len(pack)
+                self._conn.commit()
                 continue
             for row in pack:
                 corpus_id = int(row["corpus_id"])
@@ -225,14 +314,103 @@ class ListingExtractor:
                     errors += 1
                     continue
                 extracted += 1
+                if row["content_hash"]:
+                    judged_hashes.add(str(row["content_hash"]))
                 if answer.get("is_rental_offer") and not answer.get("is_vehicle_ad"):
                     self._store_listing(row, answer)
                     listings += 1
                     self._settle(corpus_id, "extracted")
                 else:
                     self._settle(corpus_id, "not_housing")
+            self._conn.commit()
+
+        for row in duplicates:
+            copied = self._copy_from_donor(row)
+            if copied is True:
+                extracted += 1
+                listings += 1
+            elif copied is False and str(row["content_hash"]) in judged_hashes:
+                # The representative was judged in this very run and left no
+                # listing row: it was not a housing offer, so neither is its
+                # word-for-word copy.
+                self._settle(int(row["corpus_id"]), "not_housing")
+                extracted += 1
+            # A donor that errored leaves the duplicate pending for the next
+            # pass — an unjudged text must not inherit a failure.
         self._conn.commit()
         return ExtractionRun(len(rows), len(gated), extracted, listings, errors)
+
+    def _copy_from_donor(self, row: sqlite3.Row) -> bool | None:
+        """Fill a crosspost from an already-extracted copy of the same text.
+
+        Returns True when a listing row was copied, False when no donor
+        listing exists, None when the row has no hash to look up by.
+        """
+        content_hash = row["content_hash"]
+        if not content_hash:
+            return None
+        donor = self._conn.execute(
+            """
+            SELECT * FROM housing_listings
+            WHERE content_hash = ? AND extractor_version = ?
+            ORDER BY listing_id LIMIT 1
+            """,
+            (content_hash, EXTRACTOR_VERSION),
+        ).fetchone()
+        if donor is None:
+            return False
+        self._conn.execute(
+            """
+            INSERT INTO housing_listings (
+                corpus_id, chat_id, content_hash, posted_at,
+                is_rental_offer, is_vehicle_ad, bedrooms, bathrooms,
+                monthly_price_thb, price_note, tv_present, tv_size_class,
+                property_type, terrace, private_setting, nature_setting,
+                amenities_json, area_raw, evidence_quote, extractor_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(corpus_id) DO UPDATE SET
+                bedrooms = excluded.bedrooms,
+                bathrooms = excluded.bathrooms,
+                monthly_price_thb = excluded.monthly_price_thb,
+                price_note = excluded.price_note,
+                tv_present = excluded.tv_present,
+                tv_size_class = excluded.tv_size_class,
+                property_type = excluded.property_type,
+                terrace = excluded.terrace,
+                private_setting = excluded.private_setting,
+                nature_setting = excluded.nature_setting,
+                amenities_json = excluded.amenities_json,
+                area_raw = excluded.area_raw,
+                evidence_quote = excluded.evidence_quote,
+                extractor_version = excluded.extractor_version,
+                extracted_at = CURRENT_TIMESTAMP
+            """,
+            (
+                int(row["corpus_id"]),
+                int(row["chat_id"]),
+                content_hash,
+                str(row["date"]),
+                1,
+                donor["is_vehicle_ad"],
+                donor["bedrooms"],
+                donor["bathrooms"],
+                donor["monthly_price_thb"],
+                donor["price_note"],
+                donor["tv_present"],
+                donor["tv_size_class"],
+                donor["property_type"],
+                donor["terrace"],
+                donor["private_setting"],
+                donor["nature_setting"],
+                donor["amenities_json"],
+                donor["area_raw"],
+                donor["evidence_quote"],
+                EXTRACTOR_VERSION,
+            ),
+        )
+        self._settle(int(row["corpus_id"]), "extracted")
+        return True
 
     async def _extract_pack(self, pack: list[sqlite3.Row]) -> dict[int, Any] | None:
         """One request carrying several advertisements."""
@@ -287,10 +465,23 @@ class ListingExtractor:
         # The same corroboration the live path applies: a model that answers
         # "no television" for an advertisement that never mentions one is
         # reporting its own silence, not the property's.
+        text = str(row["text"] or "")
         tv_present, tv_size_class = televised(
-            str(row["text"] or ""),
+            text,
             present=_clean_raw_bool(answer.get("tv_present")),
             size_class=answer.get("tv_size_class"),
+        )
+        # The same fabrication guard the live path applies: a rejecting
+        # property type must be corroborated by the text.
+        claimed_type = answer.get("property_type")
+        if claimed_type not in {None, "house", "apartment", "room", "hotel"}:
+            claimed_type = None
+        property_type = property_typed(text, claimed=claimed_type)
+        raw_amenities = answer.get("amenities")
+        amenities = (
+            {name: True for name, value in raw_amenities.items() if value is True}
+            if isinstance(raw_amenities, dict)
+            else {}
         )
         self._conn.execute(
             """
@@ -298,9 +489,10 @@ class ListingExtractor:
                 corpus_id, chat_id, content_hash, posted_at,
                 is_rental_offer, is_vehicle_ad, bedrooms, bathrooms,
                 monthly_price_thb, price_note, tv_present, tv_size_class,
-                area_raw, evidence_quote, extractor_version
+                property_type, terrace, private_setting, nature_setting,
+                amenities_json, area_raw, evidence_quote, extractor_version
             )
-            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(corpus_id) DO UPDATE SET
                 bedrooms = excluded.bedrooms,
                 bathrooms = excluded.bathrooms,
@@ -308,6 +500,11 @@ class ListingExtractor:
                 price_note = excluded.price_note,
                 tv_present = excluded.tv_present,
                 tv_size_class = excluded.tv_size_class,
+                property_type = excluded.property_type,
+                terrace = excluded.terrace,
+                private_setting = excluded.private_setting,
+                nature_setting = excluded.nature_setting,
+                amenities_json = excluded.amenities_json,
                 area_raw = excluded.area_raw,
                 evidence_quote = excluded.evidence_quote,
                 extractor_version = excluded.extractor_version,
@@ -325,6 +522,11 @@ class ListingExtractor:
                 answer.get("price_note"),
                 _clean_bool(tv_present),
                 tv_size_class,
+                property_type,
+                1 if answer.get("terrace") is True else None,
+                1 if answer.get("private_setting") is True else None,
+                1 if answer.get("nature_setting") is True else None,
+                json.dumps(amenities, ensure_ascii=False) if amenities else None,
                 answer.get("area_raw"),
                 answer.get("evidence_quote"),
                 EXTRACTOR_VERSION,

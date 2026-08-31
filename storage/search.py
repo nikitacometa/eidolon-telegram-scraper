@@ -468,6 +468,24 @@ class SearchDatabase:
         The index is rebuildable in principle, but a rebuild re-pays for the
         whole extraction pass, so an in-place migration is worth the few lines.
         """
+        listing_columns = {
+            r["name"] for r in self.conn.execute("PRAGMA table_info(housing_listings)")
+        }
+        listing_migrations = {
+            "property_type": (
+                "ALTER TABLE housing_listings ADD COLUMN property_type TEXT"
+                " CHECK(property_type IN ('house', 'apartment', 'room', 'hotel'))"
+            ),
+            "terrace": "ALTER TABLE housing_listings ADD COLUMN terrace INTEGER",
+            "private_setting": ("ALTER TABLE housing_listings ADD COLUMN private_setting INTEGER"),
+            "nature_setting": "ALTER TABLE housing_listings ADD COLUMN nature_setting INTEGER",
+            "amenities_json": "ALTER TABLE housing_listings ADD COLUMN amenities_json TEXT",
+        }
+        for column, statement in listing_migrations.items():
+            if listing_columns and column not in listing_columns:
+                self.conn.execute(statement)
+                logger.info("Migration: added housing_listings.%s", column)
+
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(extraction_state)")}
         if "attempts" not in columns:
             self.conn.execute(
