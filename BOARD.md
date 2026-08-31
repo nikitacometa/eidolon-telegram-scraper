@@ -7,7 +7,7 @@
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-073**
+- Next available ID: **E-078**
 
 ---
 
@@ -37,11 +37,16 @@
 | E-060 | Monitor the PROEXPAT community chat | todo | medium | `-1002902498444` reached the corpus by recon sampling only: 394 messages, nothing after 2026-07-25, and it carries the one standing answer to "where are Russian books in Da Nang" — the community is assembling a lending library and takes donations. Not in `observed_chats`, so its next announcement is invisible. Join it or accept that this source is frozen |
 | E-066 | Phangan housing subsystem | done | critical | 2026-08-29: `pipeline/housing/` — album-aware content units, text extraction, tri-state matching (satisfied/violated/**unknown**), editable requirements with append-only revisions, own alert outbox. `dispatch: external` on the watcher skips the relevance ladder entirely. 794 tests; every guard mutant-checked |
 | E-067 | Read listing photographs | done | critical | Two of four criteria (bathrooms, TV size) are almost never in the text — 2.3% and 0%. Governed download on its own two budgets (live/backfill), one vision call per unit, visual counts treated as a LOWER bound so a photo can never reject a listing. Verdict upgrades send a second alert carrying the photo |
-| E-068 | Historical listings and price trend | in_progress | high | `index_cli.py housing-extract` / `housing-trend`. 1,176 listings extracted so far from the two joined housing chats (515 priced, 2025-05 to 2026-08). Trend gates on n>=20 monthly / n>=10 quarterly and counts a crosspost once; append-only snapshots record `n_chats_included` so a bucket that moves says why |
+| E-068 | Historical listings and price trend | done | high | 4,362 listings over 24 months (2024-08..2026-08), re-extracted under housing-text-v2 with property type, terrace/privacy/nature and amenities; crossposts (22%) answered once and copied. `housing-trend --persist` and `housing-extract` now run from systemd timers instead of human memory |
 | E-069 | Join the remaining 23 Phangan chats | in_progress | high | Queue holds 8 housing chats at 730 days and 15 general at 90, paced 6/day one per 2h. Joined so far: `rent_phangan` (8,219), `kohphanganrentals` (1,624). The rest land over ~4 days |
 | E-070 | Measure vision accuracy on real listing photos | todo | high | The only measured fact is that gpt-5.6-luna reads a synthetic 5-stripe PNG correctly. Before trusting bathroom counts at volume, hand-label 30-50 real Phangan listing photographs and compare |
-| E-071 | Requirements editing over the MCP bridge | todo | high | `HousingStore.save_requirements` has optimistic concurrency and validation; the bridge tools (`get/preview/update_housing_requirements`) are not written yet, so today an edit means a SQL statement |
-| E-072 | Retroactive re-match after a requirements change | todo | medium | `units_for_rematch` exists and is unwindowed by design; nothing calls it yet. A loosened budget should surface archive listings as one digest, not as hundreds of individual alerts |
+| E-071 | Requirements editing over the MCP bridge | done | high | `get/preview/update_housing_requirements` shipped; revision 3 (2026-09-01) asks for a standalone house, 2BR, 20-40k THB, with TV/terrace/privacy/nature as weighted soft preferences that never reject |
+| E-072 | Retroactive re-match after a requirements change | done | medium | The worker re-judges the retained archive when the persisted generation marker trails an edit (survives restarts), commits verdicts + digest + marker in ONE transaction, and reports newly admitted listings as a single digest message. First real run: revision 3 admitted 4 |
+| E-073 | Crash-recovery hardening | done | critical | 2026-08-31 audit: 25 daemon deaths in 2 days from `int(None)` on user forwards; media worker dead from birth (ledger CHECK); stuck units unswept; vision 'done' before its alert; join replay buried as FAILED; admin-approved joins never noticed. All fixed with mutant-checked tests; reconciliation freed `it_danang` after 33 days |
+| E-074 | Two-tier requirements: hard criteria + weighted preferences | done | critical | Hard (bedrooms, rent, property_type — reject only on confirmed violation) vs soft (tv, terrace, private_setting, nature_setting — weighted 0-100 score in every alert). property_type guarded against fabrication like televised(): a rejecting claim needs the vocabulary in the text, and mixed house+condo wording stays unknown |
+| E-075 | Value-for-money rating over the archive | done | high | `housing-deals` CLI + `get_housing_deals` MCP tool: price vs the median of comparables (type x bedrooms x season pooled across years, min bucket 10, fallback ladder), quality = the same preference score alerts use. Judged by the ACTIVE revision; hard-miss excluded; priceless listings shown unranked |
+| E-076 | Housing retention | done | medium | Settled units and delivered alerts age out with the 30-day window (cascades take members/facts/matches/media), so the rematch sweep stays bounded |
+| E-077 | Validate the deals ranking against the owner's taste | todo | medium | Show the top-20 by value and ask which he would actually visit; adjust weights via preferences before trusting the score in digests |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
 
