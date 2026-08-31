@@ -525,3 +525,62 @@ async def test_requeueing_a_failed_chat_revives_it(scout: ScoutDatabase) -> None
     assert queued is not None
     assert queued.state is JoinQueueState.PENDING
     assert queued.attempts == 2  # settle counted one, the revival bumped past it
+
+
+async def test_a_flooded_invite_check_moves_to_a_fresh_key(
+    scout: ScoutDatabase, db: Database
+) -> None:
+    """A FloodWait on the re-check settles its reservation; re-using the key
+    would replay it forever and the invite request would wedge."""
+
+    class FloodThenAlready:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, CheckChatInviteRequest)
+            self.calls += 1
+            if self.calls == 1:
+                raise errors.FloodWaitError(request=None, capture=1)
+            return SimpleNamespace(chat=INVITE_CHANNEL)  # no request_needed
+
+    # Manufacture the ChatInviteAlready shape the crawler looks for.
+    class ChatInviteAlready(SimpleNamespace):
+        pass
+
+    class FloodThenMember:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, request: object) -> object:
+            assert isinstance(request, CheckChatInviteRequest)
+            self.calls += 1
+            if self.calls == 1:
+                raise errors.FloodWaitError(request=None, capture=1)
+            return ChatInviteAlready(chat=INVITE_CHANNEL, request_needed=False)
+
+    client = FloodThenMember()
+    worker = _worker_with_dialogs(scout, db, client, {})
+    await scout.enqueue_join(chat_ref="https://t.me/+SecretHash123")
+    ref = (await scout.join_queue())[0].chat_ref
+    await scout.settle_queued_join(
+        ref, state=JoinQueueState.REQUESTED, error="awaiting_admin_approval"
+    )
+
+    # First reconcile: flood — the attempt must be spent regardless.
+    await worker.reconcile()
+    queue = await scout.join_queue()
+    assert queue[0].attempts == 2  # settle counted 1, the flooded check bumped past it
+
+    async with scout.conn.execute(
+        "UPDATE join_queue SET not_before = NULL WHERE chat_ref = ?", (ref,)
+    ):
+        pass
+    await scout.conn.execute("DELETE FROM account_cooldowns")
+    await scout.conn.commit()
+
+    # Second reconcile runs under a fresh key and reaches Telegram.
+    resolved = await worker.reconcile()
+    assert client.calls == 2
+    assert resolved == 1
+    assert (await scout.join_queue())[0].state is JoinQueueState.JOINED

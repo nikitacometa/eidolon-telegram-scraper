@@ -239,13 +239,16 @@ class JoinWorker:
                 )
                 resolved += 1
                 continue
-            # Still unanswered; ask again no sooner than the recheck window,
-            # and spend the attempt so the next check gets its own key.
+            # Still unanswered; ask again no sooner than the recheck window.
+            # The attempt is spent on every outcome except a pure budget
+            # denial: a check that reached Telegram (or found a reservation
+            # already there, REPLAYED included) must move to a fresh key, or
+            # the next reconciliation replays it forever and the row wedges.
             await self._scout.defer_queued_join(
                 queued.chat_ref,
                 seconds=INVITE_RECHECK_SECONDS,
                 error=queued.last_error,
-                count_attempt=result.ok,
+                count_attempt=result.denial is None,
             )
         if resolved:
             logger.info("Join reconciliation resolved %d row(s)", resolved)
