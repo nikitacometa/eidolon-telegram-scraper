@@ -1407,7 +1407,7 @@ async def test_vision_status_stays_pending_until_the_alert_is_queued(
     async def crash(**kwargs: object) -> None:
         raise Killed
 
-    monkeypatch.setattr(store, "enqueue_alert", crash)
+    monkeypatch.setattr(store, "record_match_with_alert", crash)
     vision = FakeVision(
         VisionReading(
             bathrooms_visible_min=2,
@@ -1487,3 +1487,53 @@ async def test_photo_requests_are_capped_at_what_vision_reads(store: HousingStor
         row = await cursor.fetchone()
     assert row is not None
     assert row[0] == 6
+
+
+async def test_a_vision_verdict_and_its_alert_land_together(
+    store: HousingStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A death inside the verdict write must not leave a recorded verdict
+    whose alert never existed — the retry would then see 'nothing changed'
+    and the owner would never hear about the upgrade."""
+    key = await _unit_with_photo(
+        store,
+        tmp_path,
+        HousingFacts(
+            is_rental_offer=True,
+            is_vehicle_ad=False,
+            bedrooms=2,
+            monthly_price_thb=30000,
+        ),
+    )
+    await store.claim_due_alerts(lease_owner="drain")
+
+    class Killed(BaseException):
+        pass
+
+    real_execute = store._conn.execute
+
+    async def sabotaged(sql: str, *args: object, **kwargs: object) -> object:
+        # Die exactly between the two writes of the one transaction.
+        if "INSERT INTO housing_alerts" in sql:
+            raise Killed
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(store._conn, "execute", sabotaged)
+    vision = FakeVision(
+        VisionReading(
+            bathrooms_visible_min=2,
+            tv_size_class="large",
+            tv_present=True,
+            confidence=0.9,
+        )
+    )
+    with pytest.raises(Killed):
+        await HousingVisionWorker(store=store, extractor=vision).run_once()
+    monkeypatch.setattr(store._conn, "execute", real_execute)
+
+    # Neither write survived: the pass rolled back whole, so the retry will
+    # compare against the OLD verdict and queue the upgrade alert properly.
+    match = await store.latest_match(key)
+    assert match is not None
+    assert match["verdict"] == Verdict.POSSIBLE.value
+    assert key in await store.units_awaiting_vision()

@@ -447,6 +447,83 @@ class HousingStore:
             )
             await self._conn.commit()
 
+    async def record_match_with_alert(
+        self,
+        *,
+        unit_key: str,
+        requirements_revision: int,
+        verdict: Verdict,
+        field_verdicts: dict[str, Any],
+        alert: dict[str, Any] | None,
+    ) -> int | None:
+        """Store a verdict and its alert in one transaction.
+
+        The verdict and the alert it justifies must land together: committed
+        separately, a death between the two writes leaves a recorded verdict
+        whose alert never existed — and a retry that compares against the
+        recorded verdict concludes nothing changed and never sends it.
+
+        ``alert`` carries enqueue_alert's keyword arguments (minus the unit
+        key and revision); None records the verdict alone. Returns the alert
+        id, or None when there was no alert to queue or it deduplicated.
+        """
+        async with self._write_lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT INTO housing_matches (
+                        unit_key, requirements_revision, verdict, field_verdicts_json
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(unit_key, requirements_revision) DO UPDATE SET
+                        verdict = excluded.verdict,
+                        field_verdicts_json = excluded.field_verdicts_json,
+                        computed_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        unit_key,
+                        requirements_revision,
+                        verdict.value,
+                        json.dumps(field_verdicts, ensure_ascii=False),
+                    ),
+                )
+                alert_id: int | None = None
+                if alert is not None:
+                    photo_paths = alert.get("photo_paths")
+                    cursor = await self._conn.execute(
+                        """
+                        INSERT INTO housing_alerts (
+                            unit_key, chat_id, chat_title, telegram_msg_id,
+                            requirements_revision, verdict, kind, body_html,
+                            photo_paths_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(unit_key, verdict, kind) DO NOTHING
+                        RETURNING id
+                        """,
+                        (
+                            unit_key,
+                            alert["chat_id"],
+                            alert.get("chat_title"),
+                            alert["telegram_msg_id"],
+                            requirements_revision,
+                            Verdict(alert["verdict"]).value,
+                            AlertKind(alert["kind"]).value,
+                            alert["body_html"],
+                            json.dumps(photo_paths, ensure_ascii=False)
+                            if photo_paths
+                            else None,
+                        ),
+                    )
+                    row = await cursor.fetchone()
+                    alert_id = int(row[0]) if row is not None else None
+                await self._conn.commit()
+            except BaseException:
+                await self._conn.rollback()
+                raise
+        return alert_id
+
     # ------------------------------------------------------------------
     # Alerts
     # ------------------------------------------------------------------

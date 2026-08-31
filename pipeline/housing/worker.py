@@ -107,24 +107,27 @@ class HousingWorker:
         await self._store.set_unit_state(unit.unit_key, UnitState.MATCHING)
         revision, requirements = await self._active_requirements()
         result = match_requirements(row, requirements)
-        await self._store.record_match(
+        alert = None
+        if result.verdict is not Verdict.HARD_MISS:
+            alert = {
+                "chat_id": unit.chat_id,
+                "chat_title": None,
+                "telegram_msg_id": unit.members[0].telegram_msg_id if unit.members else 0,
+                "verdict": result.verdict,
+                "kind": AlertKind.LIVE,
+                "body_html": render_alert(unit, row, result),
+            }
+        # One transaction: a verdict without its alert must not survive a
+        # death between two separate commits.
+        await self._store.record_match_with_alert(
             unit_key=unit.unit_key,
             requirements_revision=revision,
             verdict=result.verdict,
             field_verdicts=result.as_dict(),
+            alert=alert,
         )
 
         if result.verdict is not Verdict.HARD_MISS:
-            await self._store.enqueue_alert(
-                unit_key=unit.unit_key,
-                chat_id=unit.chat_id,
-                chat_title=None,
-                telegram_msg_id=unit.members[0].telegram_msg_id if unit.members else 0,
-                requirements_revision=revision,
-                verdict=result.verdict,
-                kind=AlertKind.LIVE,
-                body_html=render_alert(unit, row, result),
-            )
             # Photographs are asked for AFTER the alert is queued, never
             # before. A listing whose bathrooms are unstated is worth telling
             # the owner about immediately; waiting for a download would delay
@@ -426,41 +429,45 @@ class HousingVisionWorker:
             return
         revision, requirements = active
         result = match_requirements(merged, requirements)
-        await self._store.record_match(
+
+        alert = None
+        if result.verdict.value != previous_verdict:
+            # An unchanged verdict sends nothing: the photographs added detail
+            # but changed nothing the owner has to act on, and repeating a
+            # verdict trains him to ignore these messages. The comparison is
+            # against the verdict read BEFORE this pass wrote anything, and
+            # the verdict and its alert are committed together below — so an
+            # interrupted pass either recorded both or neither, and the retry
+            # compares against the right thing either way.
+            if result.verdict is Verdict.HARD_MISS:
+                body = (
+                    "<b>🏠 Отбой по объявлению</b>\nПо фото видно, что не подходит:\n"
+                    + "\n".join(
+                        f"❌ {_label(field.field)}: {html.escape(field.detail)}"
+                        for field in result.fields
+                        if field.state is FieldState.VIOLATED
+                    )
+                )
+                verdict_for_alert = Verdict.POSSIBLE
+            else:
+                body = render_alert(unit, merged, result, photos_read=len(paths))
+                verdict_for_alert = result.verdict
+            alert = {
+                "chat_id": unit.chat_id,
+                "chat_title": None,
+                "telegram_msg_id": unit.members[0].telegram_msg_id if unit.members else 0,
+                "verdict": verdict_for_alert,
+                "kind": AlertKind.UPDATE,
+                "body_html": body,
+                "photo_paths": paths[:3] if result.verdict is not Verdict.HARD_MISS else None,
+            }
+
+        await self._store.record_match_with_alert(
             unit_key=unit_key,
             requirements_revision=revision,
             verdict=result.verdict,
             field_verdicts=result.as_dict(),
-        )
-
-        if result.verdict.value == previous_verdict:
-            # The photographs added detail but changed nothing the owner has
-            # to act on. Sending the same verdict twice trains him to ignore
-            # these messages, which is how a working filter becomes useless.
-            await finalize()
-            return
-
-        if result.verdict is Verdict.HARD_MISS:
-            body = "<b>🏠 Отбой по объявлению</b>\nПо фото видно, что не подходит:\n" + "\n".join(
-                f"❌ {_label(field.field)}: {html.escape(field.detail)}"
-                for field in result.fields
-                if field.state is FieldState.VIOLATED
-            )
-            verdict_for_alert = Verdict.POSSIBLE
-        else:
-            body = render_alert(unit, merged, result, photos_read=len(paths))
-            verdict_for_alert = result.verdict
-
-        await self._store.enqueue_alert(
-            unit_key=unit_key,
-            chat_id=unit.chat_id,
-            chat_title=None,
-            telegram_msg_id=unit.members[0].telegram_msg_id if unit.members else 0,
-            requirements_revision=revision,
-            verdict=verdict_for_alert,
-            kind=AlertKind.UPDATE,
-            body_html=body,
-            photo_paths=paths[:3] if result.verdict is not Verdict.HARD_MISS else None,
+            alert=alert,
         )
         await finalize()
 
