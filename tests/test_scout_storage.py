@@ -936,3 +936,48 @@ async def test_legacy_ledger_learns_media_download_kinds(tmp_path: Path) -> None
         assert [tuple(row) for row in survivors] == [("join", "succeeded")]
     finally:
         await database.close()
+
+
+async def test_rebuilt_ledger_keeps_its_budget_index(tmp_path: Path) -> None:
+    """The rename drags idx_actions_budget to the legacy table and the drop
+    destroys it there; the migration must put it back on the new table."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE telegram_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('join', 'history_page')),
+            idempotency_key TEXT NOT NULL UNIQUE,
+            job_id TEXT,
+            candidate_id INTEGER,
+            outcome TEXT NOT NULL DEFAULT 'reserved',
+            flood_wait_seconds INTEGER,
+            error_code TEXT,
+            duration_ms REAL,
+            reserved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            settled_at TIMESTAMP
+        );
+        CREATE INDEX idx_actions_budget
+            ON telegram_actions(account_id, kind, reserved_at);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database = ScoutDatabase(db_path)
+    await database.connect()
+    try:
+        indexed = await (
+            await database.conn.execute(
+                "SELECT tbl_name FROM sqlite_master"
+                " WHERE type='index' AND name='idx_actions_budget'"
+            )
+        ).fetchone()
+        assert indexed is not None
+        assert indexed[0] == "telegram_actions"
+    finally:
+        await database.close()

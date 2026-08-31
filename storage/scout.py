@@ -129,6 +129,10 @@ class ScoutDatabase:
                 "INSERT INTO telegram_actions SELECT * FROM telegram_actions_legacy"
             )
             await self._conn.execute("DROP TABLE telegram_actions_legacy")
+            # The rename dragged idx_actions_budget along to the legacy table,
+            # where the DROP destroyed it; IF NOT EXISTS skipped the name while
+            # it was still taken. Re-running the schema now recreates it.
+            await self._conn.executescript(SCOUT_SCHEMA_PATH.read_text())
             logger.info("Migration: rebuilt telegram_actions with media download kinds")
         await self._conn.commit()
         logger.info("Scout database connected: %s", self.db_path)
