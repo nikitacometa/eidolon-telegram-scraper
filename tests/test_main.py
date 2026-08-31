@@ -288,3 +288,55 @@ async def test_summary_failure_is_isolated_per_watcher() -> None:
     app.summarizer.summarize.assert_awaited_once()
     assert app.summarizer.summarize.await_args.kwargs["watcher_name"] == "healthy-watch"
     app.dispatcher.send_summary.assert_awaited_once()
+
+
+async def test_forward_from_a_person_is_captured_not_fatal() -> None:
+    """A person's forward carries channel_post=None on the header itself.
+
+    getattr's default never applies to an attribute that exists with value
+    None, and int(None) raised straight through the ingress path — measured
+    on prod 2026-08-31: 25 daemon deaths in two days, all this line.
+    """
+    app = Eidolon.__new__(Eidolon)
+    app.scout = MagicMock()
+    app.scout.store_message = AsyncMock()
+    event = SimpleNamespace(
+        text="переслал объявление",
+        message=SimpleNamespace(
+            id=11,
+            date="2026-08-31 09:00:00+00:00",
+            sender_id=42,
+            fwd_from=SimpleNamespace(from_id=SimpleNamespace(user_id=99), channel_post=None),
+            reply_to=None,
+        ),
+    )
+
+    await app._capture_scout_message(event, -100555)
+
+    stored = app.scout.store_message.await_args.args[0]
+    assert stored.forward_chat_id is None
+    assert stored.forward_message_id is None
+    assert stored.telegram_msg_id == 11
+
+
+async def test_channel_forward_keeps_its_source_ids() -> None:
+    """The channel case still records where the forward came from."""
+    app = Eidolon.__new__(Eidolon)
+    app.scout = MagicMock()
+    app.scout.store_message = AsyncMock()
+    event = SimpleNamespace(
+        text="repost",
+        message=SimpleNamespace(
+            id=12,
+            date="2026-08-31 09:00:00+00:00",
+            sender_id=42,
+            fwd_from=SimpleNamespace(from_id=SimpleNamespace(channel_id=777), channel_post=345),
+            reply_to=None,
+        ),
+    )
+
+    await app._capture_scout_message(event, -100555)
+
+    stored = app.scout.store_message.await_args.args[0]
+    assert stored.forward_chat_id == 777
+    assert stored.forward_message_id == 345

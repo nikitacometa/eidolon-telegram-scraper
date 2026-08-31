@@ -609,6 +609,10 @@ class Eidolon:
         message = event.message
         forward = getattr(message, "fwd_from", None)
         forward_peer = getattr(forward, "from_id", None)
+        # A forward from a person carries channel_post=None — the attribute
+        # exists, so getattr's default never applies and int(None) would raise.
+        forward_chat_id = getattr(forward_peer, "channel_id", None) if forward_peer else None
+        forward_message_id = getattr(forward, "channel_post", None) if forward else None
         await self.scout.store_message(
             ScoutMessage(
                 chat_id=chat_id,
@@ -616,12 +620,8 @@ class Eidolon:
                 date=str(message.date),
                 text=event.text or None,
                 sender_id=int(message.sender_id) if message.sender_id is not None else None,
-                forward_chat_id=(
-                    int(getattr(forward_peer, "channel_id", 0)) or None if forward_peer else None
-                ),
-                forward_message_id=(
-                    int(getattr(forward, "channel_post", 0)) or None if forward else None
-                ),
+                forward_chat_id=int(forward_chat_id) if forward_chat_id else None,
+                forward_message_id=int(forward_message_id) if forward_message_id else None,
                 reply_to_message_id=reply_to_message_id(message),
                 source="live",
             )

@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS telegram_actions (
     kind TEXT NOT NULL
         CHECK(kind IN (
             'join', 'hashtag_search', 'fulltext_search', 'contacts_search', 'global_search',
-            'recommendations', 'resolve_username', 'invite_check', 'history_page'
+            'recommendations', 'resolve_username', 'invite_check', 'history_page',
+            'media_download_live', 'media_download_backfill'
         )),
     idempotency_key TEXT NOT NULL UNIQUE,
     job_id TEXT REFERENCES recon_jobs(id) ON DELETE SET NULL,

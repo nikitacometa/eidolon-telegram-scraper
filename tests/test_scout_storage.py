@@ -875,3 +875,64 @@ def test_identity_requires_at_least_one_alias() -> None:
     """A chat with no locator at all cannot be tracked."""
     with pytest.raises(ValueError):
         ChatIdentity()
+
+
+async def test_legacy_ledger_learns_media_download_kinds(tmp_path: Path) -> None:
+    """A database created before the media kinds must accept them after connect.
+
+    The kind CHECK cannot be altered in place, so connect() rebuilds the
+    table. Measured on prod 2026-08-31: without this every media reservation
+    raised IntegrityError and the download worker never ran once.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE telegram_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            kind TEXT NOT NULL
+                CHECK(kind IN (
+                    'join', 'hashtag_search', 'fulltext_search', 'contacts_search',
+                    'global_search', 'recommendations', 'resolve_username',
+                    'invite_check', 'history_page'
+                )),
+            idempotency_key TEXT NOT NULL UNIQUE,
+            job_id TEXT,
+            candidate_id INTEGER,
+            outcome TEXT NOT NULL DEFAULT 'reserved'
+                CHECK(outcome IN ('reserved', 'succeeded', 'failed', 'flood_wait', 'ambiguous')),
+            flood_wait_seconds INTEGER,
+            error_code TEXT,
+            duration_ms REAL,
+            reserved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            settled_at TIMESTAMP
+        );
+        INSERT INTO telegram_actions (account_id, kind, idempotency_key, outcome)
+        VALUES ('owner-primary', 'join', 'historic-join-1', 'succeeded');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database = ScoutDatabase(db_path)
+    await database.connect()
+    try:
+        granted = await database.reserve_action(
+            account_id="owner-primary",
+            kind=ActionKind.MEDIA_DOWNLOAD_LIVE,
+            idempotency_key="media-1",
+            policy={ActionKind.MEDIA_DOWNLOAD_LIVE: BudgetRule(per_hour=100, per_day=800)},
+        )
+        assert isinstance(granted, ActionReservation)
+        survivors = await (
+            await database.conn.execute(
+                "SELECT kind, outcome FROM telegram_actions WHERE idempotency_key = ?",
+                ("historic-join-1",),
+            )
+        ).fetchall()
+        assert [tuple(row) for row in survivors] == [("join", "succeeded")]
+    finally:
+        await database.close()

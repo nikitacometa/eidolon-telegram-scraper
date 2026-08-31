@@ -111,6 +111,25 @@ class ScoutDatabase:
                 "ALTER TABLE scout_messages ADD COLUMN reply_to_message_id INTEGER"
             )
             logger.info("Migration: added scout_messages.reply_to_message_id")
+        ledger_sql = await (
+            await self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='telegram_actions'"
+            )
+        ).fetchone()
+        if ledger_sql and "media_download_live" not in ledger_sql[0]:
+            # The kind CHECK predates the media download kinds, and a CHECK
+            # cannot be altered in place: every media reservation on such a
+            # database raises IntegrityError and the worker never runs.
+            # Rebuild the table; nothing in the schema references it by FK.
+            await self._conn.execute(
+                "ALTER TABLE telegram_actions RENAME TO telegram_actions_legacy"
+            )
+            await self._conn.executescript(SCOUT_SCHEMA_PATH.read_text())
+            await self._conn.execute(
+                "INSERT INTO telegram_actions SELECT * FROM telegram_actions_legacy"
+            )
+            await self._conn.execute("DROP TABLE telegram_actions_legacy")
+            logger.info("Migration: rebuilt telegram_actions with media download kinds")
         await self._conn.commit()
         logger.info("Scout database connected: %s", self.db_path)
 
