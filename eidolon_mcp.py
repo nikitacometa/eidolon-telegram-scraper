@@ -260,6 +260,31 @@ class EidolonTools:
         )
         return status
 
+    async def get_housing_deals(
+        self,
+        *,
+        bedrooms: int | None = None,
+        days: int | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        from pipeline.housing.rating import rate_listings
+
+        report = rate_listings(
+            self._search.conn,
+            bedrooms=bedrooms,
+            days=days,
+            limit=max(1, min(limit, MAX_LIMIT)),
+        )
+        report["note"] = (
+            "Ranked over the deduplicated two-year archive. value_discount_pct is the "
+            "asking price against the median of COMPARABLE listings (same property "
+            "type, bedrooms, season-of-year pooled across years); positive = cheaper "
+            "than typical. quality_score is the same weighted preference score the "
+            "live alerts show. Listings violating a hard criterion are excluded; "
+            "listings without a price are listed unranked rather than hidden."
+        )
+        return report
+
     async def find_chat_candidates(
         self, *, min_mentions: int = 2, limit: int = 25, include_known: bool = False
     ) -> dict[str, Any]:
@@ -1085,6 +1110,30 @@ WRITE_TOOLS = [
                 "label": {"type": ["string", "null"]},
             },
             "required": ["chat_id"],
+        },
+    ),
+    Tool(
+        name="get_housing_deals",
+        description=(
+            "Rank the two-year Koh Phangan listing archive by value for money. Each "
+            "entry carries quality_score (weighted preferences: TV, terrace, privacy, "
+            "nature), value_discount_pct against the median of comparable listings "
+            "(same type, bedrooms, season), the comparable bucket and its size. Use "
+            "for 'какие сейчас выгодные варианты' and 'сколько обычно стоит такой дом'."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "bedrooms": {
+                    "type": ["integer", "null"],
+                    "description": "Only listings with this stated bedroom count.",
+                },
+                "days": {
+                    "type": ["integer", "null"],
+                    "description": "Only listings posted within the last N days.",
+                },
+                "limit": {"type": "integer", "default": 20},
+            },
         },
     ),
     Tool(

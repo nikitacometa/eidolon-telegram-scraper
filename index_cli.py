@@ -25,6 +25,7 @@ import sys
 
 from config.settings import settings
 from pipeline.housing.history import ListingExtractor, price_trend
+from pipeline.housing.rating import rate_listings
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
 from storage.db import Database
 from storage.search import (
@@ -94,6 +95,16 @@ async def _dispatch(args: argparse.Namespace) -> int:
             reseeded = extractor.reseed_stale() if args.reseed_stale else 0
             run = await extractor.run(limit=args.limit)
             print(json.dumps({"seeded": seeded, "reseeded": reseeded, **run.as_dict()}, indent=2))
+            return 0
+
+        if args.command == "housing-deals":
+            report = rate_listings(
+                search.conn,
+                bedrooms=args.bedrooms,
+                days=args.days,
+                limit=args.limit,
+            )
+            print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0
 
         if args.command == "housing-trend":
@@ -230,6 +241,11 @@ def main() -> int:
         action="store_true",
         help="re-queue listings extracted under an older extractor version",
     )
+
+    p_deals = sub.add_parser("housing-deals", help="rank extracted listings by value and quality")
+    p_deals.add_argument("--bedrooms", type=int, default=None)
+    p_deals.add_argument("--days", type=int, default=None, help="only listings this recent")
+    p_deals.add_argument("--limit", type=int, default=20)
 
     p_trend = sub.add_parser("housing-trend", help="price series over extracted listings")
     p_trend.add_argument("--period", choices=["month", "quarter"], default="month")
