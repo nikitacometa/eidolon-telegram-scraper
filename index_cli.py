@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import logging
 import sys
 
@@ -91,7 +92,21 @@ async def _dispatch(args: argparse.Namespace) -> int:
 
         if args.command == "housing-extract":
             extractor = ListingExtractor(search.conn)
-            seeded = extractor.seed(args.chat_id or [])
+            chat_ids = args.chat_id or []
+            if not chat_ids:
+                # Unattended runs seed whatever the daemon treats as a
+                # rentals board; naming chats by hand is for one-off pulls.
+                with sqlite3.connect(
+                    f"file:{settings.db_path}?mode=ro", uri=True, timeout=15.0
+                ) as live:
+                    chat_ids = [
+                        int(row[0])
+                        for row in live.execute(
+                            "SELECT chat_id FROM housing_chat_kinds"
+                            " WHERE kind = 'dedicated_housing'"
+                        )
+                    ]
+            seeded = extractor.seed(chat_ids)
             reseeded = extractor.reseed_stale() if args.reseed_stale else 0
             run = await extractor.run(limit=args.limit)
             print(json.dumps({"seeded": seeded, "reseeded": reseeded, **run.as_dict()}, indent=2))

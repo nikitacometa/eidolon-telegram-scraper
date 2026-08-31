@@ -1,0 +1,10 @@
+[Unit]
+Description=Persist the housing price trend once a day
+
+[Timer]
+OnCalendar=*-*-* 03:10:00 UTC
+AccuracySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

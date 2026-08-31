@@ -1,0 +1,13 @@
+[Unit]
+Description=Extract housing listings every 30 minutes
+
+[Timer]
+# Wall-clock for the same reason as eidolon-index.timer: boot-relative
+# triggers die of old age on a long-lived host.
+OnCalendar=*:7/30
+AccuracySec=60s
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

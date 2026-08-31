@@ -1,0 +1,14 @@
+[Unit]
+Description=Extract fresh housing listings from the archive
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/eidolon-telegram
+ExecStart=%h/eidolon-telegram/.venv/bin/python index_cli.py housing-extract --limit 300
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+# Shares the index lock with the build tick: whichever runs second skips
+# and the next tick picks the work up. A failure costs staleness, not data.
+Nice=10
+TimeoutStartSec=1200

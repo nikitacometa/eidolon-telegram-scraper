@@ -1,0 +1,13 @@
+[Unit]
+Description=Persist the housing price trend series
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/eidolon-telegram
+ExecStart=%h/eidolon-telegram/.venv/bin/python index_cli.py housing-trend --period month --persist
+ExecStart=%h/eidolon-telegram/.venv/bin/python index_cli.py housing-trend --period quarter --persist
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Nice=10
+TimeoutStartSec=600
