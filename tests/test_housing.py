@@ -1712,7 +1712,7 @@ def test_a_mixed_vocabulary_listing_cannot_be_rejected_on_its_type() -> None:
 
 
 def test_a_room_offered_inside_a_house_still_rejects() -> None:
-    """"Комната в общем доме" mentions both vocabularies, but the meaning is
+    """ "Комната в общем доме" mentions both vocabularies, but the meaning is
     unambiguous: the house is the container, the offer is the room."""
     from pipeline.housing.extractor import property_typed
 
