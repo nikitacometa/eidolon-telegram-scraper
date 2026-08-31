@@ -511,9 +511,7 @@ class HousingStore:
                             Verdict(alert["verdict"]).value,
                             AlertKind(alert["kind"]).value,
                             alert["body_html"],
-                            json.dumps(photo_paths, ensure_ascii=False)
-                            if photo_paths
-                            else None,
+                            json.dumps(photo_paths, ensure_ascii=False) if photo_paths else None,
                         ),
                     )
                     row = await cursor.fetchone()

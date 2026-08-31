@@ -224,9 +224,7 @@ class JoinWorker:
             )
             outcome = result.value if result.ok else None
             if outcome is not None and outcome.membership is ChatMembership.MEMBER:
-                chat_id = (
-                    await self._chat_id_of(outcome.chat) if outcome.chat is not None else None
-                )
+                chat_id = await self._chat_id_of(outcome.chat) if outcome.chat is not None else None
                 if chat_id is not None:
                     await self._activate(queued, chat_id)
                     resolved += 1

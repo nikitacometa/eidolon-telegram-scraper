@@ -1474,8 +1474,9 @@ async def test_photo_requests_are_capped_at_what_vision_reads(store: HousingStor
     worker = HousingWorker(
         store=store,
         extractor=FakeExtractor(
-            HousingFacts(is_rental_offer=True, is_vehicle_ad=False, bedrooms=2,
-                         monthly_price_thb=30000)
+            HousingFacts(
+                is_rental_offer=True, is_vehicle_ad=False, bedrooms=2, monthly_price_thb=30000
+            )
         ),
     )
     await worker.run_once()
