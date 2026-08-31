@@ -213,6 +213,16 @@ HOUSE_MENTION = re.compile(
     r"|\bhouse\b|\bбичхаус|\bbeach\s*house",
     re.IGNORECASE,
 )
+# "Комната в (общем) доме" is the one mixed-vocabulary construction whose
+# meaning is unambiguous: the house word names the container, the offer is
+# the room. Requires the room word to come first and the house word within
+# the same clause, so "дом с 3 комнатами" (a house, described by its rooms)
+# does not match.
+ROOM_IN_HOUSE = re.compile(
+    r"(\bкомнат\w*[^.\n!?]{0,40}\b(в|на)\b[^.\n!?]{0,30}(\bдом|\bвилл|\bhouse|\bvilla))"
+    r"|(\b(room|bedroom)\b[^.\n!?]{0,40}\bin\b[^.\n!?]{0,30}(house|villa))",
+    re.IGNORECASE,
+)
 
 
 def property_typed(text: str | None, *, claimed: str | None) -> str | None:
@@ -231,7 +241,12 @@ def property_typed(text: str | None, *, claimed: str | None) -> str | None:
     """
     if claimed not in {"apartment", "room", "hotel"}:
         return claimed
-    if text and NON_HOUSE_MENTION.search(text) and not HOUSE_MENTION.search(text):
+    if not text:
+        return None
+    if claimed == "room" and ROOM_IN_HOUSE.search(text):
+        # The house word names the container; the offer is the room.
+        return claimed
+    if NON_HOUSE_MENTION.search(text) and not HOUSE_MENTION.search(text):
         return claimed
     return None
 

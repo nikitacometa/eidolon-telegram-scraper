@@ -1709,3 +1709,19 @@ def test_a_mixed_vocabulary_listing_cannot_be_rejected_on_its_type() -> None:
 
     assert mixed is None
     assert clean == "apartment"
+
+
+def test_a_room_offered_inside_a_house_still_rejects() -> None:
+    """"Комната в общем доме" mentions both vocabularies, but the meaning is
+    unambiguous: the house is the container, the offer is the room."""
+    from pipeline.housing.extractor import property_typed
+
+    ru = property_typed("Сдаётся комната в общем доме на Шритану", claimed="room")
+    en = property_typed("Private room in our shared villa, 8000 THB", claimed="room")
+    house_of_rooms = property_typed("Сдаю дом с 3 комнатами", claimed="room")
+
+    assert ru == "room"
+    assert en == "room"
+    # A house described by its room count is not a room offer; the guard
+    # refuses the fabrication-prone reading.
+    assert house_of_rooms is None
