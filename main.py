@@ -428,13 +428,6 @@ class Eidolon:
         self._agent_watcher_task = None
         self._joiner_task = None
         self._discovery_task = None
-        # A recovery pass the owner's reply started writes to both databases;
-        # it must finish or be cancelled before the connections close under it.
-        for recovery in list(self._recovery_tasks):
-            recovery.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await recovery
-        self._recovery_tasks.clear()
 
         # Stop ingress before draining the bounded queue. A message committed
         # just before disconnect already has durable pending watcher jobs.
@@ -443,6 +436,14 @@ class Eidolon:
                 await self.client.disconnect()
             except Exception:
                 logger.exception("Telegram disconnect failed during shutdown")
+        # Only now, with ingress stopped, can no further owner reply arrive
+        # to start another one: a recovery pass writes to both databases and
+        # must finish or be cancelled before the connections close under it.
+        for recovery in list(self._recovery_tasks):
+            recovery.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await recovery
+        self._recovery_tasks.clear()
 
         if self._summary_task is not None:
             self._summary_task.cancel()
@@ -523,7 +524,11 @@ class Eidolon:
         never delays the update that carried it.
         """
         try:
-            if self._owner_recovery is None or not is_owner_reply(event, settings.pantheon_chat_id):
+            if (
+                self._owner_recovery is None
+                or self._shutdown_event.is_set()
+                or not is_owner_reply(event, settings.pantheon_chat_id)
+            ):
                 return
             task = asyncio.create_task(self._owner_recovery.owner_wrote(), name="owner-recovery")
             self._recovery_tasks.add(task)
