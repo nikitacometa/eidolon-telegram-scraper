@@ -64,6 +64,29 @@ class AlertKind(StrEnum):
     LIVE = "live"
     UPDATE = "update"
     DIGEST = "digest"
+    # A listing the owner was already told about, sent again in the current
+    # format and against the current requirements, dated as a ledger entry.
+    REPLAY = "replay"
+
+
+class ForwardStatus(StrEnum):
+    """What became of the original advertisement behind a delivered report."""
+
+    PENDING = "pending"
+    FORWARDED = "forwarded"
+    COPIED = "copied"
+    UNAVAILABLE = "unavailable"
+    SKIPPED = "skipped"
+    BOT_FALLBACK = "bot_fallback"
+
+
+@dataclass(frozen=True, slots=True)
+class UnitOrigin:
+    """Where and when an advertisement was posted, for the owner's ledger."""
+
+    posted_at: datetime | None
+    chat_title: str | None
+    sender_name: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,22 +568,25 @@ class HousingStore:
         kind: AlertKind,
         body_html: str,
         photo_paths: list[str] | None = None,
+        delay_seconds: int = 0,
     ) -> int | None:
         """Queue an alert, or return None when this verdict was already sent.
 
         Deduplication is on (unit, verdict, kind): re-running the matcher over
         the same facts must not re-notify, while a genuine upgrade from
         ``possible`` to ``confirmed`` is a different verdict and therefore a
-        new alert.
+        new alert. ``delay_seconds`` holds the row back, which is how a replay
+        of many listings is spread out in the order the owner should read it.
         """
         async with self._write_lock:
             cursor = await self._conn.execute(
                 """
                 INSERT INTO housing_alerts (
                     unit_key, chat_id, chat_title, telegram_msg_id,
-                    requirements_revision, verdict, kind, body_html, photo_paths_json
+                    requirements_revision, verdict, kind, body_html, photo_paths_json,
+                    next_attempt_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, ?))
                 ON CONFLICT(unit_key, verdict, kind) DO NOTHING
                 RETURNING id
                 """,
@@ -574,6 +600,7 @@ class HousingStore:
                     kind.value,
                     body_html,
                     json.dumps(photo_paths, ensure_ascii=False) if photo_paths else None,
+                    f"+{max(0, int(delay_seconds))} seconds",
                 ),
             )
             row = await cursor.fetchone()
@@ -639,10 +666,22 @@ class HousingStore:
         delivered: bool,
         error: str | None = None,
         retry_in_seconds: int | None = None,
+        count_attempt: bool = True,
     ) -> None:
-        """Record a delivery outcome, scheduling a retry when one is wanted."""
+        """Record a delivery outcome, scheduling a retry when one is wanted.
+
+        ``count_attempt=False`` reschedules without spending an attempt: the
+        governor's pace said "not yet", and a wait is not a failure.
+        """
         async with self._write_lock:
-            if delivered:
+            if not delivered and retry_in_seconds is not None and not count_attempt:
+                await self._conn.execute(
+                    "UPDATE housing_alerts SET delivery_status = 'pending',"
+                    " next_attempt_at = datetime(CURRENT_TIMESTAMP, ?),"
+                    " claimed_until = NULL, lease_owner = NULL, last_error = ? WHERE id = ?",
+                    (f"+{retry_in_seconds} seconds", error, alert_id),
+                )
+            elif delivered:
                 await self._conn.execute(
                     "UPDATE housing_alerts SET delivery_status = 'delivered',"
                     " attempts = attempts + 1,"
@@ -666,6 +705,119 @@ class HousingStore:
                     (f"+{retry_in_seconds} seconds", error, alert_id),
                 )
             await self._conn.commit()
+
+    async def mark_report_sent(self, alert_id: int, *, message_id: int) -> None:
+        """Record that the report reached the owner, before the forward is tried.
+
+        Committed on its own, deliberately: a crash anywhere after this write
+        resumes at the forward, and the owner never gets the same report twice.
+        """
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE housing_alerts SET report_message_id = ?,"
+                " report_sent_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (message_id, alert_id),
+            )
+            await self._conn.commit()
+
+    async def set_forward_status(
+        self, alert_id: int, status: ForwardStatus, *, error: str | None = None
+    ) -> None:
+        """Record what became of the original behind a report."""
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE housing_alerts SET forward_status = ?, forward_error = ? WHERE id = ?",
+                (status.value, error, alert_id),
+            )
+            await self._conn.commit()
+
+    async def report_message_id(
+        self, unit_key: str, *, exclude_alert_id: int | None = None
+    ) -> int | None:
+        """The owner-DM id of the most recent report about this unit, if any.
+
+        A follow-up (a verdict changed by photographs) replies to it, so the
+        owner sees which listing the update is about without a second forward.
+        ``exclude_alert_id`` leaves the caller's own row out, so an alert
+        resuming after a crash asks about the OTHER reports, not itself. Ids
+        of 0 ("sent, id unknown") are not reply targets and are skipped.
+        """
+        cursor = await self._conn.execute(
+            "SELECT report_message_id FROM housing_alerts"
+            " WHERE unit_key = ? AND report_message_id IS NOT NULL AND report_message_id > 0"
+            "   AND id <> COALESCE(?, -1)"
+            " ORDER BY report_sent_at DESC, id DESC LIMIT 1",
+            (unit_key, exclude_alert_id),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
+
+    async def unit_origin(self, unit_key: str) -> UnitOrigin:
+        """When, where and by whom the advertisement was posted.
+
+        Read from the retained message rows: the earliest member's date, and
+        the author and chat title from the member that carried the text (the
+        caption travels on one album member, not reliably the first). Falls
+        back to the unit's own creation time once the messages have aged out.
+        """
+        cursor = await self._conn.execute(
+            """
+            SELECT MIN(msg.date) AS posted_at
+            FROM housing_live_unit_messages m
+            JOIN messages msg ON msg.id = m.message_id
+            WHERE m.unit_key = ?
+            """,
+            (unit_key,),
+        )
+        row = await cursor.fetchone()
+        posted_raw = row["posted_at"] if row is not None else None
+        cursor = await self._conn.execute(
+            """
+            SELECT msg.chat_title, msg.sender_name
+            FROM housing_live_unit_messages m
+            JOIN messages msg ON msg.id = m.message_id
+            WHERE m.unit_key = ?
+            ORDER BY m.has_text DESC, m.ordinal
+            LIMIT 1
+            """,
+            (unit_key,),
+        )
+        who = await cursor.fetchone()
+        if posted_raw is None:
+            cursor = await self._conn.execute(
+                "SELECT created_at FROM housing_live_units WHERE unit_key = ?", (unit_key,)
+            )
+            created = await cursor.fetchone()
+            posted_raw = created[0] if created is not None else None
+        return UnitOrigin(
+            posted_at=_parse_timestamp(posted_raw),
+            chat_title=str(who["chat_title"]) if who is not None and who["chat_title"] else None,
+            sender_name=str(who["sender_name"]) if who is not None and who["sender_name"] else None,
+        )
+
+    async def alerted_units(self) -> list[dict[str, Any]]:
+        """Every unit the owner has been told about, with its first alert time.
+
+        Digests and synthetic keys are excluded: a replay is about listings,
+        and only a live or update alert names one.
+        """
+        cursor = await self._conn.execute(
+            """
+            SELECT unit_key, chat_id,
+                   MIN(CASE WHEN kind IN ('live', 'update') AND delivery_status = 'delivered'
+                            THEN created_at END) AS first_alert_at,
+                   -- Queued or delivered alike: a replay already in the
+                   -- outbox must not be planned a second time.
+                   SUM(CASE WHEN kind = 'replay' THEN 1 ELSE 0 END) AS replays
+            FROM housing_alerts
+            WHERE kind IN ('live', 'update', 'replay')
+              AND chat_id <> 0
+            GROUP BY unit_key
+            HAVING first_alert_at IS NOT NULL
+            ORDER BY first_alert_at
+            """
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     # ------------------------------------------------------------------
     # Requirements
@@ -1048,3 +1200,26 @@ class HousingStore:
                 (chat_id, kind),
             )
             await self._conn.commit()
+
+
+def _parse_timestamp(raw: Any) -> datetime | None:
+    """Read a stored timestamp as an aware UTC datetime.
+
+    Telethon dates are stored ISO-8601 with an offset; SQLite's own
+    CURRENT_TIMESTAMP is naive UTC in "YYYY-MM-DD HH:MM:SS" form. Both are
+    accepted, and a value that is neither is treated as unknown rather than
+    raised on: a ledger line reading "дата неизвестна" is better than an
+    alert that never goes out.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T", 1) if " " in text else text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)

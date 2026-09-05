@@ -299,6 +299,11 @@ CREATE TABLE IF NOT EXISTS housing_matches (
     PRIMARY KEY (unit_key, requirements_revision)
 );
 
+-- An alert is delivered in two steps: the report the daemon composed, then
+-- the original advertisement forwarded from the source chat. The two are
+-- separate Telegram calls, so the row records the first step's result
+-- (report_message_id) before the second begins — a retry after a crash
+-- between them resumes at the forward instead of sending the report twice.
 CREATE TABLE IF NOT EXISTS housing_alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     unit_key TEXT NOT NULL,
@@ -307,7 +312,10 @@ CREATE TABLE IF NOT EXISTS housing_alerts (
     telegram_msg_id INTEGER NOT NULL,
     requirements_revision INTEGER NOT NULL,
     verdict TEXT NOT NULL CHECK(verdict IN ('confirmed', 'possible')),
-    kind TEXT NOT NULL DEFAULT 'live' CHECK(kind IN ('live', 'update', 'digest')),
+    -- 'replay' re-sends a listing the owner was already told about, in the
+    -- current format and against the current requirements; it carries the
+    -- date of the first alert so the owner can read it as a ledger.
+    kind TEXT NOT NULL DEFAULT 'live' CHECK(kind IN ('live', 'update', 'digest', 'replay')),
     body_html TEXT NOT NULL,
     photo_paths_json TEXT,
     delivery_status TEXT NOT NULL DEFAULT 'pending'
@@ -318,7 +326,20 @@ CREATE TABLE IF NOT EXISTS housing_alerts (
     last_error TEXT,
     next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    delivered_at TIMESTAMP
+    delivered_at TIMESTAMP,
+    -- Telegram id of the report in the owner's DM, set the moment it is sent.
+    -- NULL means the report has not gone out; a retry checks this first.
+    report_message_id INTEGER,
+    report_sent_at TIMESTAMP,
+    -- What became of the original: forwarded as-is, copied (text plus the
+    -- photographs on disk) because the chat forbids forwarding or the message
+    -- is gone, unavailable when even the copy failed, skipped for kinds that
+    -- carry no original, bot_fallback when the owner DM was unreachable and
+    -- the report went through the bot with a link instead.
+    forward_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(forward_status IN ('pending', 'forwarded', 'copied', 'unavailable',
+                                 'skipped', 'bot_fallback')),
+    forward_error TEXT
 );
 
 -- One verdict per unit is delivered once. An upgrade from possible to

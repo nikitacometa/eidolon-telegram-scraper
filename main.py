@@ -37,6 +37,7 @@ from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.governor import TelegramActionGovernor
 from pipeline.housing.media import MediaDownloadWorker
+from pipeline.housing.owner_transport import OwnerTransport
 from pipeline.housing.vision import HousingVisionExtractor
 from pipeline.housing.worker import (
     HousingAlertDelivery,
@@ -333,10 +334,27 @@ class Eidolon:
                 HousingWorker(store=self.housing).run_forever(self._shutdown_event),
                 name="housing",
             )
+            # Housing reports go to the owner's DM from this account, followed
+            # by the original advertisement forwarded from the source chat —
+            # the bot cannot forward from a chat it is not in, and a t.me
+            # link into a chat the owner has not joined does not open. With
+            # no owner configured the bot path with a link remains.
+            owner = OwnerTransport(
+                client=self.client,
+                governor=self.governor,
+                owner_ref=settings.owner_username,
+            )
+            if owner.configured:
+                logger.info("Housing alerts: report + forward to the owner's DM")
+            else:
+                logger.warning(
+                    "OWNER_USERNAME is not set; housing alerts go through the bot with a link"
+                )
             self._housing_delivery_task = asyncio.create_task(
                 HousingAlertDelivery(
                     store=self.housing,
                     dispatcher=self.dispatcher,
+                    owner=owner,
                     lease_owner=f"housing-{id(self):x}",
                 ).run_forever(self._shutdown_event),
                 name="housing-delivery",

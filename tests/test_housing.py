@@ -761,7 +761,11 @@ async def test_a_delivered_alert_is_settled(store: HousingStore) -> None:
     ).run_once()
 
     assert sent == 1
-    assert dispatcher.sent == ["<b>listing</b>"]
+    # With no owner configured the bot path remains, and it appends the link
+    # at delivery time so the stored body stays format-neutral.
+    assert dispatcher.sent == [
+        '<b>listing</b>\n<a href="https://t.me/c/777/100">Открыть в Telegram</a>'
+    ]
     assert await store.claim_due_alerts(lease_owner="test") == []
 
 
@@ -836,7 +840,11 @@ async def test_the_alert_names_every_criterion_including_the_unknown_ones(
     assert "✅ терраса" in body
     assert "25 000 THB/мес" in body
     assert "Шритану" in body
-    assert "https://t.me/c/1199262612/100" in body
+    # The original is forwarded right after the report, so the report carries
+    # neither a quotation nor a link into a chat the owner cannot open.
+    assert "t.me" not in body
+    assert "<blockquote>" not in body
+    assert body.endswith("⬇️ Оригинал ниже")
 
 
 def test_extraction_ignores_a_nonsense_size_class() -> None:

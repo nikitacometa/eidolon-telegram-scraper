@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     pantheon_bot_token: str = ""
     pantheon_chat_id: int = 0
     eidolon_bot_token: str = ""  # Dedicated Eidolon bot (falls back to Pantheon)
+    # The owner's public @username. Housing alerts are delivered by the
+    # monitoring account itself into this DM — a report, then the original
+    # advertisement forwarded — because the bot is not a member of the source
+    # chats and Telegram will neither let it forward from them nor let the
+    # owner open a t.me link into a chat he is not in. Empty keeps housing on
+    # the bot path with a link, exactly as before.
+    owner_username: str = ""
 
     # Paths
     db_path: Path = Path("data/eidolon.db")

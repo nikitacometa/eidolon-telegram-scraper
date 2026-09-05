@@ -194,6 +194,19 @@ class TelegramActionGovernor:
             errors.ChannelPrivateError,
             errors.ChatAdminRequiredError,
             errors.PremiumAccountRequiredError,
+            # Owner delivery: the source forbids forwarding, the message is
+            # gone, or the owner cannot be written to. Each is final for this
+            # call and says nothing about the account's standing, so it
+            # settles as a rejection the caller can act on rather than as an
+            # ambiguous attempt that propagates and kills the delivery loop.
+            errors.ChatForwardsRestrictedError,
+            errors.MessageIdInvalidError,
+            errors.MediaEmptyError,
+            errors.UserIsBlockedError,
+            errors.UserPrivacyRestrictedError,
+            errors.PeerIdInvalidError,
+            errors.InputUserDeactivatedError,
+            errors.ChatWriteForbiddenError,
         ) as error:
             duration_ms = (time.monotonic() - started) * 1000
             code = type(error).__name__

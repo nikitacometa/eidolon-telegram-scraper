@@ -11,6 +11,7 @@
     python3 index_cli.py refs             # unjoined chats mentioned in the corpus
     python3 index_cli.py backfill-replies --limit 5000
     python3 index_cli.py reply-stats [--chat-id -100123]
+    python3 index_cli.py housing-replay --dry-run   # re-send every alerted listing
 
 Safe to interrupt: every stage tracks its own cursor and resumes.
 """
@@ -27,8 +28,10 @@ import sys
 from config.settings import settings
 from pipeline.housing.history import ListingExtractor, price_trend
 from pipeline.housing.rating import rate_listings
+from pipeline.housing.replay import plan_replay, queue_replay
 from pipeline.indexer import EmbeddingIndexer, PlaceExtractor, build_index
 from storage.db import Database
+from storage.housing import HousingStore
 from storage.search import (
     REEXTRACTABLE_STATUSES,
     SearchDatabase,
@@ -81,6 +84,26 @@ async def _dispatch(args: argparse.Namespace) -> int:
         finally:
             await database.close()
         print(json.dumps(reply_report.as_dict(), indent=2))
+        return 0
+
+    if args.command == "housing-replay":
+        # Writes the LIVE outbox: the daemon's delivery loop sends the rows,
+        # paced and checkpointed, so nothing here talks to Telegram.
+        database = Database(settings.db_path)
+        await database.connect()
+        try:
+            store = HousingStore(database.conn, database.write_lock)
+            plan = await plan_replay(store)
+            queued = 0 if args.dry_run else await queue_replay(store, plan)
+        finally:
+            await database.close()
+        print(
+            json.dumps(
+                {"dry_run": bool(args.dry_run), "queued": queued, **plan.as_dict()},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     with SearchDatabase(settings.search_db_path) as search:
@@ -255,6 +278,14 @@ def main() -> int:
         "--reseed-stale",
         action="store_true",
         help="re-queue listings extracted under an older extractor version",
+    )
+
+    p_replay = sub.add_parser(
+        "housing-replay",
+        help="queue every alerted listing again as report + forwarded original",
+    )
+    p_replay.add_argument(
+        "--dry-run", action="store_true", help="print the plan without writing the outbox"
     )
 
     p_deals = sub.add_parser("housing-deals", help="rank extracted listings by value and quality")

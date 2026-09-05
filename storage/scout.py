@@ -116,10 +116,17 @@ class ScoutDatabase:
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='telegram_actions'"
             )
         ).fetchone()
-        if ledger_sql and "media_download_live" not in ledger_sql[0]:
-            # The kind CHECK predates the media download kinds, and a CHECK
-            # cannot be altered in place: every media reservation on such a
-            # database raises IntegrityError and the worker never runs.
+        missing_kinds = [
+            kind.value
+            for kind in ActionKind
+            if ledger_sql is not None and f"'{kind.value}'" not in str(ledger_sql[0])
+        ]
+        if missing_kinds:
+            # The kind CHECK predates some action kinds, and a CHECK cannot be
+            # altered in place: every reservation of a missing kind raises
+            # IntegrityError and the worker behind it never runs. This has
+            # happened once already (the media download kinds), so the test is
+            # now "every kind the code knows is in the CHECK", not one name.
             # Rebuild the table; nothing in the schema references it by FK.
             await self._conn.execute(
                 "ALTER TABLE telegram_actions RENAME TO telegram_actions_legacy"
@@ -133,7 +140,9 @@ class ScoutDatabase:
             # where the DROP destroyed it; IF NOT EXISTS skipped the name while
             # it was still taken. Re-running the schema now recreates it.
             await self._conn.executescript(SCOUT_SCHEMA_PATH.read_text())
-            logger.info("Migration: rebuilt telegram_actions with media download kinds")
+            logger.info(
+                "Migration: rebuilt telegram_actions with kinds %s", ", ".join(missing_kinds)
+            )
         await self._conn.commit()
         logger.info("Scout database connected: %s", self.db_path)
 

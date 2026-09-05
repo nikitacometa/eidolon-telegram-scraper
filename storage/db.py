@@ -208,6 +208,7 @@ class Database:
                 "UPDATE housing_requirements_active SET rematched_generation = generation"
             )
             logger.info("Migration: added housing_requirements_active.rematched_generation")
+        await self._rebuild_housing_alerts_if_needed()
         fact_migrations = {
             "property_type": (
                 "ALTER TABLE housing_live_facts ADD COLUMN property_type TEXT"
@@ -431,6 +432,84 @@ class Database:
             logger.info("Migration: added filter_stats.accepted")
 
         await self.conn.commit()
+
+    # The columns a pre-forward housing_alerts table has, in its order. Copied
+    # by name so the rebuild cannot depend on positional luck.
+    _LEGACY_HOUSING_ALERT_COLUMNS = (
+        "id, unit_key, chat_id, chat_title, telegram_msg_id, requirements_revision, verdict,"
+        " kind, body_html, photo_paths_json, delivery_status, attempts, claimed_until,"
+        " lease_owner, last_error, next_attempt_at, created_at, delivered_at"
+    )
+
+    async def _rebuild_housing_alerts_if_needed(self) -> None:
+        """Give housing_alerts the 'replay' kind and the two-step delivery columns.
+
+        A CHECK constraint cannot be altered in place, so a table whose kind
+        list predates 'replay' is rebuilt: renamed aside, recreated from the
+        schema, rows copied by column name, the old table dropped. The two
+        indexes travel with the rename and keep their names, which would make
+        the schema's IF NOT EXISTS skip recreating them on the new table, so
+        they are dropped first. A crash in the middle leaves the renamed
+        table behind; the next connect notices it and finishes the copy
+        rather than starting a fresh, empty outbox next to the stranded rows.
+        """
+        legacy = await (
+            await self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='housing_alerts_legacy'"
+            )
+        ).fetchone()
+        current = await (
+            await self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='housing_alerts'"
+            )
+        ).fetchone()
+        if legacy is None and current is not None and "'replay'" in str(current[0]):
+            await self._add_housing_alert_columns()
+            return
+        if legacy is None:
+            await self.conn.execute("ALTER TABLE housing_alerts RENAME TO housing_alerts_legacy")
+            await self.conn.execute("DROP INDEX IF EXISTS idx_housing_alerts_dedup")
+            await self.conn.execute("DROP INDEX IF EXISTS idx_housing_alerts_due")
+            await self.conn.commit()
+        # executescript commits and recreates housing_alerts with its indexes.
+        await self.conn.executescript(SCHEMA_PATH.read_text())
+        columns = self._LEGACY_HOUSING_ALERT_COLUMNS
+        await self.conn.execute(
+            f"INSERT OR IGNORE INTO housing_alerts ({columns})"  # noqa: S608 - fixed column list
+            f" SELECT {columns} FROM housing_alerts_legacy"
+        )
+        # Everything already delivered went out through the bot, before the
+        # forward step existed; 'pending' would read as a forward still owed.
+        await self.conn.execute(
+            "UPDATE housing_alerts SET forward_status = 'skipped'"
+            " WHERE delivery_status <> 'pending' AND forward_status = 'pending'"
+        )
+        await self.conn.execute("DROP TABLE housing_alerts_legacy")
+        await self.conn.commit()
+        logger.info("Migration: rebuilt housing_alerts with the replay kind and forward columns")
+
+    async def _add_housing_alert_columns(self) -> None:
+        """Add the two-step delivery columns to a table that already knows 'replay'."""
+        columns = {
+            row[1]
+            for row in await (
+                await self.conn.execute("PRAGMA table_info(housing_alerts)")
+            ).fetchall()
+        }
+        statements = {
+            "report_message_id": "ALTER TABLE housing_alerts ADD COLUMN report_message_id INTEGER",
+            "report_sent_at": "ALTER TABLE housing_alerts ADD COLUMN report_sent_at TIMESTAMP",
+            "forward_status": (
+                "ALTER TABLE housing_alerts ADD COLUMN forward_status TEXT NOT NULL"
+                " DEFAULT 'pending' CHECK(forward_status IN ('pending', 'forwarded', 'copied',"
+                " 'unavailable', 'skipped', 'bot_fallback'))"
+            ),
+            "forward_error": "ALTER TABLE housing_alerts ADD COLUMN forward_error TEXT",
+        }
+        for column, statement in statements.items():
+            if column not in columns:
+                await self.conn.execute(statement)
+                logger.info("Migration: added housing_alerts.%s", column)
 
     async def close(self) -> None:
         """Close the database connection."""

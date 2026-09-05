@@ -130,6 +130,12 @@ class ActionKind(StrEnum):
     # that starvation impossible rather than merely unlikely.
     MEDIA_DOWNLOAD_LIVE = "media_download_live"
     MEDIA_DOWNLOAD_BACKFILL = "media_download_backfill"
+    # Talking to the owner: a housing report sent to his DM, and the forward
+    # of the original advertisement that follows it. Separate from every
+    # crawl kind because a paused crawl must never silence an alert, and a
+    # burst of alerts must never eat the history budget.
+    OWNER_MESSAGE = "owner_message"
+    OWNER_FORWARD = "owner_forward"
 
     @property
     def is_mutating(self) -> bool:
@@ -211,6 +217,12 @@ DEFAULT_BUDGET_POLICY: dict[ActionKind, BudgetRule] = {
     # ceilings are what to watch and retune once there is a week of telemetry.
     ActionKind.MEDIA_DOWNLOAD_LIVE: BudgetRule(per_hour=100, per_day=800),
     ActionKind.MEDIA_DOWNLOAD_BACKFILL: BudgetRule(per_hour=60, per_day=1000),
+    # Messages to the owner's own DM. The interval is the load-bearing part:
+    # a replay of the whole archive is thirty-odd sends, and two seconds
+    # apart is the pace of a person forwarding by hand rather than a burst.
+    # Both kinds share one pace because they alternate on the wire.
+    ActionKind.OWNER_MESSAGE: BudgetRule(per_hour=120, per_day=600, min_interval_seconds=2),
+    ActionKind.OWNER_FORWARD: BudgetRule(per_hour=120, per_day=600, min_interval_seconds=2),
 }
 
 
