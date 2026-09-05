@@ -37,7 +37,7 @@ from pipeline.embeddings import EmbeddingFilter
 from pipeline.filters import RuleFilter
 from pipeline.governor import TelegramActionGovernor
 from pipeline.housing.media import MediaDownloadWorker
-from pipeline.housing.owner_transport import OwnerTransport
+from pipeline.housing.owner_transport import OwnerRecovery, OwnerTransport, is_owner_reply
 from pipeline.housing.vision import HousingVisionExtractor
 from pipeline.housing.worker import (
     HousingAlertDelivery,
@@ -150,6 +150,11 @@ class Eidolon:
         self._housing_delivery_task: asyncio.Task[None] | None = None
         self._housing_media_task: asyncio.Task[None] | None = None
         self._housing_vision_task: asyncio.Task[None] | None = None
+        # Built with the housing subsystem; None until then. The owner's
+        # reply in the DM lifts a PEER_FLOOD pause and re-queues what fell
+        # back to the bot meanwhile.
+        self._owner_recovery: OwnerRecovery | None = None
+        self._recovery_tasks: set[asyncio.Task[int | None]] = set()
         self.governor = TelegramActionGovernor(scout=self.scout)
         self.crawler = TelegramCrawler(client=self.client, governor=self.governor)
         self.backfill = BackfillWorker(
@@ -349,6 +354,11 @@ class Eidolon:
             )
             if owner.configured:
                 logger.info("Housing alerts: report + forward to the owner's DM")
+                self._owner_recovery = OwnerRecovery(
+                    scout=self.scout,
+                    store=self.housing,
+                    account_id=self.governor.account_id,
+                )
             else:
                 logger.warning(
                     "OWNER_USERNAME is not set; housing alerts go through the bot with a link"
@@ -481,6 +491,7 @@ class Eidolon:
 
         @self.client.on(events.NewMessage)  # type: ignore[untyped-decorator]
         async def on_new_message(event: NewMessageEvent) -> None:
+            self._notice_owner_reply(event)
             try:
                 work_item = await self._ingest_update(event)
                 if work_item is not None:
@@ -494,6 +505,24 @@ class Eidolon:
                 self._fatal_ingress_error = error
                 self._shutdown_event.set()
                 logger.critical("Durable Telegram ingress failed; stopping daemon", exc_info=True)
+
+    def _notice_owner_reply(self, event: object) -> None:
+        """Kick off a recovery pass when the owner writes into the DM.
+
+        Deliberately outside the ingest try/except and never raising: the
+        ingest path treats an exception as a durable-ingress failure and
+        stops the daemon, and nothing about the owner saying "ok" is worth
+        that. The pass itself runs as its own task so a slow database write
+        never delays the update that carried it.
+        """
+        try:
+            if self._owner_recovery is None or not is_owner_reply(event, settings.pantheon_chat_id):
+                return
+            task = asyncio.create_task(self._owner_recovery.owner_wrote(), name="owner-recovery")
+            self._recovery_tasks.add(task)
+            task.add_done_callback(self._recovery_tasks.discard)
+        except Exception:
+            logger.exception("Owner reply check failed")
 
     async def _message_worker(self, worker_id: int) -> None:
         """Process queued Telegram updates with bounded concurrency."""

@@ -26,10 +26,13 @@ from storage.housing import AlertKind, HousingStore, UnitOrigin, Verdict
 
 logger = logging.getLogger(__name__)
 
-# Seconds between consecutive replayed listings in the outbox. The governor
-# paces the wire anyway; this keeps the reports in posted order even when two
-# delivery cycles overlap, because the outbox claims by next_attempt_at.
-REPLAY_SPACING_SECONDS = 6
+# Seconds between consecutive replayed listings in the outbox. Two messages
+# per listing, so this is ten seconds per message — measured 2026-09-05: the
+# six-second version, roughly three seconds per message, earned PEER_FLOOD on
+# the 17th message to a DM the owner had never written to. It also keeps the
+# reports in posted order when two delivery cycles overlap, because the outbox
+# claims by next_attempt_at.
+REPLAY_SPACING_SECONDS = 20
 
 
 @dataclass(frozen=True, slots=True)

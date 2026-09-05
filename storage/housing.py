@@ -809,6 +809,46 @@ class HousingStore:
             sender_name=str(who["sender_name"]) if who is not None and who["sender_name"] else None,
         )
 
+    async def reopen_fallback_alerts(self, *, spacing_seconds: int = 20) -> int:
+        """Queue again every alert whose original never reached the owner's DM.
+
+        Two shapes qualify: a report that went through the bot with a link
+        because the DM was unreachable (the DM never saw it — it starts over),
+        and a report that did land but whose original could be neither
+        forwarded nor copied (it resumes at the forward). Rows are spaced out
+        so the resend is paced like the first attempt. Returns the count.
+        """
+        cursor = await self._conn.execute(
+            """
+            SELECT id FROM housing_alerts
+            WHERE delivery_status = 'delivered'
+              AND kind <> 'digest'
+              AND forward_status IN ('bot_fallback', 'unavailable')
+            ORDER BY id
+            """
+        )
+        ids = [int(row[0]) for row in await cursor.fetchall()]
+        async with self._write_lock:
+            for index, alert_id in enumerate(ids, start=1):
+                await self._conn.execute(
+                    """
+                    UPDATE housing_alerts
+                    SET delivery_status = 'pending',
+                        forward_status = 'pending',
+                        forward_error = NULL,
+                        attempts = 0,
+                        claimed_until = NULL,
+                        lease_owner = NULL,
+                        last_error = NULL,
+                        delivered_at = NULL,
+                        next_attempt_at = datetime(CURRENT_TIMESTAMP, ?)
+                    WHERE id = ?
+                    """,
+                    (f"+{index * spacing_seconds} seconds", alert_id),
+                )
+            await self._conn.commit()
+        return len(ids)
+
     async def alerted_units(self) -> list[dict[str, Any]]:
         """Every unit the owner has been told about, with its first alert time.
 

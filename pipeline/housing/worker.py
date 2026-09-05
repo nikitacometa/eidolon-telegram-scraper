@@ -739,6 +739,16 @@ class HousingAlertDelivery:
             return DeliveryResult.success()
         if copied.status is SendStatus.RETRY:
             return _retry(copied)
+        if copied.status is SendStatus.UNREACHABLE:
+            # Same as an unreachable forward: the report went through moments
+            # ago, so this is a pause (PEER_FLOOD, a halt), not a verdict on
+            # the copy. Come back when the owner's reply has lifted it.
+            return DeliveryResult(
+                sent=False,
+                retryable=True,
+                error_code=copied.error_code or "owner_unreachable",
+                retry_after=300,
+            )
         await self._abandon_original(alert, reason=forwarded.error_code, report_id=int(report_id))
         return DeliveryResult.success()
 

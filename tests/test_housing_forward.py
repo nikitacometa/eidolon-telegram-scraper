@@ -20,7 +20,13 @@ import pytest
 from telethon import errors
 
 from pipeline.governor import TelegramActionGovernor
-from pipeline.housing.owner_transport import OwnerTransport, SendOutcome, SendStatus
+from pipeline.housing.owner_transport import (
+    OwnerRecovery,
+    OwnerTransport,
+    SendOutcome,
+    SendStatus,
+    is_owner_reply,
+)
 from pipeline.housing.replay import plan_replay, queue_replay, render_replay_header
 from pipeline.housing.requirements import DEFAULT_REQUIREMENTS, match_requirements
 from pipeline.housing.worker import (
@@ -1299,3 +1305,172 @@ async def test_alerts_migrated_from_the_bot_era_read_as_skipped_not_owed(tmp_pat
 
 def test_photo_paths_json_survives_the_bot_fallback() -> None:
     assert json.loads(json.dumps(["a"])) == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# PEER_FLOOD: the owner's reply is what lifts it
+# ---------------------------------------------------------------------------
+
+
+async def test_a_spam_limit_while_writing_to_the_owner_pauses_owner_talk_not_the_crawl(
+    scout: ScoutDatabase,
+) -> None:
+    """Measured 2026-09-05: PEER_FLOOD on the 17th message to a DM the owner
+    had never written to. That is about the conversation, not the archive."""
+    from pipeline.governor import ActionStatus
+
+    governor = TelegramActionGovernor(scout=scout)
+
+    async def flooded() -> str:
+        raise errors.PeerFloodError(request=None)
+
+    result = await governor.run(ActionKind.OWNER_MESSAGE, "owner-flood", flooded)
+    assert result.status is ActionStatus.HALTED
+
+    async def fine() -> str:
+        return "ok"
+
+    forward = await governor.run(ActionKind.OWNER_FORWARD, "owner-fwd", fine)
+    page = await governor.run(ActionKind.HISTORY_PAGE, "page-after", fine)
+    assert forward.status is ActionStatus.HALTED
+    assert page.ok
+    scopes = sorted(c["scope"] for c in await scout.active_cooldowns(account_id="owner-primary"))
+    assert scopes == ["owner_forward", "owner_message"]
+
+
+async def test_reopening_fallback_alerts_targets_only_what_the_dm_never_got(
+    db: Database, store: HousingStore
+) -> None:
+    key = await _album_unit(db, store)
+    live = await _queue_live_alert(store, key)
+    bot = FakeBot()
+    # Went through the bot: the DM never saw a report.
+    owner = FakeOwner(reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="PeerFloodError")])
+    await HousingAlertDelivery(store=store, dispatcher=bot, owner=owner, lease_owner="t").run_once()
+    assert (await _row(store, live))["forward_status"] == ForwardStatus.BOT_FALLBACK.value
+    digest = await store.enqueue_alert(
+        unit_key="rematch:1",
+        chat_id=0,
+        chat_title=None,
+        telegram_msg_id=0,
+        requirements_revision=1,
+        verdict=Verdict.POSSIBLE,
+        kind=AlertKind.DIGEST,
+        body_html="d",
+    )
+    assert digest is not None
+    await store.settle_alert(digest, delivered=True)
+
+    reopened = await store.reopen_fallback_alerts(spacing_seconds=0)
+
+    assert reopened == 1
+    row = await _row(store, live)
+    assert row["delivery_status"] == "pending"
+    assert row["forward_status"] == ForwardStatus.PENDING.value
+    assert row["attempts"] == 0
+    assert row["report_message_id"] is None
+    assert (await _row(store, digest))["delivery_status"] == "delivered"
+    # Delivered again, this time as report + forward into the DM.
+    healthy = FakeOwner()
+    assert (
+        await HousingAlertDelivery(
+            store=store, dispatcher=bot, owner=healthy, lease_owner="t"
+        ).run_once()
+        == 1
+    )
+    assert len(healthy.forwarded) == 1
+    assert (await _row(store, live))["forward_status"] == ForwardStatus.FORWARDED.value
+
+
+async def test_a_report_that_lost_its_original_resumes_at_the_forward_when_reopened(
+    db: Database, store: HousingStore
+) -> None:
+    key = await _album_unit(db, store)
+    alert_id = await _queue_live_alert(store, key)
+    owner = FakeOwner(
+        forwards=[SendOutcome(SendStatus.REJECTED, error_code="MessageIdInvalidError")],
+        copies=[SendOutcome(SendStatus.UNREACHABLE, error_code="PeerFloodError")],
+    )
+    delivery = HousingAlertDelivery(store=store, dispatcher=FakeBot(), owner=owner, lease_owner="t")
+    await delivery.run_once()
+    row = await _row(store, alert_id)
+    assert row["delivery_status"] == "pending"  # copy unreachable is a retry, not a close
+
+    # Give up path: force the attempts over the cap so it closes as unavailable.
+    async with store._write_lock:  # noqa: SLF001
+        await store._conn.execute(  # noqa: SLF001
+            "UPDATE housing_alerts SET attempts = 10, next_attempt_at = CURRENT_TIMESTAMP"
+            " WHERE id = ?",
+            (alert_id,),
+        )
+        await store._conn.commit()  # noqa: SLF001
+    owner._forwards = [SendOutcome(SendStatus.RETRY, error_code="telegram_network_error")]
+    await delivery.run_once()
+    row = await _row(store, alert_id)
+    assert row["forward_status"] == ForwardStatus.UNAVAILABLE.value
+    report_id = row["report_message_id"]
+    assert report_id
+
+    assert await store.reopen_fallback_alerts(spacing_seconds=0) == 1
+    healthy = FakeOwner()
+    assert (
+        await HousingAlertDelivery(
+            store=store, dispatcher=FakeBot(), owner=healthy, lease_owner="t"
+        ).run_once()
+        == 1
+    )
+    assert healthy.sent_reports == []  # the report already stands in the DM
+    assert len(healthy.forwarded) == 1
+    assert (await _row(store, alert_id))["report_message_id"] == report_id
+
+
+def test_only_an_incoming_private_message_from_the_owner_counts_as_a_reply() -> None:
+    owner_id = 424242
+    incoming = SimpleNamespace(
+        is_private=True, message=SimpleNamespace(sender_id=owner_id, out=False)
+    )
+    outgoing = SimpleNamespace(
+        is_private=True, message=SimpleNamespace(sender_id=owner_id, out=True)
+    )
+    stranger = SimpleNamespace(is_private=True, message=SimpleNamespace(sender_id=1, out=False))
+    group = SimpleNamespace(
+        is_private=False, message=SimpleNamespace(sender_id=owner_id, out=False)
+    )
+
+    assert is_owner_reply(incoming, owner_id)
+    assert not is_owner_reply(outgoing, owner_id)
+    assert not is_owner_reply(stranger, owner_id)
+    assert not is_owner_reply(group, owner_id)
+    assert not is_owner_reply(incoming, 0)
+
+
+async def test_the_owners_reply_lifts_the_owner_pause_and_requeues_the_fallbacks(
+    db: Database, store: HousingStore, scout: ScoutDatabase
+) -> None:
+    key = await _album_unit(db, store)
+    live = await _queue_live_alert(store, key)
+    bot = FakeBot()
+    owner = FakeOwner(reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="PeerFloodError")])
+    await HousingAlertDelivery(store=store, dispatcher=bot, owner=owner, lease_owner="t").run_once()
+    for scope in ("owner_message", "owner_forward"):
+        await scout.set_cooldown(
+            account_id="owner-primary",
+            scope=scope,
+            seconds=3600,
+            reason="PeerFloodError",
+            manual_resume_required=True,
+        )
+    # A FloodWait the crawl earned is not the owner's to lift.
+    await scout.set_cooldown(
+        account_id="owner-primary", scope="history_page", seconds=3600, reason="flood_wait_900s"
+    )
+    recovery = OwnerRecovery(scout=scout, store=store, account_id="owner-primary")
+
+    reopened = await recovery.owner_wrote()
+
+    assert reopened == 1
+    left = sorted(c["scope"] for c in await scout.active_cooldowns(account_id="owner-primary"))
+    assert left == ["history_page"]
+    assert (await _row(store, live))["delivery_status"] == "pending"
+    # A second reply within the throttle window does nothing more.
+    assert await recovery.owner_wrote() is None

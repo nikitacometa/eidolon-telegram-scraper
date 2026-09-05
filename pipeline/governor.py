@@ -41,6 +41,9 @@ FLOOD_COOLDOWN_MARGIN_SECONDS = 60
 # A call that takes this long without raising almost certainly slept through a
 # short FloodWait inside the library, which is otherwise invisible.
 HIDDEN_FLOOD_SUSPICION_MS = 5_000.0
+# The two kinds that talk to the owner. They share one fate under a spam
+# limit, and it is theirs alone.
+OWNER_KINDS = (ActionKind.OWNER_MESSAGE, ActionKind.OWNER_FORWARD)
 
 
 class ActionStatus(StrEnum):
@@ -296,6 +299,27 @@ class TelegramActionGovernor:
     ) -> ActionResult[T]:
         code = type(error).__name__
         await self._settle(reservation, ActionOutcome.FAILED, duration_ms, code)
+        if kind in OWNER_KINDS:
+            # PEER_FLOOD while writing to the owner is Telegram's limit on
+            # messaging a user who has not written back — a fact about that
+            # conversation, not about reading history or fetching a photo.
+            # Both owner kinds pause until the owner's reply lifts them (see
+            # OwnerRecovery); the crawl keeps going.
+            for scope in OWNER_KINDS:
+                await self._scout.set_cooldown(
+                    account_id=self._account_id,
+                    scope=scope.value,
+                    seconds=MANUAL_HALT_FLOOD_SECONDS,
+                    reason=code,
+                    manual_resume_required=True,
+                )
+            logger.error(
+                "Spam limitation on %s; owner messages paused until the owner writes back",
+                kind.value,
+            )
+            return ActionResult(
+                status=ActionStatus.HALTED, error_code=code, duration_ms=duration_ms
+            )
         # A spam limitation is about the account, not the endpoint, and it
         # escalates on repetition. Nothing automatic should touch Telegram
         # again until a human has looked at @SpamBot.

@@ -18,6 +18,7 @@ import secrets
 import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -1135,6 +1136,15 @@ class ScoutDatabase:
                 ),
             )
             await self.conn.commit()
+
+    async def active_cooldowns(self, *, account_id: str) -> list[dict[str, Any]]:
+        """Every pause currently in force for the account, with its reason."""
+        async with self.conn.execute(
+            "SELECT scope, reason, manual_resume_required, blocked_until FROM account_cooldowns"
+            " WHERE account_id = ? AND datetime(blocked_until) > CURRENT_TIMESTAMP",
+            (account_id,),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def clear_cooldown(self, *, account_id: str, scope: str) -> None:
         """Lift a pause, which for a safety halt only an operator may do."""

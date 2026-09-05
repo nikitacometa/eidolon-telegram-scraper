@@ -93,6 +93,10 @@ async def _dispatch(args: argparse.Namespace) -> int:
         await database.connect()
         try:
             store = HousingStore(database.conn, database.write_lock)
+            if args.redo_fallback:
+                reopened = await store.reopen_fallback_alerts()
+                print(json.dumps({"reopened": reopened}, indent=2))
+                return 0
             plan = await plan_replay(store)
             queued = 0 if args.dry_run else await queue_replay(store, plan)
         finally:
@@ -286,6 +290,11 @@ def main() -> int:
     )
     p_replay.add_argument(
         "--dry-run", action="store_true", help="print the plan without writing the outbox"
+    )
+    p_replay.add_argument(
+        "--redo-fallback",
+        action="store_true",
+        help="queue again every alert that went through the bot or lost its original",
     )
 
     p_deals = sub.add_parser("housing-deals", help="rank extracted listings by value and quality")
