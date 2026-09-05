@@ -54,6 +54,35 @@ PROPERTY_TYPES: tuple[str, ...] = ("house", "apartment", "room", "hotel")
 PREFERENCE_FIELDS: tuple[str, ...] = ("tv", "terrace", "private_setting", "nature_setting")
 DEFAULT_PREFERENCE_WEIGHT = 25
 
+# The owner reads the verdicts in Russian; the stored codes stay English.
+PROPERTY_TYPE_LABELS: dict[str, str] = {
+    "house": "дом",
+    "apartment": "квартира",
+    "room": "комната",
+    "hotel": "отель",
+}
+TV_CLASS_LABELS: dict[str, str] = {
+    "none": "нет",
+    "small": "маленький",
+    "medium": "средний",
+    "large": "большой",
+}
+
+
+def property_type_label(code: str) -> str:
+    """Russian name of a property type code, or the code itself when unknown."""
+    return PROPERTY_TYPE_LABELS.get(code, code)
+
+
+def tv_class_label(code: str) -> str:
+    """Russian name of a television size class, or the code itself when unknown."""
+    return TV_CLASS_LABELS.get(code, code)
+
+
+def format_thb(amount: int) -> str:
+    """Thousands separated by a thin space, the way prices read in the alerts."""
+    return f"{amount:,}".replace(",", " ")
+
 
 class FieldState(StrEnum):
     """How one criterion stands for one listing."""
@@ -294,14 +323,16 @@ def _property_type(facts: dict[str, Any], required: str) -> FieldVerdict:
     """
     value = facts.get("property_type")
     if value is None:
-        return FieldVerdict("property_type", FieldState.UNKNOWN, "not stated")
+        return FieldVerdict("property_type", FieldState.UNKNOWN, "не указан")
     if value == required:
-        return FieldVerdict("property_type", FieldState.SATISFIED, str(value))
+        return FieldVerdict("property_type", FieldState.SATISFIED, property_type_label(str(value)))
     source = str(facts.get("property_type_source") or "unknown")
+    stated = property_type_label(str(value))
+    wanted = property_type_label(required)
     if source == "text":
-        return FieldVerdict("property_type", FieldState.VIOLATED, f"{value} (want {required})")
+        return FieldVerdict("property_type", FieldState.VIOLATED, f"{stated} (нужен {wanted})")
     return FieldVerdict(
-        "property_type", FieldState.UNKNOWN, f"{value} per photos only (want {required})"
+        "property_type", FieldState.UNKNOWN, f"{stated} только по фото (нужен {wanted})"
     )
 
 
@@ -316,8 +347,8 @@ def _soft_presence(field: str, facts: dict[str, Any]) -> FieldVerdict:
     """
     value = facts.get(field)
     if value in (1, True):
-        return FieldVerdict(field, FieldState.SATISFIED, "claimed in the listing")
-    return FieldVerdict(field, FieldState.UNKNOWN, "not mentioned")
+        return FieldVerdict(field, FieldState.SATISFIED, "заявлено в объявлении")
+    return FieldVerdict(field, FieldState.UNKNOWN, "не упомянуто")
 
 
 def _at_least(field: str, value: Any, minimum: int, facts: dict[str, Any]) -> FieldVerdict:
@@ -329,17 +360,17 @@ def _at_least(field: str, value: Any, minimum: int, facts: dict[str, Any]) -> Fi
     "1 bedroom" they are describing the whole property.
     """
     if not isinstance(value, int) or isinstance(value, bool):
-        return FieldVerdict(field, FieldState.UNKNOWN, "not stated")
+        return FieldVerdict(field, FieldState.UNKNOWN, "не указано")
     if value >= minimum:
-        return FieldVerdict(field, FieldState.SATISFIED, f"{value} (need {minimum}+)")
+        return FieldVerdict(field, FieldState.SATISFIED, f"{value} (нужно {minimum}+)")
     source = str(facts.get(f"{field}_source") or "unknown")
     if source == "vision":
         return FieldVerdict(
             field,
             FieldState.UNKNOWN,
-            f"photos show {value}, which is a lower bound (need {minimum}+)",
+            f"на фото {value}, это нижняя граница (нужно {minimum}+)",
         )
-    return FieldVerdict(field, FieldState.VIOLATED, f"{value} (need {minimum}+)")
+    return FieldVerdict(field, FieldState.VIOLATED, f"{value} (нужно {minimum}+)")
 
 
 def _tv(facts: dict[str, Any], minimum_class: str) -> FieldVerdict:
@@ -353,33 +384,52 @@ def _tv(facts: dict[str, Any], minimum_class: str) -> FieldVerdict:
         # extractor is instructed to report that as unclear, not as none.
         source = str(facts.get("tv_source") or "unknown")
         if source in {"text", "vision"}:
-            return FieldVerdict("tv", FieldState.VIOLATED, "no television reported")
-        return FieldVerdict("tv", FieldState.UNKNOWN, "not stated")
+            return FieldVerdict("tv", FieldState.VIOLATED, "телевизора нет")
+        return FieldVerdict("tv", FieldState.UNKNOWN, "не указан")
 
     if size_class in (None, "unclear"):
         if present is True:
-            return FieldVerdict("tv", FieldState.UNKNOWN, "television present, size unclear")
-        return FieldVerdict("tv", FieldState.UNKNOWN, "not stated")
+            return FieldVerdict("tv", FieldState.UNKNOWN, "есть, размер неясен")
+        return FieldVerdict("tv", FieldState.UNKNOWN, "не указан")
 
     if size_class not in TV_CLASSES:
-        return FieldVerdict("tv", FieldState.UNKNOWN, f"unrecognized size class {size_class!r}")
+        return FieldVerdict("tv", FieldState.UNKNOWN, f"неизвестный класс размера {size_class!r}")
 
+    wanted = tv_class_label(minimum_class)
     if TV_CLASSES.index(str(size_class)) >= TV_CLASSES.index(minimum_class):
-        return FieldVerdict("tv", FieldState.SATISFIED, f"{size_class} (need {minimum_class}+)")
+        return FieldVerdict(
+            "tv", FieldState.SATISFIED, f"{tv_class_label(str(size_class))} (нужен {wanted}+)"
+        )
     # A television smaller than asked for is a real, stated fact about the
     # property, so this one does reject.
-    return FieldVerdict("tv", FieldState.VIOLATED, f"{size_class} (need {minimum_class}+)")
+    return FieldVerdict(
+        "tv", FieldState.VIOLATED, f"{tv_class_label(str(size_class))} (нужен {wanted}+)"
+    )
 
 
 def _rent(price: Any, bounds: dict[str, Any]) -> FieldVerdict:
     """Judge the asking price, which is stated in text or not at all."""
     if not isinstance(price, int) or isinstance(price, bool):
-        return FieldVerdict("monthly_rent_thb", FieldState.UNKNOWN, "no price stated")
+        return FieldVerdict("monthly_rent_thb", FieldState.UNKNOWN, "не указана")
     low = bounds.get("min")
     high = bounds.get("max")
     if isinstance(low, int) and price < low:
-        return FieldVerdict("monthly_rent_thb", FieldState.VIOLATED, f"{price} THB, below {low}")
+        return FieldVerdict(
+            "monthly_rent_thb",
+            FieldState.VIOLATED,
+            f"{format_thb(price)} THB, ниже {format_thb(low)}",
+        )
     if isinstance(high, int) and price > high:
-        return FieldVerdict("monthly_rent_thb", FieldState.VIOLATED, f"{price} THB, above {high}")
-    window = f"{low or 0}–{high}" if high is not None else f"{low or 0}+"
-    return FieldVerdict("monthly_rent_thb", FieldState.SATISFIED, f"{price} THB (want {window})")
+        return FieldVerdict(
+            "monthly_rent_thb",
+            FieldState.VIOLATED,
+            f"{format_thb(price)} THB, выше {format_thb(high)}",
+        )
+    window = (
+        f"{format_thb(low or 0)}–{format_thb(high)}"
+        if high is not None
+        else f"{format_thb(low or 0)}+"
+    )
+    return FieldVerdict(
+        "monthly_rent_thb", FieldState.SATISFIED, f"{format_thb(price)} THB (хотим {window})"
+    )
