@@ -494,6 +494,8 @@ def _message_link(unit: ContentUnit) -> str | None:
 # DM again. Long enough that eight waiting rows are a few log lines an hour,
 # short enough that a lifted pause is noticed the same hour.
 OWNER_UNREACHABLE_RETRY_SECONDS = 1800
+# How often the delivery loop checks whether the backlog needs a probe.
+BACKLOG_PROBE_SECONDS = 600.0
 
 # Governor answers that mean "come back later" rather than "this failed": the
 # pace, the budget, a FloodWait Telegram lifts by itself, or an account-wide
@@ -545,6 +547,7 @@ class HousingAlertDelivery:
         owner: OwnerTransport | None = None,
         poll_seconds: float = 5.0,
         max_attempts: int = 6,
+        backlog_probe_seconds: float = BACKLOG_PROBE_SECONDS,
     ) -> None:
         self._store = store
         self._dispatcher = dispatcher
@@ -552,6 +555,8 @@ class HousingAlertDelivery:
         self._lease_owner = lease_owner
         self._poll_seconds = poll_seconds
         self._max_attempts = max_attempts
+        self._probe_every = backlog_probe_seconds
+        self._last_probe: float | None = None
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         """Deliver queued housing alerts until asked to stop."""
@@ -632,7 +637,30 @@ class HousingAlertDelivery:
                 error=result.error_code,
                 retry_in_seconds=max(int(result.retry_after or 0), 2**attempts),
             )
+        await self._probe_backlog()
         return sent
+
+    async def _probe_backlog(self) -> None:
+        """Send one alert from the bot-fallback backlog back to the DM, as a probe.
+
+        A pause lifts on Telegram's clock, and nothing announces it. Waiting
+        for fresh traffic to find out would strand the backlog for as long as
+        the island stays quiet, so when nothing else is waiting, the oldest
+        row that owes the owner its DM version is reopened. It either goes
+        through — and its success reopens the rest — or the governor's pause
+        refuses it without a Telegram call, and it waits its half hour.
+        """
+        if self._owner is None or not self._owner.configured:
+            return
+        now = asyncio.get_event_loop().time()
+        if self._last_probe is not None and now - self._last_probe < self._probe_every:
+            return
+        self._last_probe = now
+        if await self._store.has_pending_alerts() or not await self._store.has_fallback_backlog():
+            return
+        reopened = await self._store.reopen_fallback_alerts(limit=1)
+        if reopened:
+            logger.info("Probing the owner's DM with one alert from the bot-fallback backlog")
 
     async def _deliver(self, alert: dict[str, Any]) -> DeliveryResult:
         """One alert, both steps, resuming wherever the previous attempt stopped."""

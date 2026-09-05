@@ -374,10 +374,12 @@ def _from_governed(result: ActionResult[Any]) -> SendOutcome:
         # its job, not a delivery failing, so the outbox is told to come
         # back rather than to count an attempt.
         code = "paced" if result.denial.scope is BudgetScope.COOLDOWN else "budget"
+        # No retry hint means a pause only a person (or the clock, hours
+        # away) lifts; asking again every half minute would only fill the log.
         return SendOutcome(
             SendStatus.RETRY,
             error_code=code,
-            retry_after=max(1, int(retry_after)) if retry_after is not None else 30,
+            retry_after=max(1, int(retry_after)) if retry_after is not None else 1800,
         )
     return SendOutcome(
         SendStatus.RETRY,

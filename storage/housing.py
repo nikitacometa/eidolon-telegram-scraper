@@ -818,7 +818,16 @@ class HousingStore:
             sender_name=str(who["sender_name"]) if who is not None and who["sender_name"] else None,
         )
 
-    async def reopen_fallback_alerts(self, *, spacing_seconds: int = 20) -> int:
+    async def has_pending_alerts(self) -> bool:
+        """Whether anything is already waiting in the outbox."""
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM housing_alerts WHERE delivery_status = 'pending' LIMIT 1"
+        )
+        return await cursor.fetchone() is not None
+
+    async def reopen_fallback_alerts(
+        self, *, spacing_seconds: int = 20, limit: int | None = None
+    ) -> int:
         """Queue again every alert whose original never reached the owner's DM.
 
         Two shapes qualify: a report that went through the bot with a link
@@ -834,7 +843,9 @@ class HousingStore:
               AND kind <> 'digest'
               AND forward_status IN ('bot_fallback', 'unavailable')
             ORDER BY id
-            """
+            LIMIT ?
+            """,
+            (-1 if limit is None else limit,),
         )
         ids = [int(row[0]) for row in await cursor.fetchall()]
         async with self._write_lock:
