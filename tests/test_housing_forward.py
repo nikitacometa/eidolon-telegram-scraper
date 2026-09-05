@@ -583,6 +583,9 @@ async def test_a_follow_up_with_no_prior_report_shows_the_original(
     ).run_once()
 
     assert owner.sent_reports[0][1] is None
+    # The stored body was a follow-up; the report the owner gets says the
+    # original is coming, because it is.
+    assert owner.sent_reports[0][0].endswith("update\n⬇️ Оригинал ниже")
     assert len(owner.forwarded) == 1
     assert (await _row(store, update_id))["forward_status"] == ForwardStatus.FORWARDED.value
 
@@ -643,13 +646,187 @@ async def test_a_delivery_that_raises_does_not_hold_the_rest_of_the_batch(
     assert row["report_message_id"] is not None  # and the report will not repeat
 
 
+async def test_a_flood_wait_on_the_report_never_spends_an_attempt(
+    db: Database, store: HousingStore
+) -> None:
+    """Telegram asking the account to wait says nothing about this listing."""
+    key = await _album_unit(db, store)
+    alert_id = await _queue_live_alert(store, key)
+    owner = FakeOwner(
+        reports=[SendOutcome(SendStatus.RETRY, error_code="flood_wait", retry_after=90)]
+    )
+
+    sent = await HousingAlertDelivery(
+        store=store, dispatcher=FakeBot(), owner=owner, lease_owner="t", max_attempts=1
+    ).run_once()
+
+    assert sent == 0
+    row = await _row(store, alert_id)
+    assert row["delivery_status"] == "pending"
+    assert row["attempts"] == 0
+    assert row["last_error"] == "flood_wait"
+
+
+async def test_a_report_sent_in_the_failing_attempt_is_not_closed_as_never_sent(
+    db: Database, store: HousingStore
+) -> None:
+    """The report goes out, the forward fails for good on the last allowed
+    attempt: the owner has a report, so the alert closes with a note — not as
+    a failure that pretends nothing was ever sent."""
+    key = await _album_unit(db, store)
+    alert_id = await _queue_live_alert(store, key)
+    owner = FakeOwner(
+        forwards=[SendOutcome(SendStatus.RETRY, error_code="telegram_network_error", retry_after=1)]
+    )
+
+    sent = await HousingAlertDelivery(
+        store=store, dispatcher=FakeBot(), owner=owner, lease_owner="t", max_attempts=1
+    ).run_once()
+
+    assert sent == 1
+    row = await _row(store, alert_id)
+    assert row["delivery_status"] == "delivered"
+    assert row["forward_status"] == ForwardStatus.UNAVAILABLE.value
+    assert owner.edits and "⚠️ Оригинал недоступен" in owner.edits[0][1]
+
+
+async def test_a_follow_up_after_a_report_with_an_unknown_id_does_not_forward_again(
+    db: Database, store: HousingStore
+) -> None:
+    key = await _album_unit(db, store)
+    live_id = await _queue_live_alert(store, key)
+    owner = FakeOwner(reports=[SendOutcome(SendStatus.SENT, message_id=None)])
+    delivery = HousingAlertDelivery(store=store, dispatcher=FakeBot(), owner=owner, lease_owner="t")
+    assert await delivery.run_once() == 1
+    assert (await _row(store, live_id))["report_message_id"] == 0
+    update_id = await store.enqueue_alert(
+        unit_key=key,
+        chat_id=CHAT_ID,
+        chat_title=None,
+        telegram_msg_id=28584,
+        requirements_revision=1,
+        verdict=Verdict.CONFIRMED,
+        kind=AlertKind.UPDATE,
+        body_html="update",
+    )
+    assert update_id is not None
+
+    assert await delivery.run_once() == 1
+
+    assert len(owner.forwarded) == 1  # the live alert's forward only
+    assert owner.sent_reports[1][1] is None  # nothing reply-able, no reply
+    assert (await _row(store, update_id))["forward_status"] == ForwardStatus.SKIPPED.value
+
+
+async def test_an_amendment_waits_out_the_pace_instead_of_being_dropped(
+    db: Database, store: HousingStore
+) -> None:
+    key = await _album_unit(db, store)
+    await _queue_live_alert(store, key)
+
+    class PacedOnce(FakeOwner):
+        def __init__(self) -> None:
+            super().__init__(
+                forwards=[SendOutcome(SendStatus.REJECTED, error_code="MessageIdInvalidError")],
+                copies=[SendOutcome(SendStatus.REJECTED, error_code="MediaEmptyError")],
+            )
+            self.edit_calls = 0
+
+        async def edit_report(self, message_id: int, body_html: str) -> SendOutcome:
+            self.edit_calls += 1
+            if self.edit_calls == 1:
+                return SendOutcome(SendStatus.RETRY, error_code="paced", retry_after=1)
+            return await super().edit_report(message_id, body_html)
+
+    owner = PacedOnce()
+    await HousingAlertDelivery(
+        store=store, dispatcher=FakeBot(), owner=owner, lease_owner="t"
+    ).run_once()
+
+    assert owner.edit_calls == 2
+    assert owner.edits and "⚠️ Оригинал недоступен" in owner.edits[0][1]
+
+
+async def test_an_account_halt_makes_the_owner_unreachable_for_the_bot_fallback(
+    scout: ScoutDatabase,
+) -> None:
+    """A spam limitation is about the account; nothing more should leave it,
+    but the owner still gets the report — through the bot, with a link."""
+    client = FakeClient()
+    client.entity_error = errors.PeerFloodError(request=None)
+    transport = OwnerTransport(
+        client=client, governor=TelegramActionGovernor(scout=scout), owner_ref="owner"
+    )
+
+    outcome = await transport.send_report("x")
+
+    assert outcome.status is SendStatus.UNREACHABLE
+    assert outcome.error_code == "PeerFloodError"
+
+
+async def test_an_interrupted_ledger_rebuild_is_finished_on_the_next_connect(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "scout.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE telegram_actions_legacy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            job_id TEXT,
+            candidate_id INTEGER,
+            outcome TEXT NOT NULL DEFAULT 'reserved',
+            flood_wait_seconds INTEGER,
+            error_code TEXT,
+            duration_ms REAL,
+            reserved_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            settled_at TIMESTAMP
+        );
+        INSERT INTO telegram_actions_legacy (account_id, kind, idempotency_key, outcome)
+        VALUES ('owner-primary', 'join', 'historic-join', 'succeeded');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    database = ScoutDatabase(db_path)
+    await database.connect()
+    try:
+        rows = await (
+            await database.conn.execute("SELECT kind, idempotency_key FROM telegram_actions")
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [("join", "historic-join")]
+        stranded = await (
+            await database.conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'telegram_actions_legacy'"
+            )
+        ).fetchall()
+        assert stranded == []
+        index = await (
+            await database.conn.execute(
+                "SELECT tbl_name FROM sqlite_master WHERE name = 'idx_actions_budget'"
+            )
+        ).fetchone()
+        assert index is not None and index[0] == "telegram_actions"
+    finally:
+        await database.close()
+
+
 async def test_giving_up_on_the_forward_closes_the_alert_with_a_note(
     db: Database, store: HousingStore
 ) -> None:
     key = await _album_unit(db, store)
     alert_id = await _queue_live_alert(store, key)
+    # A network error is a real failed attempt (a FloodWait would not be:
+    # those never spend attempts, see NOT_YET_CODES).
     owner = FakeOwner(
-        forwards=[SendOutcome(SendStatus.RETRY, error_code="flood_wait", retry_after=1)] * 3
+        forwards=[SendOutcome(SendStatus.RETRY, error_code="telegram_network_error", retry_after=1)]
+        * 3
     )
     delivery = HousingAlertDelivery(
         store=store, dispatcher=FakeBot(), owner=owner, lease_owner="t", max_attempts=2

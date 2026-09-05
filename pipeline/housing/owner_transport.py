@@ -88,6 +88,10 @@ class SendOutcome:
 # into "this message" and "this owner" is made here, where the fallback lives.
 _OWNER_UNREACHABLE_CODES = frozenset(
     {
+        "halted",
+        "channels_too_much",
+        "PeerFloodError",
+        "UserBannedInChannelError",
         "UserIsBlockedError",
         "UserPrivacyRestrictedError",
         "PeerIdInvalidError",
@@ -357,11 +361,11 @@ def _from_governed(result: ActionResult[Any]) -> SendOutcome:
     if result.status is ActionStatus.REJECTED:
         return SendOutcome(SendStatus.REJECTED, error_code=result.error_code or "rejected")
     if result.status is ActionStatus.HALTED:
-        # A halt is account-wide and needs a person; retry slowly, do not
-        # fall back to the bot — the halt says nothing about the owner.
-        return SendOutcome(
-            SendStatus.RETRY, error_code=result.error_code or "halted", retry_after=900
-        )
+        # A halt is account-wide and needs a person: Telegram pushed back on
+        # the account itself, and nothing more should leave it until someone
+        # has looked. The owner is still told — through the bot, with a link
+        # — rather than left waiting on a halt he does not know about.
+        return SendOutcome(SendStatus.UNREACHABLE, error_code=result.error_code or "halted")
     retry_after = result.retry_after_seconds
     if result.status is ActionStatus.DENIED and result.denial is not None:
         # The pace or the budget said "not yet". That is the governor doing

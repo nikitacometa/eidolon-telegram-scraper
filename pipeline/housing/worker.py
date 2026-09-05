@@ -53,6 +53,8 @@ REQUIREMENTS_POLL_SECONDS = 30.0
 
 # The owner reads dates in island time, not the server's UTC.
 OWNER_TZ = ZoneInfo("Asia/Bangkok")
+# The last line of a report whose original is forwarded right after it.
+ORIGINAL_FOLLOWS_LINE = "⬇️ Оригинал ниже"
 _MONTHS_RU = ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
 
 
@@ -390,7 +392,7 @@ def render_alert(
     if replayed_from is not None:
         lines.append(f"🔁 Повтор: первый алерт был {format_when(replayed_from, now=now)}")
     if original_follows and unit.members:
-        lines.append("⬇️ Оригинал ниже")
+        lines.append(ORIGINAL_FOLLOWS_LINE)
     return "\n".join(lines)
 
 
@@ -488,8 +490,22 @@ def _message_link(unit: ContentUnit) -> str | None:
     return message_link(unit.chat_id, unit.members[0].telegram_msg_id)
 
 
-# Governor answers that mean "come back later" rather than "this failed".
-NOT_YET_CODES = frozenset({"paced", "budget"})
+# Governor answers that mean "come back later" rather than "this failed": the
+# pace, the budget, a FloodWait Telegram lifts by itself, or an account-wide
+# halt a person has to clear. None of them says anything about THIS alert, so
+# none of them spends one of its bounded attempts — a listing must not be
+# dropped because Telegram asked the account to wait six times.
+NOT_YET_CODES = frozenset(
+    {
+        "paced",
+        "budget",
+        "flood_wait",
+        "halted",
+        "channels_too_much",
+        "PeerFloodError",
+        "UserBannedInChannelError",
+    }
+)
 
 # Why a forward was refused, in the owner's language.
 _FORWARD_REFUSALS_RU = {
@@ -625,15 +641,28 @@ class HousingAlertDelivery:
         # A follow-up replies to the report it follows up on. Whether one
         # exists is read here, once, and decides both the reply target and
         # whether the original still has to be shown.
-        prior_report = (
-            await self._store.report_message_id(unit_key, exclude_alert_id=alert_id)
-            if kind is AlertKind.UPDATE
-            else None
-        )
+        prior_report = None
+        carries_original = chat_id != 0 and kind in (AlertKind.LIVE, AlertKind.REPLAY)
+        if kind is AlertKind.UPDATE:
+            prior_report = await self._store.report_message_id(unit_key, exclude_alert_id=alert_id)
+            if chat_id != 0 and not await self._store.unit_reported(
+                unit_key, exclude_alert_id=alert_id
+            ):
+                # The owner never got a report for this listing (the first
+                # alert failed, or predates this format): show him the
+                # original now. Judged on whether ANY report went out, not on
+                # whether one is reply-able — a report whose id came back
+                # unknown was still read.
+                carries_original = True
 
         report_id = alert.get("report_message_id")
         if report_id is None:
-            outcome = await self._owner.send_report(str(alert["body_html"]), reply_to=prior_report)
+            body = str(alert["body_html"])
+            if carries_original and ORIGINAL_FOLLOWS_LINE not in body:
+                # The body was rendered as a follow-up (no original expected);
+                # delivery decided otherwise, and the report has to agree.
+                body = body.rstrip() + "\n" + ORIGINAL_FOLLOWS_LINE
+            outcome = await self._owner.send_report(body, reply_to=prior_report)
             if outcome.status is SendStatus.UNREACHABLE:
                 return await self._deliver_via_bot(alert)
             if not outcome.sent:
@@ -642,15 +671,14 @@ class HousingAlertDelivery:
             # sending, not the id, and a retry must not send again.
             report_id = outcome.message_id or 0
             await self._store.mark_report_sent(alert_id, message_id=report_id)
+            # run_once keeps this same dict for its bookkeeping; it has to
+            # see that a report now exists, or a forward that fails on the
+            # last attempt is closed as "nothing was ever sent".
+            alert["report_message_id"] = report_id
 
         if str(alert.get("forward_status") or ForwardStatus.PENDING) != ForwardStatus.PENDING:
             return DeliveryResult.success()
 
-        carries_original = chat_id != 0 and kind in (AlertKind.LIVE, AlertKind.REPLAY)
-        if kind is AlertKind.UPDATE and prior_report is None and chat_id != 0:
-            # The owner never got a report for this listing (the first alert
-            # failed, or predates this format): show him the original now.
-            carries_original = True
         if not carries_original:
             await self._store.set_forward_status(alert_id, ForwardStatus.SKIPPED)
             return DeliveryResult.success()
@@ -736,15 +764,24 @@ class HousingAlertDelivery:
         """Rewrite the report in the owner's DM with a note about the original."""
         if self._owner is None or not message_id:
             return
-        body = str(alert["body_html"]).replace("⬇️ Оригинал ниже", "").rstrip()
-        edited = await self._owner.edit_report(message_id, body + "\n" + note)
-        if not edited.sent:
-            logger.warning(
-                "Could not amend report %s for alert %d: %s",
-                message_id,
-                int(alert["id"]),
-                edited.error_code,
-            )
+        body = str(alert["body_html"]).replace(ORIGINAL_FOLLOWS_LINE, "").rstrip()
+        # The edit follows a copy attempt of the same kind, so the governor's
+        # per-kind pace can say "not yet" once; that is waited out rather than
+        # dropped, because the note IS the owner's only sign the original is
+        # missing. Anything beyond a couple of waits is logged and let go.
+        for _ in range(3):
+            edited = await self._owner.edit_report(message_id, body + "\n" + note)
+            if edited.sent:
+                return
+            if edited.status is not SendStatus.RETRY:
+                break
+            await asyncio.sleep(max(1, int(edited.retry_after or 2)))
+        logger.warning(
+            "Could not amend report %s for alert %d: %s",
+            message_id,
+            int(alert["id"]),
+            edited.error_code,
+        )
 
     async def _deliver_via_bot(self, alert: dict[str, Any]) -> DeliveryResult:
         """The pre-forward path: the report through the bot, with a link.
@@ -754,7 +791,7 @@ class HousingAlertDelivery:
         a member of the chat, which is why this is the fallback and not the
         design — but a report with a dead link beats no report.
         """
-        body = str(alert["body_html"]).replace("⬇️ Оригинал ниже", "").rstrip()
+        body = str(alert["body_html"]).replace(ORIGINAL_FOLLOWS_LINE, "").rstrip()
         link = message_link(int(alert["chat_id"]), int(alert["telegram_msg_id"]))
         if link:
             body += f'\n<a href="{link}">Открыть в Telegram</a>'

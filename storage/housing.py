@@ -752,6 +752,20 @@ class HousingStore:
         row = await cursor.fetchone()
         return int(row[0]) if row is not None and row[0] is not None else None
 
+    async def unit_reported(self, unit_key: str, *, exclude_alert_id: int | None = None) -> bool:
+        """Whether any report about this unit has reached the owner's DM.
+
+        Distinct from having a reply-able id: a report whose id came back
+        unknown (stored as 0) was still sent and read, and the original that
+        followed it must not be forwarded a second time.
+        """
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM housing_alerts WHERE unit_key = ? AND report_message_id IS NOT NULL"
+            " AND id <> COALESCE(?, -1) LIMIT 1",
+            (unit_key, exclude_alert_id),
+        )
+        return await cursor.fetchone() is not None
+
     async def unit_origin(self, unit_key: str) -> UnitOrigin:
         """When, where and by whom the advertisement was posted.
 

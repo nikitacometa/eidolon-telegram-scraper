@@ -341,7 +341,10 @@ class Eidolon:
             # no owner configured the bot path with a link remains.
             owner = OwnerTransport(
                 client=self.client,
-                governor=self.governor,
+                # Its own governor instance: same ledger and budgets (per
+                # kind, in the scout database), but its own in-flight slot,
+                # so a history page in progress does not hold a report back.
+                governor=TelegramActionGovernor(scout=self.scout),
                 owner_ref=settings.owner_username,
             )
             if owner.configured:

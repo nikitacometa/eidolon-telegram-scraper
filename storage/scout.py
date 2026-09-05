@@ -99,7 +99,23 @@ class ScoutDatabase:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=5000")
+        stranded = await (
+            await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_actions_legacy'"
+            )
+        ).fetchone()
         await self._conn.executescript(SCOUT_SCHEMA_PATH.read_text())
+        if stranded is not None:
+            # A previous connect died between renaming the ledger aside and
+            # copying it back. The schema above has just created an empty
+            # ledger next to the full one; without this the account's whole
+            # rate-limit history would sit in a table nothing reads.
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO telegram_actions SELECT * FROM telegram_actions_legacy"
+            )
+            await self._conn.execute("DROP TABLE telegram_actions_legacy")
+            await self._conn.executescript(SCOUT_SCHEMA_PATH.read_text())
+            logger.info("Migration: finished an interrupted telegram_actions rebuild")
         columns = {
             row[1]
             for row in await (

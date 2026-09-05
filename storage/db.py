@@ -485,6 +485,11 @@ class Database:
             " WHERE delivery_status <> 'pending' AND forward_status = 'pending'"
         )
         await self.conn.execute("DROP TABLE housing_alerts_legacy")
+        # A death between the two DROP INDEX statements above leaves one name
+        # attached to the legacy table, where IF NOT EXISTS skipped it and the
+        # DROP TABLE just destroyed it. Now that the names are free, running the
+        # schema once more puts back whatever is missing.
+        await self.conn.executescript(SCHEMA_PATH.read_text())
         await self.conn.commit()
         logger.info("Migration: rebuilt housing_alerts with the replay kind and forward columns")
 
