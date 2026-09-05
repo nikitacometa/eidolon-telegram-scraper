@@ -826,7 +826,7 @@ class HousingStore:
         return await cursor.fetchone() is not None
 
     async def reopen_fallback_alerts(
-        self, *, spacing_seconds: int = 20, limit: int | None = None
+        self, *, spacing_seconds: int = 20, limit: int | None = None, older_than_seconds: int = 0
     ) -> int:
         """Queue again every alert whose original never reached the owner's DM.
 
@@ -842,10 +842,11 @@ class HousingStore:
             WHERE delivery_status = 'delivered'
               AND kind <> 'digest'
               AND forward_status IN ('bot_fallback', 'unavailable')
+              AND datetime(COALESCE(delivered_at, created_at)) <= datetime('now', ?)
             ORDER BY id
             LIMIT ?
             """,
-            (-1 if limit is None else limit,),
+            (f"-{max(0, int(older_than_seconds))} seconds", -1 if limit is None else limit),
         )
         ids = [int(row[0]) for row in await cursor.fetchall()]
         async with self._write_lock:

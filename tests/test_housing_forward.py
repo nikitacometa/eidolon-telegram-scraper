@@ -11,6 +11,7 @@ listings alerted on before this format existed.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1453,14 +1454,22 @@ async def test_a_report_that_reaches_the_dm_reopens_what_fell_back_to_the_bot(
     fallen_id = await _queue_live_alert(store, fallen)
     bot = FakeBot()
     unreachable = FakeOwner(reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="halted")])
+    # The periodic probe is switched off here: this test is about the OTHER
+    # way the backlog reopens — a fresh alert that reaches the DM.
     await HousingAlertDelivery(
-        store=store, dispatcher=bot, owner=unreachable, lease_owner="t"
+        store=store,
+        dispatcher=bot,
+        owner=unreachable,
+        lease_owner="t",
+        backlog_probe_seconds=math.inf,
     ).run_once()
     assert (await _row(store, fallen_id))["forward_status"] == ForwardStatus.BOT_FALLBACK.value
     fresh = await _album_unit(db, store, first_msg_id=300)
     fresh_id = await _queue_live_alert(store, fresh)
     healthy = FakeOwner()
-    delivery = HousingAlertDelivery(store=store, dispatcher=bot, owner=healthy, lease_owner="t")
+    delivery = HousingAlertDelivery(
+        store=store, dispatcher=bot, owner=healthy, lease_owner="t", backlog_probe_seconds=math.inf
+    )
 
     assert await delivery.run_once() == 1  # the fresh alert lands in the DM
 
@@ -1552,25 +1561,33 @@ async def test_the_backlog_is_probed_with_one_row_when_nothing_else_is_waiting(
     unreachable = FakeOwner(
         reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="PeerFloodError")] * 3
     )
-    delivery = HousingAlertDelivery(store=store, dispatcher=bot, owner=unreachable, lease_owner="t")
+    # A probe every cycle, so the behaviour shows within the test.
+    delivery = HousingAlertDelivery(
+        store=store, dispatcher=bot, owner=unreachable, lease_owner="t", backlog_probe_seconds=0
+    )
     await delivery.run_once()
     assert len(bot.sent) == 3
-    assert all(
-        (await _row(store, i))["forward_status"] == ForwardStatus.BOT_FALLBACK.value for i in ids
-    )
-    # Nothing pending, backlog present: the next cycle's probe reopens exactly one.
-    delivery._last_probe = None  # noqa: SLF001 - the probe throttle is what is under test
+    # The first cycle only starts the probe clock; the second probes: exactly
+    # one row is back in the queue, the other two still stand as bot fallbacks.
     await delivery.run_once()
-    pending = [i for i in ids if (await _row(store, i))["delivery_status"] == "pending"]
-    assert pending == [ids[0]]
+    statuses = []
+    for i in ids:
+        row = await _row(store, i)
+        statuses.append((row["delivery_status"], row["forward_status"]))
+    assert statuses == [
+        ("pending", "pending"),
+        ("delivered", ForwardStatus.BOT_FALLBACK.value),
+        ("delivered", ForwardStatus.BOT_FALLBACK.value),
+    ]
     # While that one is waiting, no further probes are queued.
-    delivery._last_probe = None  # noqa: SLF001
     await delivery.run_once()
     pending = [i for i in ids if (await _row(store, i))["delivery_status"] == "pending"]
     assert pending == [ids[0]]
 
     # The pause lifts: the probe goes through and its success reopens the rest.
-    healthy = HousingAlertDelivery(store=store, dispatcher=bot, owner=FakeOwner(), lease_owner="t")
+    healthy = HousingAlertDelivery(
+        store=store, dispatcher=bot, owner=FakeOwner(), lease_owner="t", backlog_probe_seconds=0
+    )
     async with store._write_lock:  # noqa: SLF001
         await store._conn.execute(  # noqa: SLF001
             "UPDATE housing_alerts SET next_attempt_at = CURRENT_TIMESTAMP WHERE id = ?", (ids[0],)

@@ -653,12 +653,20 @@ class HousingAlertDelivery:
         if self._owner is None or not self._owner.configured:
             return
         now = asyncio.get_event_loop().time()
-        if self._last_probe is not None and now - self._last_probe < self._probe_every:
+        if self._last_probe is None:
+            # The first opportunity only starts the clock: a row that fell
+            # back seconds ago has just proven the pause, and asking again
+            # this instant would learn nothing.
+            self._last_probe = now
+            return
+        if now - self._last_probe < self._probe_every:
             return
         self._last_probe = now
         if await self._store.has_pending_alerts() or not await self._store.has_fallback_backlog():
             return
-        reopened = await self._store.reopen_fallback_alerts(limit=1)
+        reopened = await self._store.reopen_fallback_alerts(
+            limit=1, older_than_seconds=int(self._probe_every)
+        )
         if reopened:
             logger.info("Probing the owner's DM with one alert from the bot-fallback backlog")
 
