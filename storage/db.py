@@ -510,11 +510,21 @@ class Database:
                 " 'unavailable', 'skipped', 'bot_fallback'))"
             ),
             "forward_error": "ALTER TABLE housing_alerts ADD COLUMN forward_error TEXT",
+            "bot_reports": (
+                "ALTER TABLE housing_alerts ADD COLUMN bot_reports INTEGER NOT NULL DEFAULT 0"
+            ),
         }
         for column, statement in statements.items():
             if column not in columns:
                 await self.conn.execute(statement)
                 logger.info("Migration: added housing_alerts.%s", column)
+                if column == "bot_reports":
+                    # Rows that fell back before the counter existed went
+                    # through the bot at least once.
+                    await self.conn.execute(
+                        "UPDATE housing_alerts SET bot_reports = 1"
+                        " WHERE forward_status = 'bot_fallback' AND bot_reports = 0"
+                    )
 
     async def close(self) -> None:
         """Close the database connection."""

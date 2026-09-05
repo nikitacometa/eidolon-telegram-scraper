@@ -20,13 +20,7 @@ import pytest
 from telethon import errors
 
 from pipeline.governor import TelegramActionGovernor
-from pipeline.housing.owner_transport import (
-    OwnerRecovery,
-    OwnerTransport,
-    SendOutcome,
-    SendStatus,
-    is_owner_reply,
-)
+from pipeline.housing.owner_transport import OwnerTransport, SendOutcome, SendStatus
 from pipeline.housing.replay import plan_replay, queue_replay, render_replay_header
 from pipeline.housing.requirements import DEFAULT_REQUIREMENTS, match_requirements
 from pipeline.housing.worker import (
@@ -1424,58 +1418,124 @@ async def test_a_report_that_lost_its_original_resumes_at_the_forward_when_reope
     assert (await _row(store, alert_id))["report_message_id"] == report_id
 
 
-def test_only_an_incoming_private_message_from_the_owner_counts_as_a_reply() -> None:
-    owner_id = 424242
-    incoming = SimpleNamespace(
-        is_private=True, message=SimpleNamespace(sender_id=owner_id, out=False)
-    )
-    outgoing = SimpleNamespace(
-        is_private=True, message=SimpleNamespace(sender_id=owner_id, out=True)
-    )
-    stranger = SimpleNamespace(is_private=True, message=SimpleNamespace(sender_id=1, out=False))
-    group = SimpleNamespace(
-        is_private=False, message=SimpleNamespace(sender_id=owner_id, out=False)
-    )
-
-    assert is_owner_reply(incoming, owner_id)
-    assert not is_owner_reply(outgoing, owner_id)
-    assert not is_owner_reply(stranger, owner_id)
-    assert not is_owner_reply(group, owner_id)
-    assert not is_owner_reply(incoming, 0)
-
-
-async def test_the_owners_reply_lifts_the_owner_pause_and_requeues_the_fallbacks(
-    db: Database, store: HousingStore, scout: ScoutDatabase
+async def test_a_row_that_already_went_through_the_bot_waits_instead_of_repeating_it(
+    db: Database, store: HousingStore
 ) -> None:
+    """Measured 2026-09-05: reopened rows hit PEER_FLOOD again and the owner
+    got the same seven dead-link reports from the bot a second time."""
     key = await _album_unit(db, store)
     live = await _queue_live_alert(store, key)
     bot = FakeBot()
-    owner = FakeOwner(reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="PeerFloodError")])
-    await HousingAlertDelivery(store=store, dispatcher=bot, owner=owner, lease_owner="t").run_once()
-    for scope in ("owner_message", "owner_forward"):
-        await scout.set_cooldown(
-            account_id="owner-primary",
-            scope=scope,
-            seconds=3600,
-            reason="PeerFloodError",
-            manual_resume_required=True,
+    unreachable = FakeOwner(
+        reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="PeerFloodError")] * 2
+    )
+    delivery = HousingAlertDelivery(store=store, dispatcher=bot, owner=unreachable, lease_owner="t")
+    await delivery.run_once()
+    assert len(bot.sent) == 1
+    assert (await _row(store, live))["bot_reports"] == 1
+    assert await store.reopen_fallback_alerts(spacing_seconds=0) == 1
+
+    sent = await delivery.run_once()
+
+    assert sent == 0
+    assert len(bot.sent) == 1  # not a second time
+    row = await _row(store, live)
+    assert row["delivery_status"] == "pending"
+    assert row["attempts"] == 0  # a pause, not a failed attempt
+    assert row["last_error"] == "PeerFloodError"
+
+
+async def test_a_report_that_reaches_the_dm_reopens_what_fell_back_to_the_bot(
+    db: Database, store: HousingStore
+) -> None:
+    """The only trustworthy sign the DM works again is a send that worked."""
+    fallen = await _album_unit(db, store, first_msg_id=100)
+    fallen_id = await _queue_live_alert(store, fallen)
+    bot = FakeBot()
+    unreachable = FakeOwner(reports=[SendOutcome(SendStatus.UNREACHABLE, error_code="halted")])
+    await HousingAlertDelivery(
+        store=store, dispatcher=bot, owner=unreachable, lease_owner="t"
+    ).run_once()
+    assert (await _row(store, fallen_id))["forward_status"] == ForwardStatus.BOT_FALLBACK.value
+    fresh = await _album_unit(db, store, first_msg_id=300)
+    fresh_id = await _queue_live_alert(store, fresh)
+    healthy = FakeOwner()
+    delivery = HousingAlertDelivery(store=store, dispatcher=bot, owner=healthy, lease_owner="t")
+
+    assert await delivery.run_once() == 1  # the fresh alert lands in the DM
+
+    row = await _row(store, fallen_id)
+    assert row["delivery_status"] == "pending"  # reopened by that success
+    assert row["forward_status"] == ForwardStatus.PENDING.value
+    async with store._write_lock:  # noqa: SLF001
+        await store._conn.execute(  # noqa: SLF001
+            "UPDATE housing_alerts SET next_attempt_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (fallen_id,),
         )
-    # A FloodWait — the crawl's or the owner kinds' own — is not the owner's to lift.
-    await scout.set_cooldown(
-        account_id="owner-primary", scope="history_page", seconds=3600, reason="flood_wait_900s"
-    )
-    await scout.set_cooldown(
-        account_id="owner-primary", scope="owner_forward", seconds=7200, reason="flood_wait_120s"
-    )
-    recovery = OwnerRecovery(scout=scout, store=store, account_id="owner-primary")
+        await store._conn.commit()  # noqa: SLF001
+    assert await delivery.run_once() == 1
+    assert (await _row(store, fallen_id))["forward_status"] == ForwardStatus.FORWARDED.value
+    assert (await _row(store, fresh_id))["forward_status"] == ForwardStatus.FORWARDED.value
+    assert len(bot.sent) == 1
 
-    reopened = await recovery.owner_wrote()
 
-    assert reopened == 1
-    left = sorted(
-        (c["scope"], c["reason"]) for c in await scout.active_cooldowns(account_id="owner-primary")
+async def test_rows_migrated_with_a_bot_fallback_count_as_already_sent_once(tmp_path: Path) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(LEGACY_HOUSING_ALERTS_SQL)
+    raw.commit()
+    raw.close()
+    database = Database(db_path)
+    await database.connect()
+    try:
+        await database.conn.execute(
+            "INSERT INTO housing_alerts (unit_key, chat_id, telegram_msg_id, requirements_revision,"
+            " verdict, kind, body_html, delivery_status, forward_status)"
+            " VALUES ('m:1:1', -100, 1, 3, 'possible', 'replay', 'x', 'delivered', 'bot_fallback')"
+        )
+        await database.conn.commit()
+    finally:
+        await database.close()
+    # Simulate a database that gained forward_status before bot_reports existed.
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE tmp AS SELECT id, unit_key, chat_id, chat_title, telegram_msg_id,
+            requirements_revision, verdict, kind, body_html, photo_paths_json, delivery_status,
+            attempts, claimed_until, lease_owner, last_error, next_attempt_at, created_at,
+            delivered_at, report_message_id, report_sent_at, forward_status, forward_error
+            FROM housing_alerts;
+        DROP TABLE housing_alerts;
+        CREATE TABLE housing_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, unit_key TEXT NOT NULL, chat_id INTEGER NOT NULL,
+            chat_title TEXT, telegram_msg_id INTEGER NOT NULL, requirements_revision INTEGER NOT NULL,
+            verdict TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'live'
+                CHECK(kind IN ('live', 'update', 'digest', 'replay')),
+            body_html TEXT NOT NULL, photo_paths_json TEXT,
+            delivery_status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+            claimed_until TIMESTAMP, lease_owner TEXT, last_error TEXT,
+            next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, delivered_at TIMESTAMP,
+            report_message_id INTEGER, report_sent_at TIMESTAMP,
+            forward_status TEXT NOT NULL DEFAULT 'pending', forward_error TEXT
+        );
+        INSERT INTO housing_alerts SELECT * FROM tmp;
+        DROP TABLE tmp;
+        """
     )
-    assert left == [("history_page", "flood_wait_900s"), ("owner_forward", "flood_wait_120s")]
-    assert (await _row(store, live))["delivery_status"] == "pending"
-    # A second reply within the throttle window does nothing more.
-    assert await recovery.owner_wrote() is None
+    raw.commit()
+    raw.close()
+
+    database = Database(db_path)
+    await database.connect()
+    try:
+        row = await (
+            await database.conn.execute(
+                "SELECT bot_reports FROM housing_alerts WHERE unit_key = 'm:1:1'"
+            )
+        ).fetchone()
+        assert row is not None and row[0] == 1
+    finally:
+        await database.close()

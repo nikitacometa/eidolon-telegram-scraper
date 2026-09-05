@@ -339,7 +339,12 @@ CREATE TABLE IF NOT EXISTS housing_alerts (
     forward_status TEXT NOT NULL DEFAULT 'pending'
         CHECK(forward_status IN ('pending', 'forwarded', 'copied', 'unavailable',
                                  'skipped', 'bot_fallback')),
-    forward_error TEXT
+    forward_error TEXT,
+    -- How many times the report went out through the bot because the DM was
+    -- unreachable. Once is a fallback; a second time would be the same dead
+    -- link again, so a row that already went through the bot waits for the
+    -- DM instead.
+    bot_reports INTEGER NOT NULL DEFAULT 0
 );
 
 -- One verdict per unit is delivered once. An upgrade from possible to

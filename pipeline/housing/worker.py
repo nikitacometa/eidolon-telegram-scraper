@@ -490,6 +490,11 @@ def _message_link(unit: ContentUnit) -> str | None:
     return message_link(unit.chat_id, unit.members[0].telegram_msg_id)
 
 
+# How long a row that already went through the bot waits before asking the
+# DM again. Long enough that eight waiting rows are a few log lines an hour,
+# short enough that a lifted pause is noticed the same hour.
+OWNER_UNREACHABLE_RETRY_SECONDS = 1800
+
 # Governor answers that mean "come back later" rather than "this failed": the
 # pace, the budget, a FloodWait Telegram lifts by itself, or an account-wide
 # halt a person has to clear. None of them says anything about THIS alert, so
@@ -664,6 +669,16 @@ class HousingAlertDelivery:
                 body = body.rstrip() + "\n" + ORIGINAL_FOLLOWS_LINE
             outcome = await self._owner.send_report(body, reply_to=prior_report)
             if outcome.status is SendStatus.UNREACHABLE:
+                if int(alert.get("bot_reports") or 0) >= 1:
+                    # The owner already has this report from the bot, dead
+                    # link and all. Sending it there again is noise; the DM
+                    # version waits for the pause to lift.
+                    return DeliveryResult(
+                        sent=False,
+                        retryable=True,
+                        error_code=outcome.error_code or "owner_unreachable",
+                        retry_after=OWNER_UNREACHABLE_RETRY_SECONDS,
+                    )
                 return await self._deliver_via_bot(alert)
             if not outcome.sent:
                 return _retry(outcome)
@@ -675,6 +690,12 @@ class HousingAlertDelivery:
             # see that a report now exists, or a forward that fails on the
             # last attempt is closed as "nothing was ever sent".
             alert["report_message_id"] = report_id
+            # A report just reached the DM: whatever fell back to the bot or
+            # lost its original while the DM was paused can be sent properly
+            # now. Measured 2026-09-05: a PEER_FLOOD pause is lifted by
+            # Telegram's clock, not by anything the owner does, so the only
+            # trustworthy signal that the DM works again is a send that worked.
+            await self._recover_backlog()
 
         if str(alert.get("forward_status") or ForwardStatus.PENDING) != ForwardStatus.PENDING:
             return DeliveryResult.success()
@@ -704,6 +725,7 @@ class HousingAlertDelivery:
                     f"{len(message_ids)} сообщений удалены",
                 )
             await self._store.set_forward_status(alert_id, ForwardStatus.FORWARDED, error=error)
+            await self._recover_backlog()
             return DeliveryResult.success()
         if forwarded.status is SendStatus.RETRY:
             return _retry(forwarded)
@@ -736,6 +758,7 @@ class HousingAlertDelivery:
             await self._store.set_forward_status(
                 alert_id, ForwardStatus.COPIED, error=forwarded.error_code
             )
+            await self._recover_backlog()
             return DeliveryResult.success()
         if copied.status is SendStatus.RETRY:
             return _retry(copied)
@@ -751,6 +774,16 @@ class HousingAlertDelivery:
             )
         await self._abandon_original(alert, reason=forwarded.error_code, report_id=int(report_id))
         return DeliveryResult.success()
+
+    async def _recover_backlog(self) -> None:
+        """Queue again, for the DM, what went through the bot while it was paused."""
+        if not await self._store.has_fallback_backlog():
+            return
+        reopened = await self._store.reopen_fallback_alerts()
+        if reopened:
+            logger.info(
+                "DM reachable again: reopened %d alerts that fell back to the bot", reopened
+            )
 
     async def _abandon_original(
         self,

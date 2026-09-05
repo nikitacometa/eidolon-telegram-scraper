@@ -726,10 +726,19 @@ class HousingStore:
         """Record what became of the original behind a report."""
         async with self._write_lock:
             await self._conn.execute(
-                "UPDATE housing_alerts SET forward_status = ?, forward_error = ? WHERE id = ?",
-                (status.value, error, alert_id),
+                "UPDATE housing_alerts SET forward_status = ?, forward_error = ?,"
+                " bot_reports = bot_reports + ? WHERE id = ?",
+                (status.value, error, 1 if status is ForwardStatus.BOT_FALLBACK else 0, alert_id),
             )
             await self._conn.commit()
+
+    async def has_fallback_backlog(self) -> bool:
+        """Whether any delivered alert still owes the owner its DM version."""
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM housing_alerts WHERE delivery_status = 'delivered'"
+            " AND kind <> 'digest' AND forward_status IN ('bot_fallback', 'unavailable') LIMIT 1"
+        )
+        return await cursor.fetchone() is not None
 
     async def report_message_id(
         self, unit_key: str, *, exclude_alert_id: int | None = None

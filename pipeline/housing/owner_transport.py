@@ -50,8 +50,6 @@ UNREACHABLE_LOG_INTERVAL_SECONDS = 3600.0
 # 17th message in 52 s with PEER_FLOOD. Four seconds is the pace of a person
 # forwarding by hand, enforced here where both kinds meet.
 MIN_GAP_BETWEEN_SENDS_SECONDS = 4.0
-# How often the owner's reply may trigger a recovery pass.
-RECOVERY_THROTTLE_SECONDS = 600.0
 
 
 class SendStatus(StrEnum):
@@ -349,84 +347,6 @@ class OwnerTransport:
                 "Owner DM unreachable (%s); housing alerts fall back to the bot with a link",
                 outcome.error_code,
             )
-
-
-def is_owner_reply(event: Any, owner_id: int) -> bool:
-    """Whether a Telegram update is the owner writing to this account.
-
-    Only an INCOMING private message from the owner's own id counts. The
-    account's own sends into that DM arrive as updates too, flagged ``out``;
-    reading them as a reply would make every report lift the pause it is
-    waiting behind.
-    """
-    if not owner_id or not bool(getattr(event, "is_private", False)):
-        return False
-    message = getattr(event, "message", None)
-    if message is None or bool(getattr(message, "out", False)):
-        return False
-    sender_id = getattr(message, "sender_id", None)
-    return isinstance(sender_id, int) and sender_id == owner_id
-
-
-class OwnerRecovery:
-    """What the owner's reply unlocks.
-
-    Telegram's PEER_FLOOD is its limit on messaging a user who has not written
-    back; the owner writing anything into the DM is the fact that lifts it.
-    When that happens, the owner-kind pauses are cleared and every alert that
-    went through the bot with a link, or landed without its original, is
-    queued again for the DM. Nothing else is touched: a FloodWait or a halt
-    the crawl earned stays where it is.
-    """
-
-    def __init__(
-        self,
-        *,
-        scout: Any,
-        store: Any,
-        account_id: str,
-        throttle_seconds: float = RECOVERY_THROTTLE_SECONDS,
-    ) -> None:
-        self._scout = scout
-        self._store = store
-        self._account_id = account_id
-        self._throttle = throttle_seconds
-        self._last_run: float | None = None
-        self._lock = asyncio.Lock()
-
-    async def owner_wrote(self) -> int | None:
-        """Run the recovery, at most once per throttle window. Returns the reopened count."""
-        async with self._lock:
-            now = asyncio.get_event_loop().time()
-            if self._last_run is not None and now - self._last_run < self._throttle:
-                return None
-            self._last_run = now
-            cleared = []
-            for cooldown in await self._scout.active_cooldowns(account_id=self._account_id):
-                scope = str(cooldown["scope"])
-                reason = str(cooldown["reason"])
-                # Only a spam limit is the owner's to lift: a FloodWait on
-                # these kinds is Telegram's clock, and a reply does not
-                # advance it.
-                if reason in _OWNER_SPAM_REASONS and scope in {
-                    "all",
-                    ActionKind.OWNER_MESSAGE.value,
-                    ActionKind.OWNER_FORWARD.value,
-                }:
-                    await self._scout.clear_cooldown(account_id=self._account_id, scope=scope)
-                    cleared.append(scope)
-            reopened = int(await self._store.reopen_fallback_alerts())
-            logger.info(
-                "Owner wrote back: cleared cooldowns %s, reopened %d alerts for the DM",
-                cleared or "none",
-                reopened,
-            )
-            return reopened
-
-
-# Spam limits that a message TO the owner can earn; a reply from him is what
-# lifts them, so only these justify clearing an account-wide pause.
-_OWNER_SPAM_REASONS = frozenset({"PeerFloodError", "UserBannedInChannelError"})
 
 
 def _from_governed(result: ActionResult[Any]) -> SendOutcome:
