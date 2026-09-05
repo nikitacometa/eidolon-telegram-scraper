@@ -1,13 +1,13 @@
 # Eidolon — Task Board
 
-> Last updated: 2026-08-29
+> Last updated: 2026-09-05
 
 ## Conventions
 
 - **ID format**: `E-NNN` (sequential, never reuse)
 - **Statuses**: `todo` | `in_progress` | `blocked` | `done` | `superseded`
 - **Priorities**: `critical` | `high` | `medium` | `low`
-- Next available ID: **E-078**
+- Next available ID: **E-082**
 
 ---
 
@@ -47,6 +47,10 @@
 | E-075 | Value-for-money rating over the archive | done | high | `housing-deals` CLI + `get_housing_deals` MCP tool: price vs the median of comparables (type x bedrooms x season pooled across years, min bucket 10, fallback ladder), quality = the same preference score alerts use. Judged by the ACTIVE revision; hard-miss excluded; priceless listings shown unranked |
 | E-076 | Housing retention | done | medium | Settled units and delivered alerts age out with the 30-day window (cascades take members/facts/matches/media), so the rematch sweep stays bounded |
 | E-077 | Validate the deals ranking against the owner's taste | todo | medium | Show the top-20 by value and ask which he would actually visit; adjust weights via preferences before trusting the score in digests |
+| E-078 | Housing alerts as a report followed by the forwarded original | done | critical | The owner's account is not in the source chats, so the old t.me link never opened. The monitoring account now sends the report to his DM (`OWNER_USERNAME`) and forwards the whole album after it; two-step outbox with a durable checkpoint (`report_message_id`), copy fallback when a chat forbids forwarding, bot fallback when the DM is unreachable, joint 1.5 s pace across kinds, partial-album detection |
+| E-079 | Replay of every alerted listing as a dated ledger | done | high | `index_cli.py housing-replay [--dry-run]`: re-judges each alerted unit against the active revision, queues `kind='replay'` rows (posted-at + first-alert date in the report) behind a self-identifying header; dedup on (unit, verdict, replay) |
+| E-080 | Recon status only when something changes | done | medium | `scripts/recon_status.py` is a state machine over `data/recon_status_state.json`: one message when a task starts, progress at most every 12 h, one when it finishes; silence when idle. Cron moved to hourly |
+| E-081 | Silence everything but housing | done | high | Da Lat (6 chats) and Da Nang IT switched to `recon` (archive keeps growing, no alerts); pending dalat/danang alert rows drained at cutover; the 5 Phangan joins awaiting admins bound to `phangan-housing` |
 
 ## Backlog — Phase 4: Reconnaissance (design: `tmp/design-openclaw-recon.md`)
 

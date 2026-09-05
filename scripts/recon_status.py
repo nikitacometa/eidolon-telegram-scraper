@@ -1,8 +1,12 @@
-"""Report reconnaissance progress to Telegram.
+"""Report reconnaissance progress to Telegram — only when there is news.
 
-Meant for a timer: the join queue and the history archive both advance on
+Meant for an hourly timer. The join queue and the history archive advance on
 their own for hours, so the owner should learn where they got to without
-asking. Reads state only; it never touches Telegram's MTProto API.
+asking; but a report that says "44 joined, 0 queued" twice a day for a month
+is noise. The decision of whether to send lives in pipeline/recon_status.py as
+a pure state machine over two snapshots: the current one, and the one stored in
+`data/recon_status_state.json` when the last report went out. Reads state only;
+it never touches Telegram's MTProto API.
 """
 
 from __future__ import annotations
@@ -12,23 +16,26 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.settings import settings  # noqa: E402
 from pipeline.recon_models import BackfillState, JoinQueueState  # noqa: E402
+from pipeline.recon_status import ReconSnapshot, ReconStatusState, decide  # noqa: E402
 from storage.scout import ScoutDatabase  # noqa: E402
 
 TELEGRAM_API = "https://api.telegram.org"
+STATE_PATH = settings.scout_db_path.parent / "recon_status_state.json"
 
 
-def _send(text: str) -> None:
+def _send(text: str) -> bool:
     token = settings.eidolon_bot_token or settings.pantheon_bot_token
     chat_id = settings.pantheon_chat_id
     if not token or not chat_id:
         print(text)
-        return
+        return True
     payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode()
     # The URL is a fixed https constant plus the bot token; no user input
     # reaches the scheme.
@@ -41,20 +48,15 @@ def _send(text: str) -> None:
         with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
             response.read()
     except urllib.error.URLError as error:
-        # A failed status report must not look like a failed crawl.
+        # A failed status report must not look like a failed crawl — and must
+        # not advance the stored state, or the report is lost for good.
         print(f"status delivery failed: {error}", file=sys.stderr)
+        return False
+    return True
 
 
-def _plural(count: int, one: str, few: str, many: str) -> str:
-    if count % 10 == 1 and count % 100 != 11:
-        return one
-    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
-        return few
-    return many
-
-
-async def build_report() -> str:
-    """Render the current state of the queue and the archive."""
+async def snapshot() -> ReconSnapshot:
+    """Read the queue and the archive as they stand."""
     scout = ScoutDatabase(settings.scout_db_path)
     await scout.connect()
     try:
@@ -70,45 +72,51 @@ async def build_report() -> str:
     finally:
         await scout.close()
 
-    joined = [entry for entry in queue if entry.state is JoinQueueState.JOINED]
-    pending = [entry for entry in queue if entry.state is JoinQueueState.PENDING]
-    requested = [entry for entry in queue if entry.state is JoinQueueState.REQUESTED]
-    failed = [entry for entry in queue if entry.state is JoinQueueState.FAILED]
-    working = [t for t in targets if t.state is BackfillState.PENDING]
-    done = [t for t in targets if t.state is not BackfillState.PENDING]
+    return ReconSnapshot(
+        joined=tuple(e.chat_ref for e in queue if e.state is JoinQueueState.JOINED),
+        pending=tuple(e.chat_ref for e in queue if e.state is JoinQueueState.PENDING),
+        requested=tuple(e.chat_ref for e in queue if e.state is JoinQueueState.REQUESTED),
+        failed=tuple(
+            (e.chat_ref, e.last_error or "") for e in queue if e.state is JoinQueueState.FAILED
+        ),
+        backfill_pending=sum(1 for t in targets if t.state is BackfillState.PENDING),
+        backfill_done=sum(1 for t in targets if t.state is not BackfillState.PENDING),
+        messages_stored=stored,
+        oldest=str(span[0]) if span and span[0] else None,
+        newest=str(span[1]) if span and span[1] else None,
+    )
 
-    lines = [
-        "🛰 <b>Разведка Дананга — статус</b>",
-        "",
-        f"<b>Чаты:</b> вступил в {len(joined)}, "
-        f"в очереди {len(pending)}, ждёт админа {len(requested)}, "
-        f"не вышло {len(failed)}",
-        f"<b>История:</b> {stored} "
-        f"{_plural(stored, 'сообщение', 'сообщения', 'сообщений')} "
-        f"из {len(targets)} {_plural(len(targets), 'чата', 'чатов', 'чатов')}",
-    ]
-    if span and span[0]:
-        lines.append(f"<b>Глубина:</b> {str(span[0])[:10]} .. {str(span[1])[:10]}")
-    lines.append(f"<b>Докачивается:</b> {len(working)}, завершено {len(done)}")
 
-    if joined:
-        lines += ["", "<b>Уже читаю:</b>"]
-        lines += [f"• @{entry.chat_ref}" for entry in joined[:12]]
-    if pending:
-        lines += ["", f"<b>Следующие в очереди ({len(pending)}):</b>"]
-        lines += [f"• @{entry.chat_ref}" for entry in pending[:6]]
-    if failed:
-        lines += ["", "<b>Не получилось:</b>"]
-        lines += [f"• @{entry.chat_ref} — {entry.last_error or '?'}" for entry in failed[:6]]
+def load_state() -> ReconStatusState:
+    """The state stored when the last report went out; idle when none."""
+    try:
+        return ReconStatusState.from_dict(json.loads(STATE_PATH.read_text()))
+    except (OSError, ValueError):
+        return ReconStatusState()
 
-    lines += ["", "#дананг #разведка #статус"]
-    return "\n".join(lines)
+
+def save_state(state: ReconStatusState) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state.as_dict(), ensure_ascii=False, indent=2))
 
 
 def main() -> int:
-    """Build and deliver one status report."""
-    _send(asyncio.run(build_report()))
-    return 0
+    """Decide, send if there is news, store the state the report was made on."""
+    now = datetime.now(UTC)
+    current = asyncio.run(snapshot())
+    decision = decide(current, load_state(), now=now)
+    stamp = now.strftime("%Y-%m-%d %H:%M")
+    if decision.message is None:
+        print(f"{stamp} silent: {decision.reason} (active_work={current.active_work})")
+        # The idle state carries nothing worth persisting except the phase,
+        # which did not change; writing it anyway keeps the file present.
+        save_state(decision.state)
+        return 0
+    if _send(decision.message):
+        save_state(decision.state)
+        print(f"{stamp} sent: {decision.reason}")
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
