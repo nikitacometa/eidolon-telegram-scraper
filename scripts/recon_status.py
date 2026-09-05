@@ -46,11 +46,24 @@ def _send(text: str) -> bool:
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
-            response.read()
+            body = response.read()
     except urllib.error.URLError as error:
         # A failed status report must not look like a failed crawl — and must
         # not advance the stored state, or the report is lost for good.
         print(f"status delivery failed: {error}", file=sys.stderr)
+        return False
+    # Telegram answers HTTP 200 with {"ok": false} for a rejected message
+    # (bad HTML, unreachable chat); only an explicit ok is a delivery.
+    try:
+        answer = json.loads(body)
+    except ValueError:
+        print("status delivery failed: unreadable Telegram response", file=sys.stderr)
+        return False
+    if not isinstance(answer, dict) or answer.get("ok") is not True:
+        print(
+            f"status delivery failed: Telegram said {answer.get('description') if isinstance(answer, dict) else answer!r}",
+            file=sys.stderr,
+        )
         return False
     return True
 

@@ -107,9 +107,11 @@ class OwnerTransport:
         client: Any,
         governor: TelegramActionGovernor,
         owner_ref: str,
+        min_gap_seconds: float = MIN_GAP_BETWEEN_SENDS_SECONDS,
     ) -> None:
         self._client = client
         self._governor = governor
+        self._min_gap = max(0.0, min_gap_seconds)
         # Stored as written ("nikitacometa" or "@nikitacometa"); Telethon
         # accepts both. Resolved lazily, once per process.
         self._owner_ref = owner_ref.strip()
@@ -307,7 +309,7 @@ class OwnerTransport:
         async with self._pace_lock:
             now = asyncio.get_event_loop().time()
             if self._last_send_at is not None:
-                wait = MIN_GAP_BETWEEN_SENDS_SECONDS - (now - self._last_send_at)
+                wait = self._min_gap - (now - self._last_send_at)
                 if wait > 0:
                     await asyncio.sleep(wait)
             result = await self._governor.run(kind, _once_key(label), call)

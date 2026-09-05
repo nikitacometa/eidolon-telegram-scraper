@@ -730,7 +730,9 @@ def _unpaced(scout: ScoutDatabase) -> TelegramActionGovernor:
 
 async def test_the_owner_is_resolved_once_per_process(scout: ScoutDatabase) -> None:
     client = FakeClient()
-    transport = OwnerTransport(client=client, governor=_unpaced(scout), owner_ref="nikitacometa")
+    transport = OwnerTransport(
+        client=client, governor=_unpaced(scout), owner_ref="nikitacometa", min_gap_seconds=0
+    )
 
     first = await transport.send_report("a")
     second = await transport.send_report("b")
@@ -747,8 +749,13 @@ async def test_two_reports_inside_the_pace_are_spaced_not_failed(scout: ScoutDat
     one is told to come back, and the outbox must not count that as a failed
     attempt: pacing is the design working, not the delivery breaking."""
     client = FakeClient()
+    # The in-process gap is switched off so the second call reaches the
+    # governor at once and its per-kind pace is what answers.
     transport = OwnerTransport(
-        client=client, governor=TelegramActionGovernor(scout=scout), owner_ref="owner"
+        client=client,
+        governor=TelegramActionGovernor(scout=scout),
+        owner_ref="owner",
+        min_gap_seconds=0,
     )
 
     first = await transport.send_report("a")
@@ -758,6 +765,26 @@ async def test_two_reports_inside_the_pace_are_spaced_not_failed(scout: ScoutDat
     assert second.status is SendStatus.RETRY
     assert second.error_code == "paced"
     assert second.retry_after is not None and 1 <= second.retry_after <= 2
+
+
+async def test_two_sends_of_different_kinds_are_held_apart_in_process(
+    scout: ScoutDatabase,
+) -> None:
+    """The governor paces per kind; a report and its forward are two kinds and
+    would otherwise leave back to back. The transport holds them apart."""
+    import time
+
+    client = FakeClient()
+    client.forward_result = [SimpleNamespace(id=1)]
+    transport = OwnerTransport(
+        client=client, governor=_unpaced(scout), owner_ref="owner", min_gap_seconds=0.3
+    )
+
+    started = time.monotonic()
+    assert (await transport.send_report("a")).sent
+    assert (await transport.forward(chat_id=CHAT_ID, message_ids=[1])).sent
+
+    assert time.monotonic() - started >= 0.3
 
 
 async def test_a_paced_delivery_is_rescheduled_without_spending_an_attempt(

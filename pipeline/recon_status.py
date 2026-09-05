@@ -80,8 +80,11 @@ class ReconStatusState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReconStatusState:
         """Read a stored state, tolerating a missing or partial file."""
+        raw_phase = str(data.get("phase") or Phase.IDLE.value)
         return cls(
-            phase=Phase(str(data.get("phase") or Phase.IDLE.value)),
+            # An unknown phase reads as idle: the worst that follows is one
+            # extra "new task" message, where a crash would mean silence.
+            phase=Phase(raw_phase) if raw_phase in Phase.__members__.values() else Phase.IDLE,
             last_sent_at=_parse(data.get("last_sent_at")),
             baseline_joined=tuple(str(x) for x in data.get("baseline_joined") or ()),
             baseline_messages=int(data.get("baseline_messages") or 0),

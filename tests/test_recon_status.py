@@ -135,6 +135,7 @@ def test_the_state_survives_a_round_trip_through_json() -> None:
 
 def test_a_missing_or_broken_state_file_reads_as_idle() -> None:
     assert ReconStatusState.from_dict({}).phase is Phase.IDLE
+    assert ReconStatusState.from_dict({"phase": "working-now"}).phase is Phase.IDLE
     assert (
         ReconStatusState.from_dict({"phase": "idle", "last_sent_at": "garbage"}).last_sent_at
         is None
