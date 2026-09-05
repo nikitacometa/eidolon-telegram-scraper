@@ -405,9 +405,14 @@ class OwnerRecovery:
             for cooldown in await self._scout.active_cooldowns(account_id=self._account_id):
                 scope = str(cooldown["scope"])
                 reason = str(cooldown["reason"])
-                if scope in {ActionKind.OWNER_MESSAGE.value, ActionKind.OWNER_FORWARD.value} or (
-                    scope == "all" and reason in _OWNER_SPAM_REASONS
-                ):
+                # Only a spam limit is the owner's to lift: a FloodWait on
+                # these kinds is Telegram's clock, and a reply does not
+                # advance it.
+                if reason in _OWNER_SPAM_REASONS and scope in {
+                    "all",
+                    ActionKind.OWNER_MESSAGE.value,
+                    ActionKind.OWNER_FORWARD.value,
+                }:
                     await self._scout.clear_cooldown(account_id=self._account_id, scope=scope)
                     cleared.append(scope)
             reopened = int(await self._store.reopen_fallback_alerts())

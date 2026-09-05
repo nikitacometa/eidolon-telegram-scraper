@@ -1460,17 +1460,22 @@ async def test_the_owners_reply_lifts_the_owner_pause_and_requeues_the_fallbacks
             reason="PeerFloodError",
             manual_resume_required=True,
         )
-    # A FloodWait the crawl earned is not the owner's to lift.
+    # A FloodWait — the crawl's or the owner kinds' own — is not the owner's to lift.
     await scout.set_cooldown(
         account_id="owner-primary", scope="history_page", seconds=3600, reason="flood_wait_900s"
+    )
+    await scout.set_cooldown(
+        account_id="owner-primary", scope="owner_forward", seconds=7200, reason="flood_wait_120s"
     )
     recovery = OwnerRecovery(scout=scout, store=store, account_id="owner-primary")
 
     reopened = await recovery.owner_wrote()
 
     assert reopened == 1
-    left = sorted(c["scope"] for c in await scout.active_cooldowns(account_id="owner-primary"))
-    assert left == ["history_page"]
+    left = sorted(
+        (c["scope"], c["reason"]) for c in await scout.active_cooldowns(account_id="owner-primary")
+    )
+    assert left == [("history_page", "flood_wait_900s"), ("owner_forward", "flood_wait_120s")]
     assert (await _row(store, live))["delivery_status"] == "pending"
     # A second reply within the throttle window does nothing more.
     assert await recovery.owner_wrote() is None

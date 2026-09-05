@@ -428,6 +428,13 @@ class Eidolon:
         self._agent_watcher_task = None
         self._joiner_task = None
         self._discovery_task = None
+        # A recovery pass the owner's reply started writes to both databases;
+        # it must finish or be cancelled before the connections close under it.
+        for recovery in list(self._recovery_tasks):
+            recovery.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await recovery
+        self._recovery_tasks.clear()
 
         # Stop ingress before draining the bounded queue. A message committed
         # just before disconnect already has durable pending watcher jobs.
