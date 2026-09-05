@@ -137,7 +137,7 @@ eidolon-telegram/
 - **Separate account.** Never connect to the user's primary Telegram account. Dedicated number only.
 - **Test filters independently.** Each filter level must have unit tests with real message samples.
 - **Watchers config is the source of truth** for what chats to monitor and how to filter.
-- **Alerts through existing Pantheon bot** (@ClaudePantheon_Bot) — no new bot needed for MVP.
+- **Alerts through existing Pantheon bot** (@ClaudePantheon_Bot) — no new bot needed for MVP. **Exception: housing.** The bot is not a member of the source chats, so housing reports are sent by the monitoring account into the owner's DM (`OWNER_USERNAME`) and the original advertisement is forwarded right after; see `pipeline/housing/owner_transport.py`.
 
 ## Phases
 

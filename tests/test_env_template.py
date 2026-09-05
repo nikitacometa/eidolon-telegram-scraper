@@ -28,6 +28,7 @@ PLACEHOLDER_KEYS = frozenset(
         "pantheon_bot_token",
         "pantheon_chat_id",
         "eidolon_bot_token",
+        "owner_username",
         "debug_echo",
     }
 )
