@@ -16,7 +16,7 @@ dependencies = [
     "chromadb==1.5.9",
     "fastapi>=0.128,<1",
     # Serves the corpus to OpenClaw agents over MCP stdio (eidolon_mcp.py).
-    "mcp>=1.2,<2",
+    "mcp>=1.2,<3",
     "openai>=2.24,<3",
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.13,<3",
